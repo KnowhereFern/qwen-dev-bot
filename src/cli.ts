@@ -3,6 +3,7 @@ import path from 'node:path';
 import { CommunityCollector } from './community/collector.js';
 import { loadProjectConfig, PROJECT_CONFIG_PATH } from './core/config.js';
 import { projectIdFor, projectStateDir } from './core/state-paths.js';
+import type { PortfolioPlan } from './core/types.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
 import { runDaemon } from './daemon.js';
@@ -10,11 +11,17 @@ import { formatDoctor, runDoctor } from './doctor.js';
 import { createProductionHarness } from './factory.js';
 import { OctokitControlPlane, resolveGitHubToken } from './github/control-plane.js';
 import { installProject, uninstallProject } from './installer/installer.js';
+import { PortfolioCoordinator, formatPortfolioPlan } from './portfolio/coordinator.js';
+import {
+  DEFAULT_MAX_PORTFOLIO_STORIES,
+  PortfolioPlanner,
+  readRequirementsDocument,
+} from './portfolio/planner.js';
 import { QwenApiClient } from './qwen/qwen-api.js';
 import { assertQwenCredentialCompatibility, resolveQwenCredential } from './qwen/credentials.js';
 import { ProjectRegistry } from './registry.js';
 
-const VERSION = '1.0.0-rc.3';
+const VERSION = '1.0.0-rc.4';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? 'help';
@@ -66,6 +73,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       else {
         console.log(result.summary.map((line) => `- ${line}`).join('\n'));
         console.log('\nNext: run `qwen-harness doctor`. The harness reuses the credential already stored in Qwen user settings when available.');
+        if (existsSync(path.join(root, 'PROJECT.md'))) {
+          console.log('After `qwen-harness verify`, run `qwen-harness plan . --requirements PROJECT.md` to create the review-only delivery graph.');
+        }
       }
       return 0;
     }
@@ -204,6 +214,92 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         store.close();
       }
     }
+    case 'plan': {
+      const config = loadProjectConfig(root);
+      const requirementsPath = valueOf(args, '--requirements');
+      if (!requirementsPath) throw new Error('plan requires --requirements FILE');
+      const maxStories = integerValue(args, '--max-stories') ?? DEFAULT_MAX_PORTFOLIO_STORIES;
+      const credential = resolveQwenCredential(config);
+      if (credential) assertQwenCredentialCompatibility(config, credential);
+      const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      try {
+        const document = readRequirementsDocument(config.project.root, requirementsPath);
+        const github = new OctokitControlPlane({
+          repo: config.project.githubRepo,
+          token: await resolveGitHubToken(root),
+        });
+        const coordinator = new PortfolioCoordinator(config, store, github);
+        const existing = await coordinator.findByRequirements(document.content);
+        let created: { plan: PortfolioPlan; created: boolean };
+        if (existing) {
+          created = { plan: existing, created: false };
+        } else {
+          const planner = new PortfolioPlanner(
+            config,
+            new QwenApiClient({
+              model: config.qwen.model,
+              baseUrl: config.qwen.baseUrl,
+              credentialEnvKey: config.qwen.credentialEnvKey,
+              apiKey: credential?.apiKey,
+            }),
+          );
+          const draft = await planner.plan(document, maxStories);
+          created = await coordinator.createDraft({ ...document, draft });
+        }
+        const plan = hasFlag(args, '--approve') ? await coordinator.approve(created.plan.id) : created.plan;
+        const view = coordinator.status(plan);
+        console.log(json ? JSON.stringify({ created: created.created, plan: view }, null, 2) : formatPortfolioPlan(view));
+        if (!hasFlag(args, '--approve') && !json) {
+          console.log(`\nReview the epic and stories, then run: qwen-harness plan-approve ${root} --plan ${plan.id}`);
+        }
+        return 0;
+      } finally {
+        store.close();
+      }
+    }
+    case 'plan-approve': {
+      const config = loadProjectConfig(root);
+      const planId = valueOf(args, '--plan');
+      if (!planId) throw new Error('plan-approve requires --plan PLAN_ID');
+      const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      try {
+        const github = new OctokitControlPlane({
+          repo: config.project.githubRepo,
+          token: await resolveGitHubToken(root),
+        });
+        const coordinator = new PortfolioCoordinator(config, store, github);
+        const plan = await coordinator.approve(planId);
+        const view = coordinator.status(plan);
+        console.log(json ? JSON.stringify(view, null, 2) : formatPortfolioPlan(view));
+        return 0;
+      } finally {
+        store.close();
+      }
+    }
+    case 'plan-status': {
+      const config = loadProjectConfig(root);
+      const planId = valueOf(args, '--plan');
+      const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      try {
+        const github = new OctokitControlPlane({
+          repo: config.project.githubRepo,
+          token: await resolveGitHubToken(root),
+        });
+        const coordinator = new PortfolioCoordinator(config, store, github);
+        const plans = await coordinator.refresh(planId);
+        const views = plans.map((plan) => coordinator.status(plan));
+        console.log(
+          json
+            ? JSON.stringify(views, null, 2)
+            : views.length
+              ? views.map(formatPortfolioPlan).join('\n\n')
+              : 'No portfolio plans found. Run `qwen-harness plan PROJECT --requirements FILE` first.',
+        );
+        return 0;
+      } finally {
+        store.close();
+      }
+    }
     case 'run':
     case 'reconcile': {
       const config = loadProjectConfig(root);
@@ -262,7 +358,7 @@ function formatReward(scorecard: NonNullable<ReturnType<PersistentTaskStore['get
 }
 
 function firstPositional(args: string[]): string | undefined {
-  const valueOptions = new Set(['--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue']);
+  const valueOptions = new Set(['--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan']);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] as string;
     if (valueOptions.has(arg)) {
@@ -281,6 +377,14 @@ function hasFlag(args: string[], flag: string): boolean {
 function valueOf(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
+}
+
+function integerValue(args: string[], flag: string): number | undefined {
+  const value = valueOf(args, flag);
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${flag} requires an integer`);
+  return parsed;
 }
 
 function billingPlanValue(args: string[]): 'standard' | 'token-plan-personal' | 'token-plan-team' | 'coding-plan' | 'custom' | undefined {
@@ -310,6 +414,9 @@ Commands:
   logs [--lines N]     Tail the redacted append-only event ledger
   reward               Show the latest stored universal reward scorecard
   community [--force]  Scan allowlisted sources and create review-only issues
+  plan                 Turn a requirements file into a review-only delivery graph
+  plan-approve         Approve one plan and create executable normalized tasks
+  plan-status          Refresh the master issue and show story/task progress
   uninstall --yes      Remove unchanged installer-owned files
 
 Init options:
@@ -320,6 +427,11 @@ Init options:
 
 Reward options:
   --task TASK_ID --issue NUMBER --json
+
+Plan options:
+  plan PROJECT --requirements FILE [--max-stories N] [--approve] [--json]
+  plan-approve PROJECT --plan PLAN_ID [--json]
+  plan-status PROJECT [--plan PLAN_ID] [--json]
 `;
 }
 

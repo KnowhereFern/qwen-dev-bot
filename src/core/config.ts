@@ -45,6 +45,8 @@ export function defaultProjectConfig(root: string, name = path.basename(root), g
       approvalLabel: 'harness:accept',
       normalizedLabel: 'harness:normalized',
       communityLabel: 'harness:community',
+      planLabel: 'harness:plan',
+      plannedLabel: 'harness:planned',
       trustedAuthors: ['github-actions[bot]'],
       autoPromoteSelfRepair: true,
       communityEnabled: false,
@@ -303,6 +305,16 @@ export function validateProjectConfig(value: unknown, source = 'project config')
   }
   if (!Array.isArray(config.intake.trustedAuthors) || !config.intake.trustedAuthors.every(isNonEmptyString)) {
     throw new Error(`${source}: intake.trustedAuthors must contain non-empty GitHub logins`);
+  }
+  for (const [key, label] of Object.entries({
+    readyLabel: config.intake.readyLabel,
+    approvalLabel: config.intake.approvalLabel,
+    normalizedLabel: config.intake.normalizedLabel,
+    communityLabel: config.intake.communityLabel,
+    planLabel: config.intake.planLabel,
+    plannedLabel: config.intake.plannedLabel,
+  })) {
+    if (!isNonEmptyString(label)) throw new Error(`${source}: intake.${key} must be a non-empty label`);
   }
   if (!Array.isArray(config.intake.communitySources)) throw new Error(`${source}: intake.communitySources must be an array`);
   for (const communitySource of config.intake.communitySources) {

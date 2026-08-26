@@ -6,6 +6,8 @@ import { EventLedger, redactForLedger, redactText } from './ledger.js';
 import { assertTaskTransition, isTaskLeased } from './task-state.js';
 import type {
   HarnessEvent,
+  PortfolioPlan,
+  PortfolioPlanStatus,
   RewardScorecard,
   RunCheckpoint,
   TaskRecord,
@@ -23,6 +25,16 @@ interface TaskRow {
   max_attempts: number;
   lease_expires_at: number | null;
   version: number;
+  data: string;
+}
+
+interface PortfolioPlanRow {
+  id: string;
+  project_id: string;
+  source_path: string;
+  content_hash: string;
+  status: PortfolioPlanStatus;
+  updated_at: number;
   data: string;
 }
 
@@ -109,6 +121,18 @@ export class PersistentTaskStore {
         checked_at INTEGER NOT NULL,
         data TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS portfolio_plans (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        data TEXT NOT NULL,
+        UNIQUE(project_id, content_hash)
+      );
+      CREATE INDEX IF NOT EXISTS portfolio_plans_source_idx
+        ON portfolio_plans(project_id, source_path, updated_at);
     `);
     this.ledger = new EventLedger(path.dirname(stateDir), projectId);
   }
@@ -201,6 +225,52 @@ export class PersistentTaskStore {
         .prepare(`SELECT * FROM tasks WHERE project_id = ? AND state IN (${placeholders}) ORDER BY priority, issue_number`)
         .all(this.projectId, ...states) as unknown as TaskRow[]
     ).map(rowToTask);
+  }
+
+  savePortfolioPlan(plan: PortfolioPlan): PortfolioPlan {
+    if (plan.projectId !== this.projectId) {
+      throw new Error(`Portfolio plan ${plan.id} belongs to another project`);
+    }
+    this.db
+      .prepare(
+        `INSERT INTO portfolio_plans(id, project_id, source_path, content_hash, status, updated_at, data)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           source_path=excluded.source_path, content_hash=excluded.content_hash,
+           status=excluded.status, updated_at=excluded.updated_at, data=excluded.data`,
+      )
+      .run(
+        plan.id,
+        plan.projectId,
+        plan.sourcePath,
+        plan.contentHash,
+        plan.status,
+        plan.updatedAt,
+        JSON.stringify(plan),
+      );
+    return plan;
+  }
+
+  getPortfolioPlan(id: string): PortfolioPlan | null {
+    const row = this.db
+      .prepare('SELECT * FROM portfolio_plans WHERE id = ? AND project_id = ?')
+      .get(id, this.projectId) as unknown as PortfolioPlanRow | undefined;
+    return row ? rowToPortfolioPlan(row) : null;
+  }
+
+  findPortfolioPlanByHash(contentHash: string): PortfolioPlan | null {
+    const row = this.db
+      .prepare('SELECT * FROM portfolio_plans WHERE project_id = ? AND content_hash = ?')
+      .get(this.projectId, contentHash) as unknown as PortfolioPlanRow | undefined;
+    return row ? rowToPortfolioPlan(row) : null;
+  }
+
+  listPortfolioPlans(): PortfolioPlan[] {
+    return (
+      this.db
+        .prepare('SELECT * FROM portfolio_plans WHERE project_id = ? ORDER BY updated_at DESC, id DESC')
+        .all(this.projectId) as unknown as PortfolioPlanRow[]
+    ).map(rowToPortfolioPlan);
   }
 
   transition(id: string, to: TaskState, patch: Partial<TaskRecord> = {}, now = Date.now()): TaskRecord {
@@ -627,6 +697,18 @@ function rowToTask(row: TaskRow): TaskRecord {
     maxAttempts: row.max_attempts,
     leaseExpiresAt: row.lease_expires_at,
     version: row.version,
+  };
+}
+
+function rowToPortfolioPlan(row: PortfolioPlanRow): PortfolioPlan {
+  const parsed = JSON.parse(row.data) as PortfolioPlan;
+  return {
+    ...parsed,
+    projectId: row.project_id,
+    sourcePath: row.source_path,
+    contentHash: row.content_hash,
+    status: row.status,
+    updatedAt: row.updated_at,
   };
 }
 

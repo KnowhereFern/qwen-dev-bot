@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.0-rc.4] - 2026-08-25
+
+- Added tracked requirements ingestion with bounded Qwen decomposition into a validated acyclic delivery graph.
+- Added durable master plans, review-only epic/story issues, duplicate-safe publishing, explicit approval, exact dependency mapping, and progress refresh.
+- Added `plan`, `plan-approve`, and `plan-status` commands plus a fill-in starter requirements template.
+
 ## [1.0.0-rc.3] - 2026-08-25
 
 - Detects compatible Qwen binaries across PATH and the npm global prefix instead of failing when an older Homebrew copy shadows a current npm installation.

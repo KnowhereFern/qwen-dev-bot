@@ -5,7 +5,7 @@ A minimal project repository ready for the guided Qwen-inspired self-evolving de
 ## Start here
 
 1. Create a repository with GitHub's **Use this template** button and clone it.
-2. Add your project code or describe the project in `PROJECT.md`.
+2. Add your project code and fill in the short requirements template in `PROJECT.md`.
 3. Run:
 
 ```sh
@@ -25,3 +25,13 @@ qwen-harness verify .
 ```
 
 `verify` must pass before accepting autonomous work.
+
+Create the project delivery graph, review it on GitHub, and approve it only when it matches your intent:
+
+```sh
+qwen-harness plan . --requirements PROJECT.md
+qwen-harness plan-approve . --plan PLAN_ID
+qwen-harness plan-status . --plan PLAN_ID
+```
+
+The first command creates only a master-plan issue and review stories. The second command is the explicit boundary that creates dependency-aware executable tasks.

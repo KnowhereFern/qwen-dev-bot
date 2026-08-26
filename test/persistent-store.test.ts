@@ -18,6 +18,23 @@ function taskSpec(dependencies: number[]): TaskSpec {
 }
 
 describe('PersistentTaskStore', () => {
+  it('persists and deduplicates portfolio plans by requirements hash', () => {
+    const stateDir = makeTmp('persistent-portfolio');
+    let store = new PersistentTaskStore('portfolio-project', stateDir);
+    const plan = {
+      id: 'plan_123', projectId: 'portfolio-project', sourcePath: 'REQUIREMENTS.md', contentHash: 'abc',
+      title: 'Plan', objective: 'Ship', constraints: [], definitionOfDone: ['Done'], status: 'draft' as const,
+      epicIssueNumber: null, epicIssueUrl: null, stories: [], createdAt: 1, updatedAt: 1, approvedAt: null,
+    };
+    store.savePortfolioPlan(plan);
+    store.close();
+
+    store = new PersistentTaskStore('portfolio-project', stateDir);
+    expect(store.findPortfolioPlanByHash('abc')).toEqual(plan);
+    expect(store.listPortfolioPlans()).toEqual([plan]);
+    store.close();
+  });
+
   it('persists tasks, leases, checkpoints, and idempotency across restarts', () => {
     const stateDir = makeTmp('persistent-store');
     let store = new PersistentTaskStore('project-a', stateDir);
