@@ -119,7 +119,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
       defaultProjectConfig(root).qwen.baseUrl,
     qwenCredentialEnvKey: existingConfig?.qwen.credentialEnvKey ?? 'DASHSCOPE_API_KEY',
     qwenBillingPlan: existingConfig?.qwen.billingPlan ?? 'standard',
-    autoMerge: existingConfig?.worker.autoMerge ?? false,
+    autoMerge: existingConfig?.worker.autoMerge ?? true,
     enableCommunity: existingConfig?.intake.communityEnabled ?? false,
     installQwen: !options.yes && !qwenCodeVersionAtLeast(qwenRuntime.version),
     linkExtension: previousReceipt?.extensionLinked ?? true,

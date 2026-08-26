@@ -5,6 +5,7 @@ import { makeTmp } from './helpers.js';
 describe('project configuration invariants', () => {
   it('accepts the generated Qwen-native template configuration', () => {
     const config = defaultProjectConfig(makeTmp('config-valid'), 'fixture', 'owner/fixture');
+    expect(config.worker.autoMerge).toBe(true);
     expect(validateProjectConfig(config)).toBe(config);
   });
 

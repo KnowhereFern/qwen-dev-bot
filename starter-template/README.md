@@ -16,6 +16,8 @@ The dependency-free launcher checks Node and Git, downloads the pinned `qwen-dev
 
 Setup explains and verifies Qwen Code, GitHub CLI/authentication, the eligible Qwen billing plan and credential source, project dependencies, browser automation, optional multimodal tools, CI, rewards, and the persistent worker. It does not place credentials in tracked files.
 
+New projects default to guarded auto-merge after every local gate, reward check, and required GitHub check passes. The setup wizard offers a clear opt-out.
+
 Token Plan Personal cannot run the unattended worker under QwenCloud's plan terms. Use Token Plan Team, standard pay-as-you-go, or an explicitly approved compatible provider for background automation.
 
 After setup, review and commit the generated `.qwen-harness/`, `.qwen/`, `.github/`, `AUTONOMY.md`, and `QWEN.md` files. Then run:

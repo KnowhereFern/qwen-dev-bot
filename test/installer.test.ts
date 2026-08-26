@@ -42,6 +42,7 @@ describe('guided installer', () => {
         },
       });
       expect(result.config.qwen.command).toBe(path.join(currentBin, 'qwen'));
+      expect(result.config.worker.autoMerge).toBe(true);
     } finally {
       if (priorPath === undefined) delete process.env.PATH;
       else process.env.PATH = priorPath;
@@ -115,6 +116,7 @@ describe('guided installer', () => {
     const installedConfig = JSON.parse(readFileSync(configFile, 'utf8'));
     expect(installedConfig.qwen.model).toBe('qwen3.8-max');
     expect(installedConfig.qwen.baseUrl).toBe('https://qwen.example.test/compatible-mode/v1');
+    expect(installedConfig.worker.autoMerge).toBe(false);
     expect(installedConfig.qwen.allowedMcpServers).toEqual([]);
     expect(installedConfig.project.defaultBranch).toBe('develop');
     expect(installedConfig.gates.some((gate: { id: string }) => gate.id === 'custom-proof')).toBe(true);
