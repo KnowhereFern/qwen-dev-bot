@@ -1,6 +1,6 @@
 {
   "name": "qwen-dev-bot",
-  "version": "1.0.0-rc.2",
+  "version": "1.0.0-rc.3",
   "description": "Qwen3.8-Max-native self-evolving engineering harness with durable orchestration, universal runtime rewards, GitHub delivery, and guided setup.",
   "type": "module",
   "private": true,

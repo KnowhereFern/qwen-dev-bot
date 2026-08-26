@@ -105,7 +105,10 @@ export async function installProject(options: InstallOptions): Promise<{ config:
     options.answers?.trustedAuthor ??
     existingConfig?.intake.trustedAuthors.find((author) => author !== 'github-actions[bot]') ??
     (await detectGitHubUser(root));
-  const qwenVersion = await detectQwenVersion(existingConfig?.qwen.command ?? 'qwen', root);
+  const requestedQwenCommand = existingConfig?.qwen.command ?? 'qwen';
+  let qwenRuntime = requestedQwenCommand === 'qwen'
+    ? await resolveQwenRuntime(requestedQwenCommand, root)
+    : { command: requestedQwenCommand, version: await detectQwenVersion(requestedQwenCommand, root) };
   const defaults: InstallAnswers = {
     projectName: existingConfig?.project.name ?? path.basename(root),
     githubRepo: detectedRepo,
@@ -118,7 +121,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
     qwenBillingPlan: existingConfig?.qwen.billingPlan ?? 'standard',
     autoMerge: existingConfig?.worker.autoMerge ?? false,
     enableCommunity: existingConfig?.intake.communityEnabled ?? false,
-    installQwen: !options.yes && !qwenCodeVersionAtLeast(qwenVersion),
+    installQwen: !options.yes && !qwenCodeVersionAtLeast(qwenRuntime.version),
     linkExtension: previousReceipt?.extensionLinked ?? true,
     installMultimodal: false,
     installBrowserAutomation: false,
@@ -144,6 +147,21 @@ export async function installProject(options: InstallOptions): Promise<{ config:
     if (!supplied.qwenBaseUrl && options.yes) answers.qwenBaseUrl = TOKEN_PLAN_QWEN_BASE_URL;
     if (!supplied.qwenCredentialEnvKey && options.yes) answers.qwenCredentialEnvKey = 'BAILIAN_TOKEN_PLAN_API_KEY';
   }
+  if (answers.installQwen && !options.dryRun) {
+    const installed = await runProcess({
+      command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
+      args: ['install', '-g', '@qwen-code/qwen-code@latest'],
+      cwd: packageRoot,
+      timeoutMs: 10 * 60_000,
+    });
+    if (installed.exitCode !== 0) throw new Error(`Qwen Code installation failed: ${installed.stderr}`);
+    qwenRuntime = await resolveQwenRuntime('qwen', root);
+    if (!qwenCodeVersionAtLeast(qwenRuntime.version)) {
+      throw new Error(
+        `Qwen Code ${MIN_QWEN_CODE_VERSION}+ was installed, but PATH still selects ${detectedQwenCodeVersion(qwenRuntime.version) ?? 'an incompatible version'}. Remove or unlink the older Qwen installation, then rerun setup.`,
+      );
+    }
+  }
   const config = existingConfig ?? defaultProjectConfig(root, answers.projectName, answers.githubRepo);
   config.project.root = root;
   config.project.name = answers.projectName;
@@ -151,6 +169,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
   config.qwen.baseUrl = answers.qwenBaseUrl;
   config.qwen.credentialEnvKey = answers.qwenCredentialEnvKey;
   config.qwen.billingPlan = answers.qwenBillingPlan;
+  config.qwen.command = qwenRuntime.command;
   config.worker.autoMerge = answers.autoMerge;
   config.intake.communityEnabled = answers.enableCommunity;
   if (answers.installMultimodal && !config.qwen.allowedMcpServers.includes(QWEN_MM_CORE_MCP_SERVER)) {
@@ -251,25 +270,8 @@ export async function installProject(options: InstallOptions): Promise<{ config:
 
   let service: ServiceReceipt | undefined = previousReceipt?.service;
   if (answers.installQwen) {
-    summary.push(
-      `${options.dryRun ? 'would install/upgrade' : 'installed/upgraded'} Qwen Code with npm`,
-    );
-    if (!options.dryRun) {
-      const installed = await runProcess({
-        command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
-        args: ['install', '-g', '@qwen-code/qwen-code@latest'],
-        cwd: packageRoot,
-        timeoutMs: 10 * 60_000,
-      });
-      if (installed.exitCode !== 0) throw new Error(`Qwen Code installation failed: ${installed.stderr}`);
-      const installedVersion = await detectQwenVersion(config.qwen.command, root);
-      if (!qwenCodeVersionAtLeast(installedVersion)) {
-        throw new Error(
-          `Qwen Code ${MIN_QWEN_CODE_VERSION}+ is required, but ${detectedQwenCodeVersion(installedVersion) ?? 'no compatible version'} is on PATH`,
-        );
-      }
-    }
-  } else if (!qwenCodeVersionAtLeast(qwenVersion)) {
+    summary.push(`${options.dryRun ? 'would install/upgrade' : 'installed/upgraded'} Qwen Code with npm`);
+  } else if (!qwenCodeVersionAtLeast(qwenRuntime.version)) {
     summary.push(
       `Qwen Code ${MIN_QWEN_CODE_VERSION}+ is still required; rerun with --install-qwen or upgrade it manually`,
     );
@@ -937,6 +939,36 @@ async function detectGitHubUser(root: string): Promise<string> {
 async function detectQwenVersion(command: string, root: string): Promise<string> {
   const result = await runProcess({ command, args: ['--version'], cwd: root, timeoutMs: 10_000 });
   return result.exitCode === 0 ? result.stdout.trim() || result.stderr.trim() : '';
+}
+
+async function resolveQwenRuntime(command: string, root: string): Promise<{ command: string; version: string }> {
+  const executable = process.platform === 'win32' ? 'qwen.cmd' : 'qwen';
+  const candidates = [command];
+  for (const directory of (process.env.PATH ?? '').split(path.delimiter).filter(Boolean)) {
+    candidates.push(path.join(directory, executable));
+  }
+  const npmPrefix = await runProcess({
+    command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
+    args: ['prefix', '-g'],
+    cwd: root,
+    timeoutMs: 10_000,
+  });
+  if (npmPrefix.exitCode === 0 && npmPrefix.stdout.trim()) {
+    candidates.push(
+      process.platform === 'win32'
+        ? path.join(npmPrefix.stdout.trim(), executable)
+        : path.join(npmPrefix.stdout.trim(), 'bin', executable),
+    );
+  }
+
+  let fallback = { command, version: '' };
+  for (const candidate of [...new Set(candidates)]) {
+    if (path.isAbsolute(candidate) && !existsSync(candidate)) continue;
+    const version = await detectQwenVersion(candidate, root);
+    if (!fallback.version && version) fallback = { command: candidate, version };
+    if (qwenCodeVersionAtLeast(version)) return { command: candidate, version };
+  }
+  return fallback;
 }
 
 function atomicWrite(file: string, content: Buffer, mode: number): void {

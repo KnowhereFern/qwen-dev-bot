@@ -14,7 +14,7 @@ import { QwenApiClient } from './qwen/qwen-api.js';
 import { assertQwenCredentialCompatibility, resolveQwenCredential } from './qwen/credentials.js';
 import { ProjectRegistry } from './registry.js';
 
-const VERSION = '1.0.0-rc.2';
+const VERSION = '1.0.0-rc.3';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? 'help';

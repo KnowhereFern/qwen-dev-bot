@@ -12,12 +12,15 @@ if (currentNode[0] < minimumNode[0] || (currentNode[0] === minimumNode[0] && cur
 const git = spawnSync('git', ['--version'], { encoding: 'utf8', shell: false });
 if (git.status !== 0) fail('Git is required. Install Git, then rerun node setup.mjs.');
 
-const ref = 'v1.0.0-rc.2';
+const ref = 'v1.0.0-rc.3';
 const source = 'https://github.com/KnowhereFern/qwen-dev-bot.git';
 const temp = mkdtempSync(path.join(os.tmpdir(), 'qwen-dev-bot-'));
 
 try {
-  run('git', ['clone', '--depth', '1', '--branch', ref, source, temp], process.cwd(), 5 * 60_000);
+  run('git', ['init', '--quiet'], temp, 30_000);
+  run('git', ['remote', 'add', 'origin', source], temp, 30_000);
+  run('git', ['fetch', '--quiet', '--depth', '1', 'origin', `refs/tags/${ref}`], temp, 5 * 60_000);
+  run('git', ['checkout', '--quiet', '--detach', 'FETCH_HEAD^{}'], temp, 30_000);
   run(npm(), ['ci'], temp, 10 * 60_000);
   run(process.execPath, [path.join(temp, 'bin', 'qwen-harness.mjs'), 'init', process.cwd(), ...process.argv.slice(2)], process.cwd(), 30 * 60_000);
 } finally {

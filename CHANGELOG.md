@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.0-rc.3] - 2026-08-25
+
+- Detects compatible Qwen binaries across PATH and the npm global prefix instead of failing when an older Homebrew copy shadows a current npm installation.
+- Reworked starter tag checkout to avoid confusing annotated-tag and detached-HEAD warnings.
+
 ## [1.0.0-rc.2] - 2026-08-25
 
 - Upgraded pinned GitHub Actions to their Node 24 releases after the hosted runner reported Node 20 deprecation warnings.

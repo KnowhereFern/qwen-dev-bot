@@ -2,7 +2,7 @@
 
 A reusable, Qwen3.8-Max-only engineering harness for turning approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.2`. The deterministic and mocked production paths are verified. Promotion to stable `v1.0.0` is gated on a complete live run with an unattended-eligible Qwen account.
+**Release status:** `v1.0.0-rc.3`. The deterministic and mocked production paths are verified. Promotion to stable `v1.0.0` is gated on a complete live run with an unattended-eligible Qwen account.
 
 This is the canonical harness source and installer repository. For a blank application repository, use the separate [Qwen Harness Starter](https://github.com/KnowhereFern/qwen-harness-starter) template and run `node setup.mjs`. Each target project receives a small tracked control plane under `.qwen-harness/`, `.qwen/`, and `.github/`; project-specific gates, reward rubrics, protected paths, sources, and merge policy live in `.qwen-harness/project.yml`.
 

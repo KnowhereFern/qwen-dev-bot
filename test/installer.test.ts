@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { installProject, uninstallProject } from '../src/installer/installer.js';
@@ -14,6 +14,40 @@ afterEach(() => {
 });
 
 describe('guided installer', () => {
+  it.skipIf(process.platform === 'win32')('selects a compatible Qwen binary when PATH shadows it with an older copy', async () => {
+    const root = makeTmp('installer-qwen-path');
+    const oldBin = makeTmp('installer-qwen-old-bin');
+    const currentBin = makeTmp('installer-qwen-current-bin');
+    process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-qwen-path-state');
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'fixture' }));
+    writeFileSync(path.join(oldBin, 'qwen'), '#!/bin/sh\necho 0.22.0\n');
+    writeFileSync(path.join(currentBin, 'qwen'), '#!/bin/sh\necho 0.22.1\n');
+    chmodSync(path.join(oldBin, 'qwen'), 0o755);
+    chmodSync(path.join(currentBin, 'qwen'), 0o755);
+    const priorPath = process.env.PATH;
+    process.env.PATH = [oldBin, currentBin, priorPath].filter(Boolean).join(path.delimiter);
+    try {
+      const result = await installProject({
+        root,
+        yes: true,
+        answers: {
+          projectName: 'fixture',
+          githubRepo: 'owner/fixture',
+          trustedAuthor: 'owner',
+          installQwen: false,
+          linkExtension: false,
+          installService: false,
+          bootstrapDependencies: false,
+          configureGitHub: false,
+        },
+      });
+      expect(result.config.qwen.command).toBe(path.join(currentBin, 'qwen'));
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH;
+      else process.env.PATH = priorPath;
+    }
+  });
+
   it('refuses Token Plan Personal for unattended background automation', async () => {
     const root = makeTmp('installer-personal-plan');
     process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-personal-plan-state');
@@ -243,7 +277,7 @@ describe('guided installer', () => {
       timeoutMs: 20_000,
     });
     expect(receipt.exitCode).toBe(0);
-    expect(receipt.stdout.trim()).toBe('1.0.0-rc.2');
+    expect(receipt.stdout.trim()).toBe('1.0.0-rc.3');
   });
 
   it('shows setup help without entering the interactive wizard', async () => {
