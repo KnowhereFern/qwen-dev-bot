@@ -1,0 +1,13 @@
+resources:
+  - id: project.acceptance
+    type: checklist
+    description: Normalized issue acceptance criteria
+  - id: project.gates
+    type: verifier
+    description: Deterministic exact-commit gate results
+  - id: project.visuals
+    type: reference
+    description: Deterministically rendered artifacts when configured
+  - id: project.diff
+    type: reference
+    description: Exact base-to-candidate Git diff

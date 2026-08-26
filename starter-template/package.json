@@ -1,0 +1,14 @@
+{
+  "name": "qwen-harness-starter",
+  "version": "1.0.0-rc.1",
+  "private": true,
+  "description": "Minimal one-click project starter for the Qwen self-evolving development harness.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "setup": "node setup.mjs",
+    "check": "node --check setup.mjs"
+  }
+}

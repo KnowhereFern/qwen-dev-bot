@@ -1,0 +1,30 @@
+name: Qwen Harness Post-merge Repair
+
+on:
+  workflow_run:
+    workflows: ["Qwen Harness CI"]
+    types: [completed]
+
+permissions:
+  issues: write
+  actions: read
+
+jobs:
+  repair:
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.head_branch == '{{DEFAULT_BRANCH}}'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const sha = context.payload.workflow_run.head_sha;
+            const title = `[self-repair] Post-merge regression at ${sha.slice(0, 12)}`;
+            const { data: existing } = await github.rest.issues.listForRepo({ owner: context.repo.owner, repo: context.repo.repo, state: 'open', labels: 'self-repair' });
+            if (existing.some(issue => issue.title === title)) return;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body: `The required CI workflow failed on the default branch.\n\nRun: ${context.payload.workflow_run.html_url}\nCommit: ${sha}`,
+              labels: ['self-repair', 'harness:accept']
+            });

@@ -1,0 +1,34 @@
+name: Harness improvement request
+description: Submit feedback for bounded normalization and review
+title: "[request] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: Issue content is treated as untrusted feedback until a maintainer applies `harness:accept`.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What user-visible outcome should change?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Current evidence
+      description: Reproduction steps, logs, screenshots, or links.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How can the result be verified objectively?
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Product behavior or compatibility that must be preserved.

@@ -1,0 +1,6 @@
+/AUTONOMY.md @{{TRUSTED_AUTHOR}}
+/.qwen-harness/ @{{TRUSTED_AUTHOR}}
+/.github/workflows/harness-* @{{TRUSTED_AUTHOR}}
+/.qwen/agents/harness-* @{{TRUSTED_AUTHOR}}
+/.qwen/skills/harness-* @{{TRUSTED_AUTHOR}}
+/.qwen/workflows/harness-* @{{TRUSTED_AUTHOR}}
