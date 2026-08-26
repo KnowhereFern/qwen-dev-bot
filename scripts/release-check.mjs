@@ -3,6 +3,7 @@ import path from 'node:path';
 
 const root = path.resolve(import.meta.dirname, '..');
 const manifest = JSON.parse(read('package.json'));
+const lockfile = JSON.parse(read('package-lock.json'));
 const extension = JSON.parse(read('qwen-extension.json'));
 const cliSource = read('src/cli.ts');
 const problems = [];
@@ -12,6 +13,9 @@ if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(manifest.version)) {
 }
 if (extension.version !== manifest.version) {
   problems.push(`qwen-extension.json version ${extension.version} does not match package ${manifest.version}`);
+}
+if (lockfile.version !== manifest.version || lockfile.packages?.['']?.version !== manifest.version) {
+  problems.push(`package-lock.json root version does not match package ${manifest.version}`);
 }
 const cliVersion = cliSource.match(/const VERSION = '([^']+)'/)?.[1];
 if (cliVersion !== manifest.version) {
@@ -25,6 +29,9 @@ if (!existsSync(path.join(root, '.github', 'workflows', 'ci.yml'))) problems.pus
 const starterManifest = JSON.parse(read('starter-template/package.json'));
 if (starterManifest.version !== manifest.version) {
   problems.push(`starter-template/package.json version ${starterManifest.version} does not match package ${manifest.version}`);
+}
+if (!read('starter-template/setup.mjs').includes(`const ref = 'v${manifest.version}';`)) {
+  problems.push(`starter-template/setup.mjs is not pinned to v${manifest.version}`);
 }
 
 for (const file of filesUnder('.github', 'template/.github', 'starter-template/.github')) {

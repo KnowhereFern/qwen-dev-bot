@@ -2,6 +2,6 @@
   "name": "qwen-dev-harness",
   "displayName": "Qwen Development Harness",
   "description": "Bounded agents, reward evaluation guidance, and operator commands for the Qwen3.8-Max autonomous engineering harness.",
-  "version": "1.0.0-rc.1",
+  "version": "1.0.0-rc.2",
   "contextFileName": "QWEN-HARNESS.md"
 }

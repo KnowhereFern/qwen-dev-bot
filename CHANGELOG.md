@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.0-rc.2] - 2026-08-25
+
+- Upgraded pinned GitHub Actions to their Node 24 releases after the hosted runner reported Node 20 deprecation warnings.
+- Revalidated clean-clone install, source CI, package smoke, and starter generation.
+
 ## [1.0.0-rc.1] - 2026-08-25
 
 First public release candidate of the Qwen-inspired self-evolving development harness.
