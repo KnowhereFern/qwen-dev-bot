@@ -277,7 +277,7 @@ describe('guided installer', () => {
       timeoutMs: 20_000,
     });
     expect(receipt.exitCode).toBe(0);
-    expect(receipt.stdout.trim()).toBe('1.0.0-rc.3');
+    expect(receipt.stdout.trim()).toBe('1.0.0-rc.4');
   });
 
   it('shows setup help without entering the interactive wizard', async () => {

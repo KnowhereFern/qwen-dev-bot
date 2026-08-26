@@ -8,6 +8,7 @@ import type { GitHubControl, RemoteIssue } from './github/control-plane.js';
 import { GitWorkspace, branchFor } from './git/git-workspace.js';
 import { parseNormalizedSpec, type TaskNormalizer } from './intake/normalizer.js';
 import { Logger } from './logger.js';
+import { matchesPortfolioTaskContract, PortfolioCoordinator } from './portfolio/coordinator.js';
 import type { QwenExecutor } from './qwen/qwen-code-executor.js';
 import { UniversalRewardEngine } from './rewards/engine.js';
 import { resolveVisualArtifacts } from './rewards/evaluators.js';
@@ -45,33 +46,49 @@ export class HarnessSupervisor {
   ) {}
 
   async tick(signal?: AbortSignal): Promise<SupervisorTickResult> {
-    const recovered = await this.recoverExpiredLeases();
-    const community = this.community
-      ? await this.community.scan()
-      : { checked: 0, changed: 0, created: 0, skipped: 0, failed: 0 };
-    const ingested = await this.syncIntake();
-    if (signal?.aborted) {
-      return { community, ingested, recovered, processedTaskId: null, action: 'interrupted' };
-    }
+    try {
+      const recovered = await this.recoverExpiredLeases();
+      const community = this.community
+        ? await this.community.scan()
+        : { checked: 0, changed: 0, created: 0, skipped: 0, failed: 0 };
+      const ingested = await this.syncIntake();
+      if (signal?.aborted) {
+        return { community, ingested, recovered, processedTaskId: null, action: 'interrupted' };
+      }
 
-    const reconciled = await this.reconcilePending(signal);
-    if (signal?.aborted) {
-      return { community, ingested, recovered, processedTaskId: reconciled.at(-1)?.id ?? null, action: 'interrupted' };
-    }
+      const reconciled = await this.reconcilePending(signal);
+      if (signal?.aborted) {
+        return { community, ingested, recovered, processedTaskId: reconciled.at(-1)?.id ?? null, action: 'interrupted' };
+      }
 
-    const task = this.store.claimNext(this.workerId, this.config.worker.leaseMs);
-    if (!task) {
-      const latest = reconciled.at(-1);
-      return {
-        community,
-        ingested,
-        recovered,
-        processedTaskId: latest?.id ?? null,
-        action: latest ? `reconciled:${reconciled.length}:${latest.state}` : 'idle',
-      };
+      const task = this.store.claimNext(this.workerId, this.config.worker.leaseMs);
+      if (!task) {
+        const latest = reconciled.at(-1);
+        return {
+          community,
+          ingested,
+          recovered,
+          processedTaskId: latest?.id ?? null,
+          action: latest ? `reconciled:${reconciled.length}:${latest.state}` : 'idle',
+        };
+      }
+      await this.executeTask(task, signal);
+      return { community, ingested, recovered, processedTaskId: task.id, action: 'executed' };
+    } finally {
+      const portfolioPlans = this.store.listPortfolioPlans().filter((plan) =>
+        ['approving', 'active', 'blocked'].includes(plan.status),
+      );
+      if (!signal?.aborted && portfolioPlans.length > 0) {
+        try {
+          const coordinator = new PortfolioCoordinator(this.config, this.store, this.github);
+          for (const plan of portfolioPlans) await coordinator.refresh(plan.id);
+        } catch (error) {
+          this.logger.warn('portfolio status refresh failed', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
     }
-    await this.executeTask(task, signal);
-    return { community, ingested, recovered, processedTaskId: task.id, action: 'executed' };
   }
 
   async syncIntake(): Promise<number> {
@@ -82,6 +99,25 @@ export class HarnessSupervisor {
       const trusted = this.config.intake.trustedAuthors.includes(issue.author);
       const normalized = issue.labels.includes(this.config.intake.normalizedLabel) && parsed;
       if (normalized && trusted) {
+        const portfolioLink = this.store.listPortfolioPlans().flatMap((plan) =>
+          plan.stories
+            .filter((story) => story.normalizedIssueNumber === issue.number)
+            .map((story) => ({ plan, story })),
+        )[0];
+        if (portfolioLink && !matchesPortfolioTaskContract(portfolioLink.plan, portfolioLink.story, parsed)) {
+          const idempotencyKey = `portfolio:contract-rejected:${issue.number}:${sha256(issue.body)}`;
+          this.store.recordEvent('portfolio.contract_rejected', null, {
+            planId: portfolioLink.plan.id,
+            storyKey: portfolioLink.story.key,
+            issueNumber: issue.number,
+          }, idempotencyKey);
+          this.logger.warn('edited portfolio task contract rejected', {
+            planId: portfolioLink.plan.id,
+            storyKey: portfolioLink.story.key,
+            issueNumber: issue.number,
+          });
+          continue;
+        }
         const existing = this.store.findByIssue(issue.number);
         const task = this.store.upsert({
           issueNumber: issue.number,

@@ -809,6 +809,8 @@ async function configureGitHubRepository(config: ProjectConfig, dryRun: boolean)
     [config.intake.approvalLabel, '0e8a16', 'Maintainer approved for normalization'],
     [config.intake.normalizedLabel, '5319e7', 'Bot-normalized executable task'],
     [config.intake.communityLabel, 'fbca04', 'Untrusted community signal awaiting maintainer review'],
+    [config.intake.planLabel, '8250df', 'Master requirements plan managed by the harness'],
+    [config.intake.plannedLabel, 'c5def5', 'Planned story awaiting explicit plan approval'],
     ['self-repair', 'd93f0b', 'Created from reproducible harness feedback'],
   ];
   const existingLabelsResult = await runProcess({

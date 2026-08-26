@@ -2,7 +2,7 @@
 
 A reusable, Qwen3.8-Max-only engineering harness for turning approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.3`. The deterministic and mocked production paths are verified. Promotion to stable `v1.0.0` is gated on a complete live run with an unattended-eligible Qwen account.
+**Release status:** `v1.0.0-rc.4`. The deterministic and mocked production paths are verified. Promotion to stable `v1.0.0` is gated on a complete live run with an unattended-eligible Qwen account.
 
 This is the canonical harness source and installer repository. For a blank application repository, use the separate [Qwen Harness Starter](https://github.com/KnowhereFern/qwen-harness-starter) template and run `node setup.mjs`. Each target project receives a small tracked control plane under `.qwen-harness/`, `.qwen/`, and `.github/`; project-specific gates, reward rubrics, protected paths, sources, and merge policy live in `.qwen-harness/project.yml`.
 
@@ -17,6 +17,7 @@ This project implements the public Qwen-described architecture and feedback loop
 | Build, unit, integration, E2E, lifecycle, and security checks | Auto-discovered and project-configurable gates, bounded subprocesses, a built-in secret/symlink scan, GitHub CI, and fresh-worktree post-merge verification |
 | Universal reward system | Hard execution vetoes plus weighted Qwen rubric, independent agentic review, and optional rendered-visual scoring; every result is an evidence-linked scorecard |
 | Multi-source evolution | Allowlisted HTTPS source snapshots, content hashing, Qwen proposal extraction, deduplication, and review-only GitHub issues that must still be approved and normalized |
+| Requirements-to-delivery planning | A project-local requirements file becomes a durable master-plan issue plus bounded, dependency-aware review stories; explicit approval freezes exact normalized task contracts |
 | Dynamic workflows and multi-agent work | A Qwen workflow with parallel read-only reconnaissance, one mutating implementer, and independent review; six bounded Qwen subagents ship in the extension |
 | Multimodal-native work | Visual reward artifacts are supported directly; setup can also install the official Qwen-MM-Plugins core capability for Qwen's implementation agents |
 | Continuous delivery and self-repair | Exact remote-head checks, opt-in auto-merge, verification of the actual merge commit, and one deduplicated repair issue per post-merge regression |
@@ -28,6 +29,8 @@ The implementation tracks Qwen's official documentation for [headless goals and 
 ## Runtime loop
 
 ```text
+requirements file -> draft epic + review stories -> explicit plan approval
+                                      |
 approved issue / allowlisted source / CI regression
                          |
                   untrusted intake
@@ -140,6 +143,19 @@ The readiness matrix checks Node, Git, GitHub auth/repository/protection, the ac
 
 Create a GitHub issue and apply `harness:accept`. The raw issue is never executed. Qwen creates a separate normalized issue, the persistent worker claims it, and the task proceeds through the loop.
 
+For a larger project, give the planner one project-local requirements file (committing it is recommended). It uses Qwen only to propose a bounded acyclic delivery graph, validates every story/gate/reward ID, and publishes a review-only master issue plus story issues. Nothing can execute until you approve the plan:
+
+```sh
+qwen-harness plan /path/to/project --requirements PROJECT.md
+# Review the generated epic and stories on GitHub.
+qwen-harness plan-approve /path/to/project --plan PLAN_ID
+qwen-harness plan-status /path/to/project --plan PLAN_ID
+```
+
+Use `plan ... --approve` only when you intentionally want planning and approval in one command. Re-running the same requirements snapshot is idempotent. Editing the file creates a new draft; the harness refuses to approve that revision while an earlier plan for the same source is active or blocked, so accepted work is never silently rewritten.
+
+The minimum useful requirements file needs only: a product objective, intended user/use case, MVP scope, constraints, and observable definition of done. A story list is optional—the planner can propose it—but specific acceptance examples improve the result. The starter repository’s `PROJECT.md` is a fill-in template.
+
 Useful commands:
 
 ```sh
@@ -150,6 +166,9 @@ qwen-harness status /path/to/project [--json]
 qwen-harness logs /path/to/project [--lines 100]
 qwen-harness reward /path/to/project [--task TASK_ID | --issue N]
 qwen-harness community /path/to/project [--force]
+qwen-harness plan /path/to/project --requirements FILE [--max-stories N] [--approve]
+qwen-harness plan-approve /path/to/project --plan PLAN_ID
+qwen-harness plan-status /path/to/project [--plan PLAN_ID]
 qwen-harness update /path/to/project
 qwen-harness uninstall /path/to/project --yes [--remove-service]
 ```
@@ -175,6 +194,7 @@ Normalized task gate/reward IDs are trace metadata only: a task cannot weaken pr
 
 - Issues, comments, linked pages, source pages, logs, test output, and model output are untrusted data.
 - Only normalized issues created by configured trusted identities can become runnable tasks.
+- Portfolio story issues are review-only; approval creates separate normalized task issues from the validated, frozen plan graph.
 - One worker mutates one harness-owned worktree; research and review agents are read-only.
 - Shell execution uses argument arrays with `shell: false`, bounded output, timeouts, process-tree termination, a reduced gate environment, and a credential-minimized Qwen environment.
 - A passing summary cannot compensate for a failed hard gate, critical rubric, security finding, or changed PR head.

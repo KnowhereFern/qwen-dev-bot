@@ -32,9 +32,11 @@ export interface CheckSummary {
 
 export interface GitHubControl {
   readonly repoSlug: string;
+  currentUser(): Promise<string>;
   listOpenIssues(): Promise<RemoteIssue[]>;
   getIssue(issueNumber: number): Promise<RemoteIssue>;
   createIssue(input: { title: string; body: string; labels: string[] }): Promise<RemoteIssue>;
+  updateIssue(issueNumber: number, input: { title?: string; body?: string }): Promise<RemoteIssue>;
   comment(issueNumber: number, body: string): Promise<void>;
   addLabels(issueNumber: number, labels: string[]): Promise<void>;
   removeLabel(issueNumber: number, label: string): Promise<void>;
@@ -75,6 +77,11 @@ export class OctokitControlPlane implements GitHubControl {
     this.octokit = new Octokit({ auth: options.token });
   }
 
+  async currentUser(): Promise<string> {
+    const { data } = await this.octokit.rest.users.getAuthenticated();
+    return data.login;
+  }
+
   async listOpenIssues(): Promise<RemoteIssue[]> {
     const rows = await this.octokit.paginate(this.octokit.rest.issues.listForRepo, {
       owner: this.owner,
@@ -101,6 +108,16 @@ export class OctokitControlPlane implements GitHubControl {
       title: input.title,
       body: input.body,
       labels: input.labels,
+    });
+    return toIssue(data);
+  }
+
+  async updateIssue(issueNumber: number, input: { title?: string; body?: string }): Promise<RemoteIssue> {
+    const { data } = await this.octokit.rest.issues.update({
+      owner: this.owner,
+      repo: this.repo,
+      issue_number: issueNumber,
+      ...input,
     });
     return toIssue(data);
   }

@@ -151,11 +151,18 @@ class MockGitHub implements GitHubControl {
     });
   }
 
+  async currentUser(): Promise<string> { return 'bot'; }
   async listOpenIssues(): Promise<RemoteIssue[]> { return [...this.issues.values()]; }
   async getIssue(number: number): Promise<RemoteIssue> { return this.issues.get(number) as RemoteIssue; }
   async createIssue(input: { title: string; body: string; labels: string[] }): Promise<RemoteIssue> {
     const issue = { number: this.nextIssue++, title: input.title, body: input.body, labels: input.labels, author: 'bot', url: `https://github.test/issues/${this.nextIssue - 1}` };
     this.issues.set(issue.number, issue);
+    return issue;
+  }
+  async updateIssue(number: number, input: { title?: string; body?: string }): Promise<RemoteIssue> {
+    const issue = this.issues.get(number) as RemoteIssue;
+    if (input.title !== undefined) issue.title = input.title;
+    if (input.body !== undefined) issue.body = input.body;
     return issue;
   }
   async comment(number: number, body: string): Promise<void> { this.comments.push({ number, body }); }

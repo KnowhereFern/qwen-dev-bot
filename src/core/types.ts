@@ -99,6 +99,8 @@ export interface ProjectConfig {
     approvalLabel: string;
     normalizedLabel: string;
     communityLabel: string;
+    planLabel: string;
+    plannedLabel: string;
     trustedAuthors: string[];
     autoPromoteSelfRepair: boolean;
     communityEnabled: boolean;
@@ -162,6 +164,52 @@ export interface TaskRecord {
   createdAt: number;
   updatedAt: number;
   version: number;
+}
+
+export const PORTFOLIO_PLAN_STATUSES = [
+  'draft',
+  'approving',
+  'active',
+  'done',
+  'blocked',
+  'superseded',
+] as const;
+
+export type PortfolioPlanStatus = (typeof PORTFOLIO_PLAN_STATUSES)[number];
+
+export interface PortfolioStory {
+  key: string;
+  title: string;
+  goal: string;
+  acceptanceCriteria: string[];
+  constraints: string[];
+  requiredGateIds: string[];
+  rewardCriterionIds: string[];
+  risk: 'low' | 'medium' | 'high';
+  dependsOn: string[];
+  rollback: string;
+  sourceIssueNumber: number | null;
+  sourceIssueUrl: string | null;
+  normalizedIssueNumber: number | null;
+  normalizedIssueUrl: string | null;
+}
+
+export interface PortfolioPlan {
+  id: string;
+  projectId: string;
+  sourcePath: string;
+  contentHash: string;
+  title: string;
+  objective: string;
+  constraints: string[];
+  definitionOfDone: string[];
+  status: PortfolioPlanStatus;
+  epicIssueNumber: number | null;
+  epicIssueUrl: string | null;
+  stories: PortfolioStory[];
+  createdAt: number;
+  updatedAt: number;
+  approvedAt: number | null;
 }
 
 export interface RunCheckpoint {
