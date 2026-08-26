@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+- Enabled guarded auto-merge by default for newly installed projects, with `--no-auto-merge` as the explicit opt-out and existing project choices preserved during updates.
+
 ## [1.0.0-rc.4] - 2026-08-25
 
 - Added tracked requirements ingestion with bounded Qwen decomposition into a validated acyclic delivery graph.

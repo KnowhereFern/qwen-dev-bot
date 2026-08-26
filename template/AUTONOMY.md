@@ -26,7 +26,7 @@ The exact remote PR head must equal the locally tested and rewarded commit. A ta
 4. Run every applicable deterministic gate and the universal reward system.
 5. Push the tested commit and open or update one PR.
 6. Wait for required exact-head GitHub checks.
-7. Stop at merge-ready unless auto-merge was explicitly enabled.
+7. Merge only when the configured auto-merge policy is enabled and every exact-head check still passes; otherwise stop at merge-ready.
 8. Verify the merged commit from a fresh detached worktree; create one deduplicated self-repair issue on regression.
 
 ## Failure policy

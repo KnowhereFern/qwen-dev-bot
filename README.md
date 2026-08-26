@@ -20,7 +20,7 @@ This project implements the public Qwen-described architecture and feedback loop
 | Requirements-to-delivery planning | A project-local requirements file becomes a durable master-plan issue plus bounded, dependency-aware review stories; explicit approval freezes exact normalized task contracts |
 | Dynamic workflows and multi-agent work | A Qwen workflow with parallel read-only reconnaissance, one mutating implementer, and independent review; six bounded Qwen subagents ship in the extension |
 | Multimodal-native work | Visual reward artifacts are supported directly; setup can also install the official Qwen-MM-Plugins core capability for Qwen's implementation agents |
-| Continuous delivery and self-repair | Exact remote-head checks, opt-in auto-merge, verification of the actual merge commit, and one deduplicated repair issue per post-merge regression |
+| Continuous delivery and self-repair | Exact remote-head checks, guarded auto-merge by default, verification of the actual merge commit, and one deduplicated repair issue per post-merge regression |
 
 The Qwen article's **online data balancer** is RL-training infrastructure, not a repository automation feature. This harness does not pretend to train or rebalance model batches. At runtime it provides deterministic per-project polling, task priority, and bounded mutation concurrency.
 
@@ -64,7 +64,7 @@ Supported task states are `intake`, `normalized`, `ready`, `leased`, `active`, `
 
 Token Plan Personal is intentionally rejected by setup: QwenCloud limits it to personal interactive use and prohibits background automation, batch scripts, and application backends. Coding Plan is also rejected because its current supported-model list does not include this template's required `qwen3.8-max`. Token Plan Team uses `BAILIAN_TOKEN_PLAN_API_KEY` with `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`; standard QwenCloud uses its matching standard key and endpoint. Setup and doctor prevent known plan-key/endpoint mismatches.
 
-The target repository must already exist. Setup does not create a GitHub repository, push commits, or enable auto-merge unless explicitly requested.
+The target repository must already exist. Setup does not create a GitHub repository or push commits. New project configurations enable guarded auto-merge by default; setup changes GitHub labels and branch protection only when explicitly requested.
 
 ## Guided setup
 
@@ -109,7 +109,7 @@ npm run setup -- /absolute/path/to/your-project --yes \
   --persist-api-key --configure-github
 ```
 
-`--auto-merge` is deliberately separate and defaults off. The installer is idempotent: it updates unchanged harness-owned files, preserves project customizations, backs up pre-existing settings, and records hashes for safe uninstall. Optional GitHub configuration creates only missing labels and adds only missing required status contexts; it does not replace existing label metadata or branch-protection rules.
+Guarded auto-merge defaults on for new projects so a fully passing story can unblock its dependents without human polling. Answer `no` in the wizard or pass `--no-auto-merge` to opt out; `--auto-merge` can explicitly opt an existing project back in during `update`. Existing project choices are preserved unless a flag changes them. The installer is idempotent: it updates unchanged harness-owned files, preserves project customizations, backs up pre-existing settings, and records hashes for safe uninstall. Optional GitHub configuration creates only missing labels and adds only missing required status contexts; it does not replace existing label metadata or branch-protection rules.
 
 Setup writes additive project `.qwen/settings.json` entries for `qwen3.8-max`, sandboxing, leaf-only delegation, and dynamic workflows, referring only to the configured credential environment name; it never writes the credential into tracked project settings. The harness resolves that name from the same untracked user locations Qwen Code uses. Model-driven Qwen subprocesses receive a least-privilege environment, never inherit GitHub/OpenAI/npm/cloud credentials, and use an invocation-level MCP allowlist. The allowlist is empty by default; `--with-mm` adds only `qwen-mm-plugins-core`. The main session and reviewers remain non-mutating; each headless run auto-approves only the exact installed saved workflow path, and only that workflow's implementer receives YOLO approval. The implementer remains inside Qwen's sandbox, an isolated worktree, and the supervisor's external protected-path checks. The saved dynamic workflow receives explicit concurrency, total-agent, wall-time, output-token, per-agent turn, and per-agent time limits from project configuration.
 
@@ -198,7 +198,7 @@ Normalized task gate/reward IDs are trace metadata only: a task cannot weaken pr
 - One worker mutates one harness-owned worktree; research and review agents are read-only.
 - Shell execution uses argument arrays with `shell: false`, bounded output, timeouts, process-tree termination, a reduced gate environment, and a credential-minimized Qwen environment.
 - A passing summary cannot compensate for a failed hard gate, critical rubric, security finding, or changed PR head.
-- Auto-merge is opt-in and uses GitHub's expected-head SHA guard.
+- Auto-merge defaults on, can be disabled per project, and uses GitHub's expected-head SHA guard.
 - `done` means the actual merge commit passed a fresh post-merge run—not merely that code, a PR, or CI exists.
 - SQLite state, checkpoints, service credentials, transcripts, and redacted JSONL ledgers stay outside tracked project content.
 

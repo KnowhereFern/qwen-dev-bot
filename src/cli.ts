@@ -56,7 +56,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           qwenBaseUrl: valueOf(args, '--base-url'),
           qwenCredentialEnvKey: valueOf(args, '--api-key-env'),
           qwenBillingPlan: billingPlanValue(args),
-          autoMerge: hasFlag(args, '--auto-merge') || undefined,
+          autoMerge: toggleFlagValue(args, '--auto-merge', '--no-auto-merge'),
           enableCommunity: hasFlag(args, '--community') || undefined,
           installQwen: hasFlag(args, '--install-qwen') || undefined,
           installService: hasFlag(args, '--install-service') ? true : hasFlag(args, '--no-service') ? false : undefined,
@@ -91,7 +91,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           qwenBaseUrl: valueOf(args, '--base-url') ?? current.qwen.baseUrl,
           qwenCredentialEnvKey: valueOf(args, '--api-key-env') ?? current.qwen.credentialEnvKey,
           qwenBillingPlan: billingPlanValue(args) ?? current.qwen.billingPlan,
-          autoMerge: current.worker.autoMerge,
+          autoMerge: toggleFlagValue(args, '--auto-merge', '--no-auto-merge') ?? current.worker.autoMerge,
           enableCommunity: current.intake.communityEnabled,
           installQwen: hasFlag(args, '--install-qwen'),
           installService: hasFlag(args, '--install-service') ? true : hasFlag(args, '--no-service') ? false : undefined,
@@ -374,6 +374,13 @@ function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
 }
 
+function toggleFlagValue(args: string[], enabledFlag: string, disabledFlag: string): boolean | undefined {
+  const enabled = hasFlag(args, enabledFlag);
+  const disabled = hasFlag(args, disabledFlag);
+  if (enabled && disabled) throw new Error(`${enabledFlag} and ${disabledFlag} cannot be used together`);
+  return enabled ? true : disabled ? false : undefined;
+}
+
 function valueOf(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
@@ -422,7 +429,7 @@ Commands:
 Init options:
   --dry-run --yes --name NAME --repo OWNER/NAME --trusted-author LOGIN --billing-plan PLAN
   --base-url URL --api-key-env NAME
-  --auto-merge --community --configure-github --install-qwen --with-mm --with-browser --install-cli --persist-api-key
+  --auto-merge --no-auto-merge --community --configure-github --install-qwen --with-mm --with-browser --install-cli --persist-api-key
   --install-service --no-service --no-link-extension --skip-dependencies
 
 Reward options:

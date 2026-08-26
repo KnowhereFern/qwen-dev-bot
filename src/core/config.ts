@@ -38,7 +38,7 @@ export function defaultProjectConfig(root: string, name = path.basename(root), g
       maxReadOnlyAgents: 4,
       maxAttempts: 5,
       identicalFailureLimit: 3,
-      autoMerge: false,
+      autoMerge: true,
     },
     intake: {
       readyLabel: 'harness:ready',
