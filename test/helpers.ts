@@ -1,4 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { afterEach } from 'vitest';
 import { Logger } from '../src/logger.js';
@@ -8,12 +9,12 @@ export const silentLogger = new Logger({ sink: () => {} });
 
 const tmpDirs: string[] = [];
 
-/** Create a unique temp workDir inside the project (`.tmp/`), auto-removed. */
+/** Create an isolated operating-system temp workDir, auto-removed with sibling state. */
 export function makeTmp(prefix: string): string {
-  const base = path.join(process.cwd(), '.tmp');
-  mkdirSync(base, { recursive: true });
-  const dir = mkdtempSync(path.join(base, `${prefix}-`));
-  tmpDirs.push(dir);
+  const root = mkdtempSync(path.join(os.tmpdir(), `qwen-harness-${prefix}-`));
+  const dir = path.join(root, 'work');
+  mkdirSync(dir);
+  tmpDirs.push(root);
   return dir;
 }
 
