@@ -1,7 +1,7 @@
 {
   "name": "qwen-dev-harness",
-  "displayName": "Qwen Development Harness",
-  "description": "Bounded agents, reward evaluation guidance, and operator commands for the Qwen3.8-Max autonomous engineering harness.",
+  "displayName": "Autonomous Software Delivery Harness",
+  "description": "Fern-designed delivery agents, reward evaluation guidance, and operator commands powered by Qwen3.8-Max.",
   "version": "1.0.0-rc.4",
-  "contextFileName": "QWEN-HARNESS.md"
+  "contextFileName": "DELIVERY-HARNESS.md"
 }

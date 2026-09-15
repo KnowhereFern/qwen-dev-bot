@@ -4,7 +4,7 @@ import type { ProjectConfig } from './core/types.js';
 import { PROJECT_CONFIG_PATH } from './core/config.js';
 import { redactText } from './core/ledger.js';
 import { QwenApiClient } from './qwen/qwen-api.js';
-import { qwenCredentialCompatibilityProblem, resolveQwenCredential } from './qwen/credentials.js';
+import { qwenCredentialCompatibilityProblem, resolveQwenCredential } from './qwen/credential-resolver.js';
 import {
   MIN_QWEN_CODE_VERSION,
   QWEN_MM_CORE_MCP_SERVER,
@@ -175,7 +175,7 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
         compatibilityProblem ? 'fail' : config.qwen.billingPlan === 'custom' ? 'warn' : 'pass',
         compatibilityProblem ??
           (config.qwen.billingPlan === 'custom'
-            ? 'Custom Qwen billing route selected; confirm it permits unattended automation'
+            ? 'Custom Qwen billing route selected; verify its credential and endpoint compatibility'
             : `${config.qwen.billingPlan} credential family and endpoint are consistent`),
       ),
     );
@@ -427,11 +427,11 @@ export function templateAssetProblems(root: string): string[] {
     ['QWEN.md', ['The external supervisor', 'harness-implement.js']],
     ['.github/CODEOWNERS', ['/.qwen-harness/', '/.qwen/workflows/harness-*']],
     ['.github/ISSUE_TEMPLATE/harness-task.yml', ['Harness improvement request', 'harness:accept']],
-    ['.github/workflows/harness-ci.yml', ['Qwen Harness / CI', 'run-gates.mjs', 'persist-credentials: false']],
-    ['.github/workflows/harness-dispatch.yml', ['Qwen Harness Dispatch Health', 'harness:ready']],
-    ['.github/workflows/harness-governance.yml', ['Qwen Harness / governance', 'check-governance.mjs', 'persist-credentials: false']],
-    ['.github/workflows/harness-intake.yml', ['Qwen Harness Intake', 'harness:accept']],
-    ['.github/workflows/harness-postmerge.yml', ['Qwen Harness Post-merge Repair', 'self-repair']],
+    ['.github/workflows/harness-ci.yml', ['Fern Delivery Harness / CI', 'run-gates.mjs', 'persist-credentials: false']],
+    ['.github/workflows/harness-dispatch.yml', ['Fern Delivery Harness Dispatch Health', 'harness:ready']],
+    ['.github/workflows/harness-governance.yml', ['Fern Delivery Harness / governance', 'check-governance.mjs', 'persist-credentials: false']],
+    ['.github/workflows/harness-intake.yml', ['Fern Delivery Harness Intake', 'harness:accept']],
+    ['.github/workflows/harness-postmerge.yml', ['Fern Delivery Harness Post-merge Repair', 'self-repair']],
     ['.qwen-harness/scripts/bootstrap.mjs', ["spawn(command, args", 'shell: false', 'terminateTree', 'declaredNodePackages', "['install', '--list']"]],
     ['.qwen-harness/scripts/check-governance.mjs', ['--name-status', '--find-renames']],
     ['.qwen-harness/scripts/run-gates.mjs', ['config.gates', 'timeoutMs', 'terminateTree']],

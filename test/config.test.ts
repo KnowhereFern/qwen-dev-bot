@@ -37,15 +37,22 @@ describe('project configuration invariants', () => {
 
   it('validates the configured Qwen credential environment name', () => {
     const config = defaultProjectConfig(makeTmp('config-credential'), 'fixture', 'owner/fixture');
-    config.qwen.credentialEnvKey = 'BAILIAN_CODING_PLAN_API_KEY';
+    config.qwen.credentialEnvKey = 'CUSTOM_QWEN_API_KEY';
     expect(validateProjectConfig(config)).toBe(config);
     config.qwen.credentialEnvKey = 'bad-key';
     expect(() => validateProjectConfig(config)).toThrow(/credentialEnvKey/);
   });
 
-  it('requires the Token Plan endpoint for unattended Team billing', () => {
-    const config = defaultProjectConfig(makeTmp('config-token-team'), 'fixture', 'owner/fixture');
-    config.qwen.billingPlan = 'token-plan-team';
+  it('keeps technology policy approval separate from live deployment authority', () => {
+    const config = defaultProjectConfig(makeTmp('config-technologies'), 'fixture', 'owner/fixture');
+    expect(config.technologyPolicy.approved).toContainEqual({ category: 'hosting', technology: 'Vercel' });
+    config.technologyPolicy.authority = 'production' as 'build-test-only';
+    expect(() => validateProjectConfig(config)).toThrow(/technologyPolicy/);
+  });
+
+  it.each(['token-plan-personal', 'token-plan-team'] as const)('requires the Token Plan endpoint for %s', (billingPlan) => {
+    const config = defaultProjectConfig(makeTmp(`config-${billingPlan}`), 'fixture', 'owner/fixture');
+    config.qwen.billingPlan = billingPlan;
     config.qwen.credentialEnvKey = 'BAILIAN_TOKEN_PLAN_API_KEY';
     expect(() => validateProjectConfig(config)).toThrow(/Token Plan base URL/);
     config.qwen.baseUrl = 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1';

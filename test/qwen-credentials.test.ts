@@ -2,7 +2,7 @@ import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
-import { detectQwenCredentialEnvKey, qwenCredentialCompatibilityProblem, resolveQwenCredential } from '../src/qwen/credentials.js';
+import { qwenCredentialCompatibilityProblem, resolveQwenCredential } from '../src/qwen/credential-resolver.js';
 import { makeTmp } from './helpers.js';
 
 describe('Qwen credential resolution', () => {
@@ -29,19 +29,6 @@ describe('Qwen credential resolution', () => {
     expect(`${credential?.source} ${credential?.envKey}`).not.toContain('saved-secret');
   });
 
-  it('detects a Coding Plan credential stored in Qwen settings', () => {
-    const root = makeTmp('qwen-coding-plan');
-    const settings = path.join(root, 'settings.json');
-    writeFileSync(settings, JSON.stringify({ env: { BAILIAN_CODING_PLAN_API_KEY: 'plan-secret' } }));
-    expect(
-      detectQwenCredentialEnvKey({
-        environment: {},
-        qwenSettingsFile: settings,
-        qwenEnvironmentFile: path.join(root, 'missing.env'),
-      }),
-    ).toBe('BAILIAN_CODING_PLAN_API_KEY');
-  });
-
   it('rejects a plan key routed through the standard billing endpoint', () => {
     const config = defaultProjectConfig(makeTmp('qwen-route'), 'fixture', 'owner/fixture');
     expect(
@@ -51,5 +38,18 @@ describe('Qwen credential resolution', () => {
         source: 'Qwen user settings',
       }),
     ).toMatch(/not interchangeable/);
+  });
+
+  it.each(['token-plan-personal', 'token-plan-team'] as const)('requires an sk-sp credential for %s', (billingPlan) => {
+    const config = defaultProjectConfig(makeTmp(`qwen-${billingPlan}`), 'fixture', 'owner/fixture');
+    config.qwen.billingPlan = billingPlan;
+    config.qwen.baseUrl = 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1';
+    expect(
+      qwenCredentialCompatibilityProblem(config, {
+        apiKey: 'standard-redacted',
+        envKey: 'BAILIAN_TOKEN_PLAN_API_KEY',
+        source: 'Qwen user settings',
+      }),
+    ).toMatch(/dedicated sk-sp credential/);
   });
 });

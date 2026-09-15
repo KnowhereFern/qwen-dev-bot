@@ -16,5 +16,5 @@ mkdirSync(target, { recursive: true });
 const safeTarget = realpathSync(target);
 cpSync(source, safeTarget, { recursive: true, errorOnExist: true });
 renameSync(path.join(safeTarget, 'gitignore.template'), path.join(safeTarget, '.gitignore'));
-console.log(`Created Qwen harness starter at ${safeTarget}`);
+console.log(`Created delivery harness starter at ${safeTarget}`);
 console.log(`Next: cd ${JSON.stringify(safeTarget)} && git init -b main`);

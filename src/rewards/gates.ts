@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync } from 'node:fs';
-import path from 'node:path';
 import type { GateDefinition, GateResult } from '../core/types.js';
 import { environmentSecretValues } from '../core/ledger.js';
 import { gateEnvironment, resolveInside, runProcess } from '../runtime/safe-process.js';

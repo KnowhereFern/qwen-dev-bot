@@ -2,7 +2,7 @@ import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
-import type { GateResult, RewardCriterionConfig, TaskRecord } from '../src/core/types.js';
+import type { GateResult, TaskRecord } from '../src/core/types.js';
 import { UniversalRewardEngine, type EvaluatorResult, type RewardContext, type RewardEvaluator } from '../src/rewards/engine.js';
 import { ExecutionEvaluator } from '../src/rewards/evaluators.js';
 import { GateRunner } from '../src/rewards/gates.js';
@@ -63,7 +63,8 @@ describe('universal runtime rewards', () => {
 
   it('fails the built-in security gate on a changed credential', async () => {
     const root = makeTmp('reward-secret');
-    writeFileSync(path.join(root, 'leak.txt'), 'OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456\n');
+    const providerKey = `sk-${'abcdefghijklmnopqrstuvwxyz123456'}`;
+    writeFileSync(path.join(root, 'leak.txt'), `OPENAI_API_KEY=${providerKey}\n`);
     const result = await new GateRunner().runAll([], root, ['leak.txt']);
     expect(result[0]?.id).toBe('harness-security');
     expect(result[0]?.ok).toBe(false);

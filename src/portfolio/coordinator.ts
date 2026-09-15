@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { PersistentTaskStore } from '../core/persistent-store.js';
 import type { PortfolioPlan, PortfolioStory, ProjectConfig, TaskRecord, TaskSpec } from '../core/types.js';
-import type { GitHubControl, RemoteIssue } from '../github/control-plane.js';
+import type { GitHubControl } from '../github/control-plane.js';
 import { renderNormalizedBody } from '../intake/normalizer.js';
 import type { PortfolioDraft } from './planner.js';
 
@@ -43,6 +43,8 @@ export class PortfolioCoordinator {
       objective: input.draft.objective,
       constraints: [...input.draft.constraints],
       definitionOfDone: [...input.draft.definitionOfDone],
+      technologyDecisions: structuredClone(input.draft.technologyDecisions),
+      deploymentDecisions: structuredClone(input.draft.deploymentDecisions),
       status: 'draft',
       epicIssueNumber: null,
       epicIssueUrl: null,
@@ -122,6 +124,8 @@ export class PortfolioCoordinator {
         risk: story.risk,
         dependencies,
         rollback: story.rollback,
+        technologyDecisions: technologyDecisionsFor(plan, story),
+        deploymentDecisions: deploymentDecisionsFor(plan, story),
       };
       const body = `${renderNormalizedBody(source, spec)}\n\n<!-- ${NORMALIZED_STORY_MARKER} ${plan.id}:${story.key} -->`;
       const normalized = await this.github.createIssue({
@@ -334,6 +338,8 @@ export function matchesPortfolioTaskContract(
     risk: story.risk,
     dependencies: dependencyIssues,
     rollback: story.rollback,
+    technologyDecisions: technologyDecisionsFor(plan, story),
+    deploymentDecisions: deploymentDecisionsFor(plan, story),
   };
   const actual = {
     ...spec,
@@ -361,6 +367,24 @@ function renderEpic(plan: PortfolioPlan, tasks: TaskRecord[]): string {
     '',
     '## Constraints',
     ...(plan.constraints.length ? plan.constraints.map((item) => `- ${item}`) : ['- None declared.']),
+    '',
+    '## Frozen technology decisions',
+    ...(plan.technologyDecisions.length
+      ? plan.technologyDecisions.map(
+          (decision) =>
+            `- \`${decision.id}\` ${decision.category}: **${decision.technology}** (${decision.source}) — ${decision.rationale}`,
+        )
+      : ['- None required.']),
+    '',
+    '## Frozen deployment decisions',
+    ...(plan.deploymentDecisions.length
+      ? plan.deploymentDecisions.map(
+          (decision) =>
+            `- \`${decision.id}\` ${decision.component}: **${decision.provider} / ${decision.environment}** — ${decision.authority}; ${decision.rationale}`,
+        )
+      : ['- None required.']),
+    '',
+    '> Plan approval freezes these decisions. Build-and-test authority does not grant credentials, resource creation, or live deployment authority.',
     '',
     '## Delivery graph',
     ...plan.stories.map((story) => {
@@ -395,6 +419,9 @@ function renderStory(plan: PortfolioPlan, story: PortfolioStory): string {
     '## Dependencies',
     ...(dependencies.length ? dependencies : ['- None']),
     '',
+    '## Frozen decisions for this story',
+    ...renderStoryDecisions(plan, story),
+    '',
     `Required gates: ${story.requiredGateIds.join(', ') || '(none)'}`,
     `Reward criteria: ${story.rewardCriterionIds.join(', ') || '(none)'}`,
     `Risk: **${story.risk}**`,
@@ -403,6 +430,32 @@ function renderStory(plan: PortfolioPlan, story: PortfolioStory): string {
     `Source requirements: \`${plan.sourcePath}\` at \`${plan.contentHash}\``,
     `<!-- ${STORY_MARKER} ${plan.id}:${story.key} -->`,
   ].join('\n');
+}
+
+function technologyDecisionsFor(plan: PortfolioPlan, story: PortfolioStory) {
+  return plan.technologyDecisions
+    .filter((decision) => story.technologyDecisionIds.includes(decision.id))
+    .map((decision) => structuredClone(decision));
+}
+
+function deploymentDecisionsFor(plan: PortfolioPlan, story: PortfolioStory) {
+  return plan.deploymentDecisions
+    .filter((decision) => story.deploymentDecisionIds.includes(decision.id))
+    .map((decision) => structuredClone(decision));
+}
+
+function renderStoryDecisions(plan: PortfolioPlan, story: PortfolioStory): string[] {
+  const technologies = technologyDecisionsFor(plan, story).map(
+    (decision) =>
+      `- Technology \`${decision.id}\`: ${decision.category} = **${decision.technology}** (${decision.source}) — ${decision.rationale}`,
+  );
+  const deployments = deploymentDecisionsFor(plan, story).map(
+    (decision) =>
+      `- Deployment \`${decision.id}\`: ${decision.component} on **${decision.provider} / ${decision.environment}** — ${decision.authority}; ${decision.rationale}`,
+  );
+  return technologies.length || deployments.length
+    ? [...technologies, ...deployments, '- Authority boundary: build and test only; no credentials, resource creation, or live deployment.']
+    : ['- None.'];
 }
 
 function taskForStory(story: PortfolioStory, tasks: TaskRecord[]): TaskRecord | undefined {

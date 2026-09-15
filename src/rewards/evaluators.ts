@@ -3,7 +3,12 @@ import { globSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { RewardCriterionConfig, RewardEvidence } from '../core/types.js';
 import { QwenApiClient, parseJson } from '../qwen/qwen-api.js';
-import { qwenEnvironment, qwenMcpArgs, qwenSubagentArgs } from '../qwen/runtime-compat.js';
+import {
+  qwenEnvironment,
+  qwenMcpArgs,
+  qwenSubagentArgs,
+  type QwenRuntimeCredential,
+} from '../qwen/runtime-compat.js';
 import { runProcess } from '../runtime/safe-process.js';
 import type { EvaluatorResult, RewardContext, RewardEvaluator } from './engine.js';
 
@@ -80,6 +85,8 @@ export class QwenRubricEvaluator implements RewardEvaluator {
 export class QwenAgenticEvaluator implements RewardEvaluator {
   readonly modality = 'agentic' as const;
 
+  constructor(private readonly credential?: QwenRuntimeCredential | null) {}
+
   async evaluate(criterion: RewardCriterionConfig, context: RewardContext): Promise<EvaluatorResult> {
     const schema = JSON.stringify({
       type: 'object',
@@ -126,7 +133,11 @@ export class QwenAgenticEvaluator implements RewardEvaluator {
       timeoutMs: 25 * 60_000,
       signal: context.signal,
       maxOutputBytes: 10 * 1024 * 1024,
-      env: { ...qwenEnvironment(), QWEN_SANDBOX: 'true', QWEN_CODE_UNATTENDED_RETRY: '1' },
+      env: {
+        ...qwenEnvironment(process.env, this.credential),
+        QWEN_SANDBOX: 'true',
+        QWEN_CODE_UNATTENDED_RETRY: '1',
+      },
     });
     if (receipt.exitCode !== 0 || receipt.aborted) throw new Error(`Qwen independent review failed: ${receipt.stderr.slice(-1_000)}`);
     const output = parseStructuredResult(receipt.stdout);
@@ -244,6 +255,15 @@ function renderReviewInput(criterion: RewardCriterionConfig, context: RewardCont
     `Goal: ${spec?.goal ?? context.task.title}`,
     'Acceptance criteria:',
     ...(spec?.acceptanceCriteria ?? []).map((item) => `- ${item}`),
+    'Frozen technology decisions:',
+    ...(spec?.technologyDecisions ?? []).map(
+      (decision) => `- ${decision.id}: ${decision.category} = ${decision.technology} (${decision.source})`,
+    ),
+    'Frozen deployment decisions:',
+    ...(spec?.deploymentDecisions ?? []).map(
+      (decision) =>
+        `- ${decision.id}: ${decision.component} on ${decision.provider}/${decision.environment}; authority=${decision.authority}`,
+    ),
     'Gate evidence:',
     ...context.gateResults.map((gate) => `- ${gate.id}: ${gate.ok ? 'PASS' : 'FAIL'} (${gate.evidenceHash})`),
     `Changed files: ${context.changedFiles.join(', ')}`,

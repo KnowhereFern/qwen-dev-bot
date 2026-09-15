@@ -23,6 +23,8 @@ function validSpec(): TaskSpec {
     risk: 'low',
     dependencies: [2],
     rollback: 'Revert the task commit.',
+    technologyDecisions: [],
+    deploymentDecisions: [],
   };
 }
 

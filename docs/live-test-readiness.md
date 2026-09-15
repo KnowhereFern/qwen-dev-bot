@@ -1,6 +1,8 @@
-# Qwen Harness: 16-Day Run Overview
+# Live Test Readiness
 
-Status checked: August 26, 2026
+Status checked: September 15, 2026
+
+This document describes Fern's software-delivery product: a governed system for turning approved objectives into verified releases through Qwen Code and `qwen3.8-max`.
 
 ## Bottom line
 
@@ -10,7 +12,7 @@ The honest status is:
 
 - **Architecture:** ready for a controlled live demo.
 - **Current machine:** not running yet. No target project is registered and no persistent worker service is installed.
-- **Provider:** Qwen Code `0.22.1` is now the active version, but Token Plan Personal cannot be used for unattended/background automation.
+- **Provider:** Qwen Code `0.22.1` is active. Token Plan Personal and Team are supported through their dedicated key and endpoint configuration.
 - **Release proof:** deterministic tests and mocked production boundaries pass; a real end-to-end soak is still required before calling this stable `v1.0.0`.
 
 A normal user should only need to provide one requirements file, run guided setup, review the proposed plan, and approve it. The harness handles the individual stories after that.
@@ -73,7 +75,7 @@ That provides practical continuation. A literal `load checkpoint and restore pha
 
 ## What the reward system does
 
-The reward system is a runtime quality gate, not Qwen's private RL training system.
+The reward system is the runtime quality gate for delivered work.
 
 For every candidate commit it combines:
 
@@ -82,7 +84,7 @@ For every candidate commit it combines:
 3. **Independent agent review:** a separate read-only review looks for unresolved high-severity defects.
 4. **Optional visual review:** rendered screenshots or other configured visual artifacts can be scored.
 
-Every criterion has a threshold and weight. All hard criteria, all critical criteria, and the aggregate threshold must pass. The resulting scorecard is tied to the task and commit SHA and is published as `Qwen Harness / reward`.
+Every criterion has a threshold and weight. All hard criteria, all critical criteria, and the aggregate threshold must pass. The resulting scorecard is tied to the task and commit SHA and is published as `Fern Delivery Harness / reward`.
 
 The reward system supports a long run by producing a consistent decision at every boundary:
 
@@ -105,10 +107,10 @@ It does **not** keep the worker alive. Long-run continuity comes from the servic
 | PR, CI, merge, and post-merge loop | Ready, default-on | Exact-head checks and post-merge verification exist. New projects default `autoMerge` to `true`; projects can opt out and pause at `merge_ready`. |
 | Dependency and browser preflight | Ready | Setup/bootstrap and doctor check package managers, dependencies, configured gate executables, and declared Playwright/Cypress runtimes. |
 | Persistent worker | Implemented, not installed here | macOS uses `RunAtLoad` plus `KeepAlive`; Linux uses `Restart=always`. This Mac currently has no worker service. |
-| Current Qwen executable | Ready | `PATH` resolves `/Users/iamfern/.npm-global/bin/qwen`, version `0.22.1`. |
+| Current Qwen executable | Ready | `PATH` resolves Qwen Code version `0.22.1`. |
 | Current harness installation | Not ready | `qwen-harness` is not on `PATH`; the local source command can still be used. |
 | Registered target | Not ready | The local registry contains zero projects. |
-| Eligible unattended credential | Not ready | The stated Token Plan Personal subscription is not eligible for background automation. Use Token Plan Team, standard/pay-as-you-go QwenCloud, or another explicitly permitted compatible route. |
+| Configured model credential | Not ready | A standard credential is present in Qwen user settings; the selected Token Plan credential and endpoint still need to be connected and verified for the test project. |
 | Always-on host | Not established | A sleeping or powered-off Mac does not execute work. A 16-day run needs an always-on host and network. |
 | Health alerting | Missing | Status and logs exist, but there is no proactive alert when the worker stops, a credential expires, disk fills, or a task is quarantined. |
 | State backup and log retention | Missing | SQLite and JSONL state are durable on one disk, but there is no scheduled backup, integrity check, or log rotation/retention policy. |
@@ -119,7 +121,7 @@ It does **not** keep the worker alive. Long-run continuity comes from the servic
 These are the minimum blockers, not optional polish:
 
 1. Choose a real demo repository and place a small `PROJECT.md` in it.
-2. Use a Qwen credential whose terms permit unattended automation. Token Plan Personal is a hard stop for this use case.
+2. Configure the selected Qwen billing route with its matching credential and endpoint.
 3. Run guided setup against that target, install/link the CLI, register the project, and install the worker service.
 4. Make every `doctor --live` and `verify` check pass, including one real Qwen3.8-Max call.
 5. Keep the default `autoMerge` setting enabled if no human will merge PRs, and configure the required branch-protection checks.
@@ -205,9 +207,8 @@ Do not measure success only by commit count. A credible run should show:
 - worker uptime and stalled/quarantined tasks were externally visible;
 - no protected harness files or unrelated target work were modified.
 
-## References
+## Runtime documentation
 
-- [Qwen3.8-Max article and self-evolving harness description](https://qwen.ai/blog?id=qwen3.8)
 - [Official Qwen Code headless mode, Goal resumption, and budgets](https://qwenlm.github.io/qwen-code-docs/en/users/features/headless/)
-- [Official QwenCloud Token Plan Personal FAQ](https://docs.qwencloud.com/token-plan/personal/token-plan-personal-faq)
+- [Official QwenCloud Token Plan quick start](https://docs.qwencloud.com/token-plan/personal/token-plan-personal-quickstart)
 - [Repository README](README.md)

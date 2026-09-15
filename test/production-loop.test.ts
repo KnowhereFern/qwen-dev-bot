@@ -19,7 +19,7 @@ import { ExecutionEvaluator } from '../src/rewards/evaluators.js';
 import { GateRunner } from '../src/rewards/gates.js';
 import { HarnessSupervisor } from '../src/supervisor.js';
 import { runProcess } from '../src/runtime/safe-process.js';
-import { createGitFixture } from './git-workspace.test.js';
+import { createGitFixture } from './fixtures/git.js';
 import { makeTmp, silentLogger } from './helpers.js';
 
 class MockQwenExecutor implements QwenExecutor {
@@ -31,6 +31,7 @@ class MockQwenExecutor implements QwenExecutor {
       workflowRunId: 'workflow-1',
       summary: 'add verified feature',
       goalState: 'complete',
+      goalReason: null,
       needsContinuation: false,
       usage: { output_tokens: 10 },
       durationMs: 5,
@@ -64,6 +65,8 @@ class MockNormalizer implements TaskNormalizer {
       risk: 'low',
       dependencies: [],
       rollback: 'Revert the feature commit.',
+      technologyDecisions: [],
+      deploymentDecisions: [],
     };
     return { title: 'Add verified feature', body: renderNormalizedBody(issue, spec), spec };
   }
@@ -138,7 +141,6 @@ class MockGitHub implements GitHubControl {
   readonly prs = new Map<number, RemotePullRequest>();
   readonly checks: string[] = [];
   private nextIssue = 2;
-  private lastSha = '';
 
   constructor() {
     this.issues.set(1, {
@@ -179,7 +181,7 @@ class MockGitHub implements GitHubControl {
   }
   async getPullRequest(number: number): Promise<RemotePullRequest> { return this.prs.get(number) as RemotePullRequest; }
   async checksForRef(): Promise<CheckSummary> { return { complete: true, successful: true, pending: [], failed: [] }; }
-  async publishCheck(input: { name: string; sha: string }): Promise<void> { this.checks.push(input.name); this.lastSha = input.sha; }
+  async publishCheck(input: { name: string; sha: string }): Promise<void> { this.checks.push(input.name); }
   async mergePullRequest(number: number, expectedHeadSha: string): Promise<{ merged: boolean; sha: string; message: string }> {
     const pr = this.prs.get(number) as RemotePullRequest;
     pr.merged = true;
@@ -336,7 +338,7 @@ describe('production supervisor trace', () => {
     expect(normalized?.prNumber).toBe(1);
     expect(normalized?.rewardRunId).toBeTruthy();
     expect(normalized?.spec?.source.kind).toBe('community');
-    expect(github.checks).toContain('Qwen Harness / reward');
+    expect(github.checks).toContain('Fern Delivery Harness / reward');
     expect(github.prs.get(1)?.merged).toBe(true);
     expect(github.comments.some((comment) => comment.number === 1 && comment.body.includes('Normalized'))).toBe(true);
 

@@ -50,6 +50,17 @@ describe('Qwen runtime boundary', () => {
     expect(environment).not.toHaveProperty('SSH_AUTH_SOCK');
   });
 
+  it('forwards only the configured custom credential alongside the safe environment', () => {
+    const environment = qwenEnvironment(
+      { PATH: '/bin', CUSTOM_QWEN_KEY: 'from-source', UNRELATED_SECRET: 'do-not-forward' },
+      { envKey: 'CUSTOM_QWEN_KEY', apiKey: 'resolved-custom-secret' },
+    );
+
+    expect(environment.CUSTOM_QWEN_KEY).toBe('resolved-custom-secret');
+    expect(environment).not.toHaveProperty('UNRELATED_SECRET');
+    expect(() => qwenEnvironment({}, { envKey: 'unsafe-key', apiKey: 'secret' })).toThrow(/uppercase/);
+  });
+
   it('caps MCP discovery to explicit project servers and denies all by default', () => {
     expect(NO_MCP_SERVERS_VALUE).toBe('');
     expect(qwenMcpArgs([])).toEqual(['--allowed-mcp-server-names', '']);

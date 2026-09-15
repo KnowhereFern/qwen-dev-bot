@@ -55,14 +55,26 @@ function draft(): PortfolioDraft {
     objective: 'Deliver the minimum useful demo',
     constraints: ['Preserve existing behavior'],
     definitionOfDone: ['Every story is merged and verified'],
+    technologyDecisions: [
+      { id: 'WEB', category: 'hosting', technology: 'Vercel', source: 'approved', rationale: 'Host the web app' },
+      { id: 'AUTH', category: 'authentication', technology: 'Clerk', source: 'approved', rationale: 'Authenticate users' },
+    ],
+    deploymentDecisions: [
+      {
+        id: 'WEB_PREVIEW', component: 'web', provider: 'Vercel', environment: 'preview',
+        authority: 'build-test-only', rationale: 'Prepare preview configuration',
+      },
+    ],
     stories: [
       {
         key: 'S1', title: 'Foundation', goal: 'Build the foundation', acceptanceCriteria: ['Foundation test passes'],
         constraints: [], requiredGateIds: ['test'], rewardCriterionIds: ['execution'], risk: 'low', dependsOn: [], rollback: 'Revert foundation',
+        technologyDecisionIds: ['AUTH'], deploymentDecisionIds: [],
       },
       {
         key: 'S2', title: 'Feature', goal: 'Build the feature', acceptanceCriteria: ['Feature test passes'],
         constraints: [], requiredGateIds: ['test'], rewardCriterionIds: ['execution'], risk: 'medium', dependsOn: ['S1'], rollback: 'Revert feature',
+        technologyDecisionIds: ['WEB'], deploymentDecisionIds: ['WEB_PREVIEW'],
       },
     ],
   };
@@ -98,6 +110,11 @@ describe('PortfolioCoordinator', () => {
     expect(firstSpec?.dependencies).toEqual([]);
     expect(secondSpec?.dependencies).toEqual([2]);
     expect(secondSpec?.constraints).toContain('Preserve existing behavior');
+    expect(firstSpec?.technologyDecisions.map((decision) => decision.id)).toEqual(['AUTH']);
+    expect(secondSpec?.technologyDecisions.map((decision) => decision.id)).toEqual(['WEB']);
+    expect(secondSpec?.deploymentDecisions).toEqual([
+      expect.objectContaining({ id: 'WEB_PREVIEW', authority: 'build-test-only' }),
+    ]);
     expect((github.issues.get(5) as RemoteIssue).labels).toEqual(['harness:normalized', 'harness:ready']);
     expect(matchesPortfolioTaskContract(approved, approved.stories[1]!, secondSpec!)).toBe(true);
     expect(matchesPortfolioTaskContract(approved, approved.stories[1]!, { ...secondSpec!, goal: 'edited later' })).toBe(false);

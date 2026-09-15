@@ -8,6 +8,7 @@ import {
   qwenSavedWorkflowPermissionArgs,
   qwenSubagentArgs,
   qwenWorkflowEnvironment,
+  type QwenRuntimeCredential,
 } from './runtime-compat.js';
 
 export interface QwenCodeRunInput {
@@ -24,6 +25,7 @@ export interface QwenCodeRunResult {
   workflowRunId: string | null;
   summary: string;
   goalState: string | null;
+  goalReason: string | null;
   needsContinuation: boolean;
   usage: Record<string, unknown>;
   durationMs: number;
@@ -39,11 +41,27 @@ interface StreamEvent {
   session_id?: string;
   result?: string;
   usage?: Record<string, unknown>;
-  event?: { type?: string; state?: string; status?: string; runId?: string; run_id?: string };
+  event?: {
+    type?: string;
+    state?: string;
+    status?: string;
+    runId?: string;
+    run_id?: string;
+    goal_state?: {
+      goal?: {
+        status?: string;
+        lastReason?: string;
+        limitKind?: string;
+      } | null;
+    };
+  };
 }
 
 export class QwenCodeExecutor implements QwenExecutor {
-  constructor(private readonly config: ProjectConfig) {}
+  constructor(
+    private readonly config: ProjectConfig,
+    private readonly credential?: QwenRuntimeCredential | null,
+  ) {}
 
   async execute(input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
     const workflowPath = path.join(input.worktree, '.qwen', 'workflows', 'harness-implement.js');
@@ -78,11 +96,15 @@ export class QwenCodeExecutor implements QwenExecutor {
       sessionId: string | null;
       resultEvent: StreamEvent | null;
       goalState: string | null;
+      goalReason: string | null;
+      goalLimitKind: string | null;
       workflowRunId: string | null;
     } = {
       sessionId: input.task.qwenSessionId,
       resultEvent: null,
       goalState: null,
+      goalReason: null,
+      goalLimitKind: null,
       workflowRunId: input.task.qwenWorkflowRunId,
     };
     const acceptEvent = (event: StreamEvent): void => {
@@ -91,7 +113,12 @@ export class QwenCodeExecutor implements QwenExecutor {
         input.onSession?.(event.session_id);
       }
       if (event.type === 'result') latest.resultEvent = event;
-      if (event.event?.type === 'goal_state') latest.goalState = event.event.state ?? event.event.status ?? null;
+      if (event.event?.type === 'goal_state') {
+        const details = goalDetailsFromStreamEvent(event);
+        latest.goalState = details?.state ?? null;
+        latest.goalReason = details?.reason ?? null;
+        latest.goalLimitKind = details?.limitKind ?? null;
+      }
       latest.workflowRunId = event.event?.runId ?? event.event?.run_id ?? latest.workflowRunId;
     };
     const consume = (chunk: string): void => {
@@ -115,7 +142,7 @@ export class QwenCodeExecutor implements QwenExecutor {
       maxOutputBytes: 25 * 1024 * 1024,
       onStdout: consume,
       env: {
-        ...qwenEnvironment(),
+        ...qwenEnvironment(process.env, this.credential),
         QWEN_CODE_UNATTENDED_RETRY: '1',
         ...qwenWorkflowEnvironment({
           maxConcurrency: this.config.worker.maxReadOnlyAgents,
@@ -137,7 +164,19 @@ export class QwenCodeExecutor implements QwenExecutor {
     const budgetExit = receipt.exitCode === 53 || receipt.exitCode === 55 || receipt.timedOut;
     if (receipt.exitCode !== 0 && !budgetExit) throw new Error(formatProcessFailure(receipt));
 
-    const needsContinuation = budgetExit || ['active', 'paused', 'working'].includes(latest.goalState ?? '');
+    const disposition = classifyGoalDisposition({
+      budgetExit,
+      state: latest.goalState,
+      reason: latest.goalReason,
+      limitKind: latest.goalLimitKind,
+    });
+    if (disposition === 'retry') {
+      const details = [latest.goalReason, latest.goalLimitKind].filter(Boolean).join('; ');
+      throw new Error(
+        redactText(`Qwen goal stopped in ${latest.goalState ?? 'unknown'} state${details ? `: ${details}` : ''}`),
+      );
+    }
+    const needsContinuation = disposition === 'continue';
     const summary =
       latest.resultEvent?.result?.trim() ||
       (needsContinuation ? 'Qwen run paused at its configured budget' : 'Qwen goal completed');
@@ -147,11 +186,38 @@ export class QwenCodeExecutor implements QwenExecutor {
       workflowRunId: latest.workflowRunId,
       summary: redactText(summary).slice(0, 12_000),
       goalState: latest.goalState,
+      goalReason: latest.goalReason,
       needsContinuation,
       usage: latest.resultEvent?.usage ?? {},
       durationMs: receipt.durationMs,
     };
   }
+}
+
+export function classifyGoalDisposition(input: {
+  budgetExit: boolean;
+  state: string | null;
+  reason?: string | null;
+  limitKind?: string | null;
+}): 'complete' | 'continue' | 'retry' {
+  if (input.budgetExit) return 'continue';
+  if (input.state === null || input.state === 'complete' || input.state === 'completed') return 'complete';
+  return 'retry';
+}
+
+export function goalDetailsFromStreamEvent(value: unknown): {
+  state: string | null;
+  reason: string | null;
+  limitKind: string | null;
+} | null {
+  if (!isRecord(value) || !isRecord(value.event) || value.event.type !== 'goal_state') return null;
+  const snapshot = isRecord(value.event.goal_state) ? value.event.goal_state : null;
+  const goal = snapshot && isRecord(snapshot.goal) ? snapshot.goal : null;
+  return {
+    state: textOrNull(goal?.status) ?? textOrNull(value.event.state) ?? textOrNull(value.event.status),
+    reason: textOrNull(goal?.lastReason),
+    limitKind: textOrNull(goal?.limitKind),
+  };
 }
 
 export function goalPromptFor(task: TaskRecord, feedback: string[], workflowPath?: string): string {
@@ -178,6 +244,21 @@ export function renderObjective(task: TaskRecord, feedback: string[], workflowPa
     ...spec.acceptanceCriteria.map((criterion) => `- ${criterion}`),
     'Constraints:',
     ...spec.constraints.map((constraint) => `- ${constraint}`),
+    'Frozen technology decisions:',
+    ...(spec.technologyDecisions.length
+      ? spec.technologyDecisions.map(
+          (decision) =>
+            `- ${decision.id}: ${decision.category} = ${decision.technology} (${decision.source}); ${decision.rationale}`,
+        )
+      : ['- None']),
+    'Frozen deployment decisions:',
+    ...(spec.deploymentDecisions.length
+      ? spec.deploymentDecisions.map(
+          (decision) =>
+            `- ${decision.id}: ${decision.component} on ${decision.provider}/${decision.environment}; authority=${decision.authority}; ${decision.rationale}`,
+        )
+      : ['- None']),
+    'Do not substitute frozen choices. Build-test-only authority never permits credentials, resource creation, or live deployment.',
     `Rollback: ${spec.rollback}`,
     ...(feedback.length > 0 ? ['', 'Verifier feedback to repair:', ...feedback.map((item) => `- ${item}`)] : []),
     '',
@@ -196,6 +277,8 @@ function fallbackSpec(task: TaskRecord): TaskSpec {
     risk: 'medium',
     dependencies: [],
     rollback: 'Revert the task commit.',
+    technologyDecisions: [],
+    deploymentDecisions: [],
   };
 }
 
@@ -207,6 +290,14 @@ function parseEvent(line: string): StreamEvent | null {
   } catch {
     return null;
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function textOrNull(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
 function durationToMs(value: string): number {

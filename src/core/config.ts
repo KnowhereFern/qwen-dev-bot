@@ -91,6 +91,20 @@ export function defaultProjectConfig(root: string, name = path.basename(root), g
         },
       ],
     },
+    technologyPolicy: {
+      authority: 'build-test-only',
+      approved: [
+        { category: 'source-control', technology: 'GitHub' },
+        { category: 'authentication', technology: 'Clerk' },
+        { category: 'payments', technology: 'Stripe' },
+        { category: 'database', technology: 'Supabase' },
+        { category: 'hosting', technology: 'Vercel' },
+        { category: 'cloud-platform', technology: 'Google Cloud' },
+        { category: 'model-gateway', technology: 'OpenRouter' },
+        { category: 'secondary-model', technology: 'DeepSeek' },
+      ],
+      requirePlanApprovalForExceptions: true,
+    },
     protectedPaths: [
       'AUTONOMY.md',
       '.qwen-harness/',
@@ -163,6 +177,11 @@ export function loadProjectConfig(rootOrFile: string): ProjectConfig {
       ...parsed.rewards,
       criteria: parsed.rewards?.criteria ?? defaults.rewards.criteria,
     },
+    technologyPolicy: {
+      ...defaults.technologyPolicy,
+      ...parsed.technologyPolicy,
+      approved: parsed.technologyPolicy?.approved ?? defaults.technologyPolicy.approved,
+    },
     protectedPaths: parsed.protectedPaths ?? defaults.protectedPaths,
   };
   return validateProjectConfig(merged, file);
@@ -194,11 +213,11 @@ export function validateProjectConfig(value: unknown, source = 'project config')
   if (!/^[A-Z_][A-Z0-9_]*$/.test(config.qwen.credentialEnvKey)) {
     throw new Error(`${source}: qwen.credentialEnvKey must be an uppercase environment variable name`);
   }
-  if (!['standard', 'token-plan-team', 'custom'].includes(config.qwen.billingPlan)) {
-    throw new Error(`${source}: invalid qwen.billingPlan for unattended operation`);
+  if (!['standard', 'token-plan-personal', 'token-plan-team', 'custom'].includes(config.qwen.billingPlan)) {
+    throw new Error(`${source}: invalid qwen.billingPlan`);
   }
-  if (config.qwen.billingPlan === 'token-plan-team' && new URL(config.qwen.baseUrl).hostname !== new URL(TOKEN_PLAN_QWEN_BASE_URL).hostname) {
-    throw new Error(`${source}: Token Plan Team requires the Token Plan base URL`);
+  if (config.qwen.billingPlan.startsWith('token-plan-') && new URL(config.qwen.baseUrl).hostname !== new URL(TOKEN_PLAN_QWEN_BASE_URL).hostname) {
+    throw new Error(`${source}: Token Plan requires the Token Plan base URL`);
   }
   if (!['low', 'medium', 'xhigh'].includes(config.qwen.implementationReasoning)) {
     throw new Error(`${source}: invalid qwen.implementationReasoning`);
@@ -264,6 +283,27 @@ export function validateProjectConfig(value: unknown, source = 'project config')
   }
   if (!Array.isArray(config.gates) || !Array.isArray(config.rewards?.criteria)) {
     throw new Error(`${source}: gates and rewards.criteria must be arrays`);
+  }
+  if (
+    config.technologyPolicy?.authority !== 'build-test-only' ||
+    config.technologyPolicy.requirePlanApprovalForExceptions !== true ||
+    !Array.isArray(config.technologyPolicy.approved) ||
+    !config.technologyPolicy.approved.every(
+      (entry) =>
+        entry &&
+        typeof entry === 'object' &&
+        typeof entry.category === 'string' &&
+        entry.category.trim().length > 0 &&
+        typeof entry.technology === 'string' &&
+        entry.technology.trim().length > 0,
+    ) ||
+    new Set(
+      config.technologyPolicy.approved.map(
+        (entry) => `${entry.category.trim().toLowerCase()}\u0000${entry.technology.trim().toLowerCase()}`,
+      ),
+    ).size !== config.technologyPolicy.approved.length
+  ) {
+    throw new Error(`${source}: technologyPolicy must contain unique approved technologies and preserve build-test-only authority`);
   }
   const gateIds = new Set<string>();
   for (const gate of config.gates) {

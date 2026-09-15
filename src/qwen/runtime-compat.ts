@@ -49,13 +49,28 @@ const SAFE_QWEN_ENVIRONMENT = [
   'BAILIAN_API_KEY',
 ] as const;
 
+export interface QwenRuntimeCredential {
+  envKey: string;
+  apiKey?: string;
+}
+
 /** Build the least-privilege environment inherited by model-driven Qwen processes. */
-export function qwenEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function qwenEnvironment(
+  source: NodeJS.ProcessEnv = process.env,
+  credential?: QwenRuntimeCredential | null,
+): NodeJS.ProcessEnv {
   const environment = Object.fromEntries(
     SAFE_QWEN_ENVIRONMENT.flatMap((name) =>
       source[name] === undefined ? [] : [[name, source[name]]],
     ),
   );
+  if (credential) {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(credential.envKey)) {
+      throw new Error('Configured Qwen credential key must be an uppercase environment variable name');
+    }
+    const value = credential.apiKey ?? source[credential.envKey];
+    if (value !== undefined) environment[credential.envKey] = value;
+  }
   return {
     ...environment,
     QWEN_CODE_FORCE_ENCRYPTED_FILE_STORAGE: 'true',

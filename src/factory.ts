@@ -9,7 +9,7 @@ import { OctokitControlPlane, resolveGitHubToken, type GitHubControl } from './g
 import { IssueNormalizer } from './intake/normalizer.js';
 import { Logger } from './logger.js';
 import { QwenApiClient } from './qwen/qwen-api.js';
-import { assertQwenCredentialCompatibility, resolveQwenCredential } from './qwen/credentials.js';
+import { assertQwenCredentialCompatibility, resolveQwenCredential } from './qwen/credential-resolver.js';
 import { QwenCodeExecutor } from './qwen/qwen-code-executor.js';
 import { UniversalRewardEngine } from './rewards/engine.js';
 import {
@@ -58,7 +58,7 @@ export async function createProductionHarness(
     const rewards = new UniversalRewardEngine([
       new ExecutionEvaluator(),
       new QwenRubricEvaluator(qwenApi),
-      new QwenAgenticEvaluator(),
+      new QwenAgenticEvaluator(credential),
       new QwenVisualEvaluator(qwenApi),
     ]);
     const supervisor = new HarnessSupervisor(
@@ -66,7 +66,7 @@ export async function createProductionHarness(
       store,
       github,
       git,
-      new QwenCodeExecutor(config),
+      new QwenCodeExecutor(config, credential),
       new IssueNormalizer(config, qwenApi),
       new GateRunner(),
       rewards,

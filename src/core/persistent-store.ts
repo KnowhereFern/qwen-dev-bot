@@ -691,6 +691,13 @@ function rowToTask(row: TaskRow): TaskRecord {
   const parsed = JSON.parse(row.data) as TaskRecord;
   return {
     ...parsed,
+    spec: parsed.spec
+      ? {
+          ...parsed.spec,
+          technologyDecisions: parsed.spec.technologyDecisions ?? [],
+          deploymentDecisions: parsed.spec.deploymentDecisions ?? [],
+        }
+      : null,
     state: row.state,
     priority: row.priority,
     attempts: row.attempts,
@@ -704,6 +711,13 @@ function rowToPortfolioPlan(row: PortfolioPlanRow): PortfolioPlan {
   const parsed = JSON.parse(row.data) as PortfolioPlan;
   return {
     ...parsed,
+    technologyDecisions: parsed.technologyDecisions ?? [],
+    deploymentDecisions: parsed.deploymentDecisions ?? [],
+    stories: parsed.stories.map((story) => ({
+      ...story,
+      technologyDecisionIds: story.technologyDecisionIds ?? [],
+      deploymentDecisionIds: story.deploymentDecisionIds ?? [],
+    })),
     projectId: row.project_id,
     sourcePath: row.source_path,
     contentHash: row.content_hash,

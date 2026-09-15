@@ -14,6 +14,8 @@ function taskSpec(dependencies: number[]): TaskSpec {
     risk: 'low',
     dependencies,
     rollback: 'Revert the task commit.',
+    technologyDecisions: [],
+    deploymentDecisions: [],
   };
 }
 
@@ -24,6 +26,7 @@ describe('PersistentTaskStore', () => {
     const plan = {
       id: 'plan_123', projectId: 'portfolio-project', sourcePath: 'REQUIREMENTS.md', contentHash: 'abc',
       title: 'Plan', objective: 'Ship', constraints: [], definitionOfDone: ['Done'], status: 'draft' as const,
+      technologyDecisions: [], deploymentDecisions: [],
       epicIssueNumber: null, epicIssueUrl: null, stories: [], createdAt: 1, updatedAt: 1, approvedAt: null,
     };
     store.savePortfolioPlan(plan);

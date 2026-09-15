@@ -44,7 +44,7 @@ export class QwenApiClient {
       throw new Error('Qwen API baseUrl must be HTTPS and must not embed credentials');
     }
     this.model = options.model ?? QWEN_HARNESS_MODEL;
-    if (this.model !== QWEN_HARNESS_MODEL) throw new Error(`Qwen harness model must be ${QWEN_HARNESS_MODEL}`);
+    if (this.model !== QWEN_HARNESS_MODEL) throw new Error(`Delivery harness model must be ${QWEN_HARNESS_MODEL}`);
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = options.timeoutMs ?? 120_000;
     this.maxAttempts = options.maxAttempts ?? 3;
