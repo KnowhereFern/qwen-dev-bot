@@ -1,7 +1,7 @@
 {
   "name": "qwen-dev-bot",
   "version": "1.0.0-rc.4",
-  "description": "Qwen3.8-Max-native self-evolving engineering harness with durable orchestration, universal runtime rewards, GitHub delivery, and guided setup.",
+  "description": "Fern-designed autonomous software delivery harness powered by Qwen3.8-Max, with durable orchestration, runtime rewards, GitHub delivery, and guided setup.",
   "type": "module",
   "private": true,
   "license": "MIT",
@@ -25,6 +25,7 @@
     "agents/",
     "bin/",
     "commands/",
+    "docs/",
     "scripts/",
     "skills/",
     "src/",
@@ -33,7 +34,7 @@
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "LICENSE",
-    "QWEN-HARNESS.md",
+    "DELIVERY-HARNESS.md",
     "README.md",
     "SECURITY.md",
     "qwen-extension.json",
@@ -50,8 +51,7 @@
     "starter:create": "node scripts/create-starter.mjs",
     "harness": "node bin/qwen-harness.mjs",
     "setup": "node bin/qwen-harness.mjs init",
-    "doctor": "node bin/qwen-harness.mjs doctor",
-    "demo": "tsx src/demo/e2e.ts"
+    "doctor": "node bin/qwen-harness.mjs doctor"
   },
   "dependencies": {
     "octokit": "^5.0.5",

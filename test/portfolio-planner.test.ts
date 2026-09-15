@@ -19,6 +19,8 @@ function story(key: string, dependsOn: string[] = []): Record<string, unknown> {
     risk: 'low',
     dependsOn,
     rollback: `Revert ${key}`,
+    technologyDecisionIds: [],
+    deploymentDecisionIds: [],
   };
 }
 
@@ -30,6 +32,8 @@ describe('portfolio planner validation', () => {
         objective: 'Ship the demo',
         constraints: ['Keep compatibility'],
         definitionOfDone: ['All stories pass'],
+        technologyDecisions: [],
+        deploymentDecisions: [],
         stories: [story('S2', ['S1']), story('S1')],
       },
       ['test'],
@@ -46,10 +50,56 @@ describe('portfolio planner validation', () => {
       objective: 'Ship the demo',
       constraints: [],
       definitionOfDone: ['All stories pass'],
+      technologyDecisions: [],
+      deploymentDecisions: [],
     };
     expect(() => validatePortfolioDraft({ ...base, stories: [story('S1', ['S2']), story('S2', ['S1'])] }, ['test'], ['execution'])).toThrow(/cycle/);
     expect(() => validatePortfolioDraft({ ...base, stories: [story('S1', ['MISSING'])] }, ['test'], ['execution'])).toThrow(/unknown dependency/);
     expect(() => validatePortfolioDraft({ ...base, stories: [{ ...story('S1'), requiredGateIds: ['made-up'] }] }, ['test'], ['execution'])).toThrow(/unknown gate/);
+  });
+
+  it('freezes approved and exception technologies with build-test-only deployment authority', () => {
+    const result = validatePortfolioDraft(
+      {
+        title: 'Delivery plan',
+        objective: 'Ship safely',
+        constraints: [],
+        definitionOfDone: ['Verified'],
+        technologyDecisions: [
+          { id: 'WEB', category: 'hosting', technology: 'Vercel', rationale: 'Approved hosting' },
+          { id: 'QUEUE', category: 'queue', technology: 'Example Queue', rationale: 'Required exception' },
+        ],
+        deploymentDecisions: [
+          { id: 'PREVIEW', component: 'web', provider: 'Vercel', environment: 'preview', rationale: 'Build preview' },
+        ],
+        stories: [{
+          ...story('S1'),
+          technologyDecisionIds: ['WEB', 'QUEUE'],
+          deploymentDecisionIds: ['PREVIEW'],
+        }],
+      },
+      ['test'],
+      ['execution'],
+      10,
+      {
+        authority: 'build-test-only',
+        approved: [{ category: 'hosting', technology: 'Vercel' }],
+        requirePlanApprovalForExceptions: true,
+      },
+    );
+
+    expect(result.technologyDecisions.map((decision) => decision.source)).toEqual(['approved', 'exception']);
+    expect(result.deploymentDecisions[0]?.authority).toBe('build-test-only');
+    expect(() => validatePortfolioDraft(
+      {
+        title: 'Bad references', objective: 'Reject drift', constraints: [], definitionOfDone: ['Verified'],
+        technologyDecisions: [], deploymentDecisions: [],
+        stories: [{ ...story('S1'), technologyDecisionIds: ['MISSING'] }],
+      },
+      ['test'],
+      ['execution'],
+      10,
+    )).toThrow(/unknown technology decision/);
   });
 });
 

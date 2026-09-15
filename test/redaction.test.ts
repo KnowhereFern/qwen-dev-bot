@@ -10,12 +10,13 @@ afterEach(() => {
 
 describe('credential redaction', () => {
   it('redacts known formats, credential URLs, and configured environment secrets', () => {
+    const providerKey = `sk-${'abcdefghijklmnopqrstuvwxyz123456'}`;
     process.env.QWEN_HARNESS_TEST_TOKEN = 'unusual-secret-value-123456';
     const redacted = redactText(
-      'Bearer abc.def sk-abcdefghijklmnopqrstuvwxyz https://user:password@github.test unusual-secret-value-123456',
+      `Bearer abc.def ${providerKey} https://user:password@github.test unusual-secret-value-123456`,
     );
     expect(redacted).not.toContain('abc.def');
-    expect(redacted).not.toContain('sk-abcdefghijklmnopqrstuvwxyz');
+    expect(redacted).not.toContain(providerKey);
     expect(redacted).not.toContain('password@');
     expect(redacted).not.toContain('unusual-secret-value-123456');
   });

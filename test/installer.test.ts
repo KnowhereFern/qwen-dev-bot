@@ -49,24 +49,27 @@ describe('guided installer', () => {
     }
   });
 
-  it('refuses Token Plan Personal for unattended background automation', async () => {
+  it('configures Token Plan Personal with its matching credential and endpoint', async () => {
     const root = makeTmp('installer-personal-plan');
     process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-personal-plan-state');
-    await expect(
-      installProject({
-        root,
-        yes: true,
-        answers: {
-          projectName: 'fixture',
-          githubRepo: 'owner/fixture',
-          trustedAuthor: 'owner',
-          qwenBillingPlan: 'token-plan-personal',
-          linkExtension: false,
-          installService: false,
-          configureGitHub: false,
-        },
-      }),
-    ).rejects.toThrow(/cannot be used by this unattended/);
+    const result = await installProject({
+      root,
+      yes: true,
+      answers: {
+        projectName: 'fixture',
+        githubRepo: 'owner/fixture',
+        trustedAuthor: 'owner',
+        qwenBillingPlan: 'token-plan-personal',
+        linkExtension: false,
+        installService: false,
+        bootstrapDependencies: false,
+        configureGitHub: false,
+      },
+    });
+
+    expect(result.config.qwen.billingPlan).toBe('token-plan-personal');
+    expect(result.config.qwen.credentialEnvKey).toBe('BAILIAN_TOKEN_PLAN_API_KEY');
+    expect(result.config.qwen.baseUrl).toBe('https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1');
   });
 
   it('installs idempotently and preserves modified files on uninstall', async () => {

@@ -56,6 +56,38 @@ export interface RewardCriterionConfig {
   artifactGlobs?: string[];
 }
 
+export type DeliveryAuthority = 'build-test-only';
+
+export interface ApprovedTechnology {
+  category: string;
+  technology: string;
+}
+
+export interface TechnologyPolicy {
+  authority: DeliveryAuthority;
+  approved: ApprovedTechnology[];
+  requirePlanApprovalForExceptions: true;
+}
+
+export interface TechnologyDecision {
+  id: string;
+  category: string;
+  technology: string;
+  source: 'approved' | 'exception';
+  rationale: string;
+}
+
+export interface DeploymentDecision {
+  id: string;
+  component: string;
+  provider: string;
+  environment: 'local' | 'preview' | 'staging' | 'production';
+  authority: DeliveryAuthority;
+  rationale: string;
+}
+
+export type QwenBillingPlan = 'standard' | 'token-plan-personal' | 'token-plan-team' | 'custom';
+
 export interface ProjectConfig {
   configVersion: typeof CONFIG_VERSION;
   project: {
@@ -69,7 +101,7 @@ export interface ProjectConfig {
     model: string;
     baseUrl: string;
     credentialEnvKey: string;
-    billingPlan: 'standard' | 'token-plan-team' | 'custom';
+    billingPlan: QwenBillingPlan;
     implementationReasoning: ReasoningEffort;
     reviewReasoning: ReasoningEffort;
     triageReasoning: ReasoningEffort;
@@ -114,6 +146,7 @@ export interface ProjectConfig {
     criticalThreshold: number;
     criteria: RewardCriterionConfig[];
   };
+  technologyPolicy: TechnologyPolicy;
   protectedPaths: string[];
 }
 
@@ -131,6 +164,8 @@ export interface TaskSpec {
   risk: 'low' | 'medium' | 'high';
   dependencies: number[];
   rollback: string;
+  technologyDecisions: TechnologyDecision[];
+  deploymentDecisions: DeploymentDecision[];
 }
 
 export interface TaskRecord {
@@ -188,6 +223,8 @@ export interface PortfolioStory {
   risk: 'low' | 'medium' | 'high';
   dependsOn: string[];
   rollback: string;
+  technologyDecisionIds: string[];
+  deploymentDecisionIds: string[];
   sourceIssueNumber: number | null;
   sourceIssueUrl: string | null;
   normalizedIssueNumber: number | null;
@@ -203,6 +240,8 @@ export interface PortfolioPlan {
   objective: string;
   constraints: string[];
   definitionOfDone: string[];
+  technologyDecisions: TechnologyDecision[];
+  deploymentDecisions: DeploymentDecision[];
   status: PortfolioPlanStatus;
   epicIssueNumber: number | null;
   epicIssueUrl: string | null;

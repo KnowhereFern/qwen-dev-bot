@@ -1,16 +1,22 @@
-# Qwen Development Harness
+# Autonomous Software Delivery Harness
 
-A reusable, Qwen3.8-Max-only engineering harness for turning approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
+A software product designed and built by Fern. It uses Qwen Code and `qwen3.8-max` as its execution engine to turn approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.4`. The deterministic and mocked production paths are verified. Promotion to stable `v1.0.0` is gated on a complete live run with an unattended-eligible Qwen account.
+**Release status:** `v1.0.0-rc.4`. The deterministic and mocked production paths are verified. Promotion to stable `v1.0.0` is gated on a complete live run with a configured Qwen account.
 
-This is the canonical harness source and installer repository. For a blank application repository, use the separate [Qwen Harness Starter](https://github.com/KnowhereFern/qwen-harness-starter) template and run `node setup.mjs`. Each target project receives a small tracked control plane under `.qwen-harness/`, `.qwen/`, and `.github/`; project-specific gates, reward rubrics, protected paths, sources, and merge policy live in `.qwen-harness/project.yml`.
+See [live test readiness](docs/live-test-readiness.md) for the current machine and end-to-end proof status.
 
-This project implements the public Qwen-described architecture and feedback loops. It does not claim to reproduce undisclosed internal Qwen infrastructure or RL training systems.
+This is the canonical harness source and installer repository. For a blank application repository, use the separate [Harness Starter](https://github.com/KnowhereFern/qwen-harness-starter) template and run `node setup.mjs`. Each target project receives a small tracked control plane under `.qwen-harness/`, `.qwen/`, and `.github/`; project-specific gates, reward rubrics, protected paths, sources, and merge policy live in `.qwen-harness/project.yml`.
+
+## Designed and built by Fern
+
+Fern created the architecture, delivery model, governance rules, reward system, and product philosophy in this repository.
+
+Qwen Code and `qwen3.8-max` provide the model runtime. The harness supplies the orchestration, evaluation, delivery workflow, and operating contract.
 
 ## What is implemented
 
-| Capability described by Qwen | Template plumbing |
+| Product capability | Implementation |
 | --- | --- |
 | Issue state, dispatch, monitoring, watchdog recovery | Transactional SQLite state machine, dependency-aware atomic leases, heartbeats, checkpoints, retry fingerprints, quarantine, and reconciliation |
 | Long-running autonomous implementation | Headless Qwen Code `/goal`, saved session IDs, `/goal resume`, stream-JSON monitoring, hard wall/tool/turn budgets, and isolated Git worktrees |
@@ -22,9 +28,9 @@ This project implements the public Qwen-described architecture and feedback loop
 | Multimodal-native work | Visual reward artifacts are supported directly; setup can also install the official Qwen-MM-Plugins core capability for Qwen's implementation agents |
 | Continuous delivery and self-repair | Exact remote-head checks, guarded auto-merge by default, verification of the actual merge commit, and one deduplicated repair issue per post-merge regression |
 
-The Qwen article's **online data balancer** is RL-training infrastructure, not a repository automation feature. This harness does not pretend to train or rebalance model batches. At runtime it provides deterministic per-project polling, task priority, and bounded mutation concurrency.
+The harness evaluates delivered software at runtime using deterministic per-project polling, task priority, and bounded mutation concurrency.
 
-The implementation tracks Qwen's official documentation for [headless goals and budgets](https://qwenlm.github.io/qwen-code-docs/en/users/features/headless/), [subagents](https://qwenlm.github.io/qwen-code-docs/en/users/features/sub-agents/), [saved dynamic workflows](https://qwenlm.github.io/qwen-code-docs/en/blog/updates/weekly-update-2026-06-25/), [extensions](https://qwenlm.github.io/qwen-code-docs/en/users/extension/introduction/), and [OpenAI-compatible model providers](https://qwenlm.github.io/qwen-code-docs/en/users/configuration/model-providers/). GitHub and multimodal setup follow the official [Qwen Code GitHub Actions guide](https://github.com/QwenLM/qwen-code/blob/main/docs/users/integration-github-action.md) and [Qwen-MM-Plugins installation guide](https://github.com/QwenLM/Qwen-MM-Plugins/blob/main/docs/en/installation.md); multimodal installation uses Qwen Code's native extension command and an immutable capability tag.
+The Qwen Code integration follows its official documentation for [headless goals and budgets](https://qwenlm.github.io/qwen-code-docs/en/users/features/headless/), [subagents](https://qwenlm.github.io/qwen-code-docs/en/users/features/sub-agents/), [saved dynamic workflows](https://qwenlm.github.io/qwen-code-docs/en/blog/updates/weekly-update-2026-06-25/), [extensions](https://qwenlm.github.io/qwen-code-docs/en/users/extension/introduction/), and [OpenAI-compatible model providers](https://qwenlm.github.io/qwen-code-docs/en/users/configuration/model-providers/). GitHub and multimodal integration use the official [Qwen Code GitHub Actions guide](https://github.com/QwenLM/qwen-code/blob/main/docs/users/integration-github-action.md) and [Qwen-MM-Plugins installation guide](https://github.com/QwenLM/Qwen-MM-Plugins/blob/main/docs/en/installation.md); multimodal installation uses Qwen Code's native extension command and an immutable capability tag.
 
 ## Runtime loop
 
@@ -60,9 +66,9 @@ Supported task states are `intake`, `normalized`, `ready`, `leased`, `active`, `
 - Git and a clean target repository with an `origin` remote
 - Qwen Code 0.22.1 or newer (the setup wizard can install or upgrade it)
 - GitHub CLI authenticated to the target repository, or `GH_TOKEN`/`GITHUB_TOKEN` (`repo` for a classic token; Contents, Issues, Pull requests, Commit statuses write plus Checks read for a fine-grained token)
-- A Qwen credential and endpoint that can call `qwen3.8-max` in unattended automation: a standard/pay-as-you-go QwenCloud key, Token Plan Team, or an explicitly approved compatible provider. The harness can reuse the configured credential name from Qwen Code's user settings, `~/.qwen/.env`, the shell, or its mode-0600 worker file.
+- A Qwen credential and matching endpoint that can call `qwen3.8-max`: standard QwenCloud, Token Plan Personal, Token Plan Team, or a custom compatible provider. The harness can reuse the configured credential name from Qwen Code's user settings, `~/.qwen/.env`, the shell, or its mode-0600 worker file.
 
-Token Plan Personal is intentionally rejected by setup: QwenCloud limits it to personal interactive use and prohibits background automation, batch scripts, and application backends. Coding Plan is also rejected because its current supported-model list does not include this template's required `qwen3.8-max`. Token Plan Team uses `BAILIAN_TOKEN_PLAN_API_KEY` with `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`; standard QwenCloud uses its matching standard key and endpoint. Setup and doctor prevent known plan-key/endpoint mismatches.
+Token Plan Personal and Team use `BAILIAN_TOKEN_PLAN_API_KEY` with `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`; standard QwenCloud uses its matching standard key and endpoint. Setup and doctor prevent known key/endpoint mismatches.
 
 The target repository must already exist. Setup does not create a GitHub repository or push commits. New project configurations enable guarded auto-merge by default; setup changes GitHub labels and branch protection only when explicitly requested.
 
@@ -82,7 +88,7 @@ The wizard detects the GitHub repository and project scripts, then asks about:
 - the Qwen billing plan, matching endpoint/credential name, and optional Qwen Code install or upgrade;
 - reuse of a credential already saved in Qwen Code; accepting the matching default normally requires no token copying or shell export;
 - allowlisted community-source scanning;
-- the Qwen harness extension and optional Qwen-MM-Plugins core capability (`uvx` required and its official system check runs during setup);
+- the delivery harness extension for Qwen Code and optional Qwen-MM-Plugins core capability (`uvx` required and its official system check runs during setup);
 - target dependencies and declared Playwright/Cypress browser runtimes; dependency bootstrap is on by default, and `--with-browser` can add project-local `@playwright/test` first;
 - the persistent launchd, systemd-user, or Windows worker;
 - optional mode-0600 copying of the detected Qwen credential for that worker (off by default because the worker can normally reuse Qwen user settings);
@@ -154,7 +160,7 @@ qwen-harness plan-status /path/to/project --plan PLAN_ID
 
 Use `plan ... --approve` only when you intentionally want planning and approval in one command. Re-running the same requirements snapshot is idempotent. Editing the file creates a new draft; the harness refuses to approve that revision while an earlier plan for the same source is active or blocked, so accepted work is never silently rewritten.
 
-The minimum useful requirements file needs only: a product objective, intended user/use case, MVP scope, constraints, and observable definition of done. A story list is optional—the planner can propose it—but specific acceptance examples improve the result. The starter repository’s `PROJECT.md` is a fill-in template.
+The minimum useful requirements file needs only: a product objective, intended user/use case, MVP scope, constraints, and observable definition of done. A story list is optional—the planner can propose it—but specific acceptance examples improve the result. The planner also records the relevant technology and deployment choices. Catalog exceptions are visibly marked; approval freezes the reviewed choices into each normalized story contract. Deployment choices remain build-and-test-only and never grant credentials, resource creation, or live deployment authority. The starter repository’s `PROJECT.md` is a fill-in template.
 
 Useful commands:
 
@@ -185,6 +191,7 @@ The Qwen extension also contributes `/harness:doctor`, `/harness:status`, and `/
 - `intake.communitySources`: HTTPS sources, poll interval, proposal cap, and per-source `autoApprove`;
 - `worker`: retry/quarantine policy, lease timing, polling, read-only workflow concurrency, and auto-merge. The mutation capacity is fixed at one;
 - `qwen`: reasoning tiers; main-run, workflow, token, and subagent budgets; and `allowedMcpServers`. The model is intentionally fixed to `qwen3.8-max`; ambient user MCP servers are not inherited and subagent nesting is disabled.
+- `technologyPolicy`: approved category/technology pairs used by portfolio planning. Choices outside the catalog are plan exceptions, and delivery authority is fixed at `build-test-only`.
 
 For visual scoring, add a `visual` reward criterion with `artifactGlobs` pointing to deterministic screenshots or renders produced by a gate. Missing or out-of-worktree artifacts fail closed.
 
@@ -194,7 +201,7 @@ Normalized task gate/reward IDs are trace metadata only: a task cannot weaken pr
 
 - Issues, comments, linked pages, source pages, logs, test output, and model output are untrusted data.
 - Only normalized issues created by configured trusted identities can become runnable tasks.
-- Portfolio story issues are review-only; approval creates separate normalized task issues from the validated, frozen plan graph.
+- Portfolio story issues are review-only; approval creates separate normalized task issues from the validated, frozen plan graph, including only the technology/deployment decisions referenced by each story.
 - One worker mutates one harness-owned worktree; research and review agents are read-only.
 - Shell execution uses argument arrays with `shell: false`, bounded output, timeouts, process-tree termination, a reduced gate environment, and a credential-minimized Qwen environment.
 - A passing summary cannot compensate for a failed hard gate, critical rubric, security finding, or changed PR head.
@@ -210,18 +217,15 @@ See the installed project's `AUTONOMY.md` for the enforceable project contract.
 npm test
 npm run typecheck
 npm run build
-npm run demo
 npm run release:check
 npm run package:smoke
 ```
 
 The production-path integration test uses a real temporary Git repository and bare remote with mocked GitHub/Qwen boundaries. It proves normalization through merge and post-merge verification without credentials. Live GitHub and Qwen readiness remains the responsibility of `qwen-harness verify` in the installed target project.
 
-The older in-memory dispatcher/demo modules remain as a deterministic teaching fixture; `src/supervisor.ts` and its production adapters are the operational path.
-
 ## Release model
 
 - `qwen-dev-bot` is the reusable source, installer, extension, supervisor, tests, and release history.
 - `qwen-harness-starter` is the minimal GitHub template for a new project. Its dependency-free `setup.mjs` downloads a pinned harness release and launches the guided wizard.
 - GitHub-hosted source CI runs the release gate, typecheck, full test suite, and packed-CLI smoke test on Linux and macOS.
-- Stable releases require a clean-clone package check plus a real issue-to-post-merge run on an eligible Qwen plan. Mocked integration proves plumbing but is not represented as live service proof.
+- Stable releases require a clean-clone package check plus a real issue-to-post-merge run with a configured Qwen credential. Mocked integration proves plumbing but is not represented as live service proof.

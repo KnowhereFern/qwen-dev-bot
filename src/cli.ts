@@ -3,7 +3,7 @@ import path from 'node:path';
 import { CommunityCollector } from './community/collector.js';
 import { loadProjectConfig, PROJECT_CONFIG_PATH } from './core/config.js';
 import { projectIdFor, projectStateDir } from './core/state-paths.js';
-import type { PortfolioPlan } from './core/types.js';
+import type { PortfolioPlan, QwenBillingPlan } from './core/types.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
 import { runDaemon } from './daemon.js';
@@ -18,7 +18,7 @@ import {
   readRequirementsDocument,
 } from './portfolio/planner.js';
 import { QwenApiClient } from './qwen/qwen-api.js';
-import { assertQwenCredentialCompatibility, resolveQwenCredential } from './qwen/credentials.js';
+import { assertQwenCredentialCompatibility, resolveQwenCredential } from './qwen/credential-resolver.js';
 import { ProjectRegistry } from './registry.js';
 
 const VERSION = '1.0.0-rc.4';
@@ -394,13 +394,13 @@ function integerValue(args: string[], flag: string): number | undefined {
   return parsed;
 }
 
-function billingPlanValue(args: string[]): 'standard' | 'token-plan-personal' | 'token-plan-team' | 'coding-plan' | 'custom' | undefined {
+function billingPlanValue(args: string[]): QwenBillingPlan | undefined {
   const value = valueOf(args, '--billing-plan');
   if (value === undefined) return undefined;
-  if (!['standard', 'token-plan-personal', 'token-plan-team', 'coding-plan', 'custom'].includes(value)) {
+  if (!['standard', 'token-plan-personal', 'token-plan-team', 'custom'].includes(value)) {
     throw new Error(`Invalid --billing-plan: ${value}`);
   }
-  return value as 'standard' | 'token-plan-personal' | 'token-plan-team' | 'coding-plan' | 'custom';
+  return value as QwenBillingPlan;
 }
 
 function help(): string {

@@ -16,7 +16,7 @@ if (!target) {
   if (!process.stdin.isTTY) fail('Pass the target project path: npm run bootstrap -- /absolute/path/to/project');
   const terminal = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    target = (await terminal.question('Project folder to equip with the Qwen harness: ')).trim();
+    target = (await terminal.question('Project folder to equip with the delivery harness: ')).trim();
   } finally {
     terminal.close();
   }

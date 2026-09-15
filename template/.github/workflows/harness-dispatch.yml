@@ -1,4 +1,4 @@
-name: Qwen Harness Dispatch Health
+name: Fern Delivery Harness Dispatch Health
 
 on:
   schedule:
@@ -23,4 +23,4 @@ jobs:
               labels: 'harness:ready',
               per_page: 100
             });
-            core.summary.addHeading('Qwen Harness queue').addRaw(`${data.length} ready issue(s); persistent host workers poll this repository.`).write();
+            core.summary.addHeading('Fern Delivery Harness queue').addRaw(`${data.length} ready issue(s); persistent host workers poll this repository.`).write();

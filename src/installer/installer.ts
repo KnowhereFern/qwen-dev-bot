@@ -24,7 +24,7 @@ import {
   validateProjectConfig,
 } from '../core/config.js';
 import { projectIdFor } from '../core/state-paths.js';
-import type { ProjectConfig } from '../core/types.js';
+import type { ProjectConfig, QwenBillingPlan } from '../core/types.js';
 import { ProjectRegistry } from '../registry.js';
 import { runProcess } from '../runtime/safe-process.js';
 import {
@@ -37,7 +37,7 @@ import {
   qwenMmCoreCheckArgs,
   qwenMmCoreInstallArgs,
 } from '../qwen/runtime-compat.js';
-import { resolveQwenCredential } from '../qwen/credentials.js';
+import { resolveQwenCredential } from '../qwen/credential-resolver.js';
 import { installWorkerService, uninstallWorkerService, type ServiceReceipt } from './service.js';
 
 export interface InstallAnswers {
@@ -46,7 +46,7 @@ export interface InstallAnswers {
   trustedAuthor: string;
   qwenBaseUrl: string;
   qwenCredentialEnvKey: string;
-  qwenBillingPlan: 'standard' | 'token-plan-personal' | 'token-plan-team' | 'coding-plan' | 'custom';
+  qwenBillingPlan: QwenBillingPlan;
   autoMerge: boolean;
   enableCommunity: boolean;
   installQwen: boolean;
@@ -137,13 +137,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
   const answers = options.yes
     ? { ...defaults, ...supplied }
     : await guidedAnswers({ ...defaults, ...supplied });
-  if (answers.qwenBillingPlan === 'token-plan-personal') {
-    throw new Error('Qwen Token Plan Personal cannot be used by this unattended/background harness under the plan terms. Use Token Plan Team or a standard pay-as-you-go API key.');
-  }
-  if (answers.qwenBillingPlan === 'coding-plan') {
-    throw new Error('Qwen Coding Plan does not currently list qwen3.8-max. This template requires qwen3.8-max; use Token Plan Team or a standard pay-as-you-go API key.');
-  }
-  if (answers.qwenBillingPlan === 'token-plan-team') {
+  if (answers.qwenBillingPlan.startsWith('token-plan-')) {
     if (!supplied.qwenBaseUrl && options.yes) answers.qwenBaseUrl = TOKEN_PLAN_QWEN_BASE_URL;
     if (!supplied.qwenCredentialEnvKey && options.yes) answers.qwenCredentialEnvKey = 'BAILIAN_TOKEN_PLAN_API_KEY';
   }
@@ -477,18 +471,12 @@ async function guidedAnswers(defaults: InstallAnswers): Promise<InstallAnswers> 
     const githubRepo = await ask('GitHub repository (owner/name)', defaults.githubRepo);
     const trustedAuthor = await ask('Trusted GitHub automation/operator login', defaults.trustedAuthor);
     const qwenBillingPlan = await chooseQwenBillingPlan(terminal, defaults.qwenBillingPlan);
-    if (qwenBillingPlan === 'token-plan-personal') {
-      throw new Error('Qwen Token Plan Personal is limited to interactive use and cannot power this unattended/background harness. Choose Token Plan Team or standard pay-as-you-go.');
-    }
-    if (qwenBillingPlan === 'coding-plan') {
-      throw new Error('Coding Plan does not currently offer this template\'s required qwen3.8-max model. Choose Token Plan Team or standard pay-as-you-go.');
-    }
-    const suggestedBaseUrl = qwenBillingPlan === 'token-plan-team'
+    const suggestedBaseUrl = qwenBillingPlan.startsWith('token-plan-')
       ? TOKEN_PLAN_QWEN_BASE_URL
       : qwenBillingPlan === 'standard'
         ? DEFAULT_QWEN_BASE_URL
         : defaults.qwenBaseUrl;
-    const suggestedCredential = qwenBillingPlan === 'token-plan-team'
+    const suggestedCredential = qwenBillingPlan.startsWith('token-plan-')
       ? 'BAILIAN_TOKEN_PLAN_API_KEY'
       : defaults.qwenCredentialEnvKey;
     const qwenBaseUrl = await ask('Qwen API base URL', suggestedBaseUrl);
@@ -499,7 +487,7 @@ async function guidedAnswers(defaults: InstallAnswers): Promise<InstallAnswers> 
       `Install/upgrade Qwen Code globally with npm (requires ${MIN_QWEN_CODE_VERSION}+)?`,
       defaults.installQwen,
     );
-    const linkExtension = await yesNo('Link the Qwen harness extension for this user?', defaults.linkExtension);
+    const linkExtension = await yesNo('Link the delivery harness extension for this user?', defaults.linkExtension);
     const installMultimodal = await yesNo('Install Qwen-MM-Plugins core for multimodal tools?', false);
     const installBrowserAutomation = await yesNo('Add project-local Playwright for browser/E2E work?', false);
     const bootstrapDependencies = await yesNo('Install/check the target project dependencies and declared browser runtimes now?', true);
@@ -542,17 +530,16 @@ async function chooseQwenBillingPlan(
 ): Promise<InstallAnswers['qwenBillingPlan']> {
   const plans: Array<{ value: InstallAnswers['qwenBillingPlan']; label: string }> = [
     { value: 'standard', label: 'Standard QwenCloud API key / pay-as-you-go' },
-    { value: 'token-plan-team', label: 'Token Plan Team (supports unattended automation)' },
-    { value: 'token-plan-personal', label: 'Token Plan Personal (interactive use only)' },
-    { value: 'coding-plan', label: 'Coding Plan (qwen3.8-max unavailable)' },
+    { value: 'token-plan-personal', label: 'Token Plan Personal' },
+    { value: 'token-plan-team', label: 'Token Plan Team' },
     { value: 'custom', label: 'Custom OpenAI-compatible Qwen endpoint' },
   ];
   console.log('\nQwen billing plan:');
   plans.forEach((plan, index) => console.log(`  ${index + 1}. ${plan.label}${plan.value === fallback ? ' [default]' : ''}`));
-  const answer = (await terminal.question('Choose 1-5: ')).trim();
+  const answer = (await terminal.question('Choose 1-4: ')).trim();
   if (!answer) return fallback;
   const selected = plans[Number(answer) - 1];
-  if (!selected) throw new Error('Choose a Qwen billing plan from 1 through 5');
+  if (!selected) throw new Error('Choose a Qwen billing plan from 1 through 4');
   return selected.value;
 }
 
@@ -849,7 +836,7 @@ async function configureGitHubRepository(config: ProjectConfig, dryRun: boolean)
     cwd: config.project.root,
     timeoutMs: 30_000,
   });
-  const requiredContexts = ['Qwen Harness / CI', 'Qwen Harness / governance', 'Qwen Harness / reward'];
+  const requiredContexts = ['Fern Delivery Harness / CI', 'Fern Delivery Harness / governance', 'Fern Delivery Harness / reward'];
   if (existingProtection.exitCode === 0) {
     let current: { required_status_checks?: { strict?: boolean; contexts?: string[] } | null };
     try {

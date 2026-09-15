@@ -1,4 +1,4 @@
-name: Qwen Harness CI
+name: Fern Delivery Harness CI
 
 on:
   pull_request:
@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   ci:
-    name: Qwen Harness / CI
+    name: Fern Delivery Harness / CI
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

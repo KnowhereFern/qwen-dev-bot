@@ -66,6 +66,8 @@ export class IssueNormalizer implements TaskNormalizer {
       risk: output.risk,
       dependencies: output.dependencies,
       rollback: output.rollback,
+      technologyDecisions: [],
+      deploymentDecisions: [],
     };
     return { title: output.title, body: renderNormalizedBody(issue, spec), spec };
   }
@@ -83,6 +85,20 @@ export function renderNormalizedBody(source: RemoteIssue, spec: TaskSpec): strin
     '',
     '## Constraints',
     ...spec.constraints.map((item) => `- ${item}`),
+    ...(spec.technologyDecisions.length || spec.deploymentDecisions.length
+      ? [
+          '',
+          '## Frozen delivery decisions',
+          ...spec.technologyDecisions.map(
+            (decision) =>
+              `- Technology ${decision.id}: ${decision.category} = ${decision.technology} (${decision.source}); ${decision.rationale}`,
+          ),
+          ...spec.deploymentDecisions.map(
+            (decision) =>
+              `- Deployment ${decision.id}: ${decision.component} on ${decision.provider}/${decision.environment} (${decision.authority}); ${decision.rationale}`,
+          ),
+        ]
+      : []),
     '',
     `Risk: **${spec.risk}**`,
     `Rollback: ${spec.rollback}`,
@@ -135,6 +151,8 @@ function validateOutput(value: unknown, gateIds: string[], rewardIds: string[]):
 
 function validateSpec(value: TaskSpec): TaskSpec {
   const sourceKinds: TaskSpec['source']['kind'][] = ['user', 'community', 'self-repair', 'ci', 'developer'];
+  const technologyDecisions = value?.technologyDecisions ?? [];
+  const deploymentDecisions = value?.deploymentDecisions ?? [];
   if (
     !value ||
     typeof value !== 'object' ||
@@ -151,7 +169,9 @@ function validateSpec(value: TaskSpec): TaskSpec {
     !['low', 'medium', 'high'].includes(value.risk) ||
     !Array.isArray(value.dependencies) ||
     !value.dependencies.every((number) => Number.isSafeInteger(number) && number > 0) ||
-    !isText(value.rollback)
+    !isText(value.rollback) ||
+    !isTechnologyDecisions(technologyDecisions) ||
+    !isDeploymentDecisions(deploymentDecisions)
   ) {
     throw new Error('Invalid normalized task spec');
   }
@@ -169,7 +189,36 @@ function validateSpec(value: TaskSpec): TaskSpec {
     rewardCriterionIds: unique(value.rewardCriterionIds),
     dependencies: [...new Set(value.dependencies)],
     rollback: value.rollback.trim(),
+    technologyDecisions: structuredClone(technologyDecisions),
+    deploymentDecisions: structuredClone(deploymentDecisions),
   };
+}
+
+function isTechnologyDecisions(value: unknown): value is TaskSpec['technologyDecisions'] {
+  return Array.isArray(value) && value.every(
+    (decision) =>
+      decision &&
+      typeof decision === 'object' &&
+      isText(decision.id) &&
+      isText(decision.category) &&
+      isText(decision.technology) &&
+      (decision.source === 'approved' || decision.source === 'exception') &&
+      isText(decision.rationale),
+  );
+}
+
+function isDeploymentDecisions(value: unknown): value is TaskSpec['deploymentDecisions'] {
+  return Array.isArray(value) && value.every(
+    (decision) =>
+      decision &&
+      typeof decision === 'object' &&
+      isText(decision.id) &&
+      isText(decision.component) &&
+      isText(decision.provider) &&
+      ['local', 'preview', 'staging', 'production'].includes(decision.environment) &&
+      decision.authority === 'build-test-only' &&
+      isText(decision.rationale),
+  );
 }
 
 function isText(value: unknown): value is string {

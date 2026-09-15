@@ -2,7 +2,7 @@
   "name": "qwen-harness-starter",
   "version": "1.0.0-rc.4",
   "private": true,
-  "description": "Minimal one-click project starter for the Qwen self-evolving development harness.",
+  "description": "Minimal one-click starter for Fern's autonomous software delivery harness, powered by Qwen Code.",
   "license": "MIT",
   "engines": {
     "node": ">=22.5"

@@ -4,7 +4,7 @@ import type { CommunityCollector, CommunityScanResult } from './community/collec
 import type { ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
-import type { GitHubControl, RemoteIssue } from './github/control-plane.js';
+import type { GitHubControl } from './github/control-plane.js';
 import { GitWorkspace, branchFor } from './git/git-workspace.js';
 import { parseNormalizedSpec, type TaskNormalizer } from './intake/normalizer.js';
 import { Logger } from './logger.js';
@@ -15,9 +15,9 @@ import { resolveVisualArtifacts } from './rewards/evaluators.js';
 import { GateRunner } from './rewards/gates.js';
 
 export const REQUIRED_GITHUB_CHECKS = [
-  'Qwen Harness / CI',
-  'Qwen Harness / governance',
-  'Qwen Harness / reward',
+  'Fern Delivery Harness / CI',
+  'Fern Delivery Harness / governance',
+  'Fern Delivery Harness / reward',
 ] as const;
 
 const RECONCILIATION_STATES = ['pr_open', 'waiting_ci', 'merge_ready', 'post_merge'] as const;
@@ -220,7 +220,11 @@ export class HarnessSupervisor {
         qwenWorkflowRunId: qwenResult.workflowRunId,
       });
       if (qwenResult.needsContinuation) {
-        this.checkpoint(task, { goalState: qwenResult.goalState, usage: qwenResult.usage });
+        this.checkpoint(task, {
+          goalState: qwenResult.goalState,
+          goalReason: qwenResult.goalReason,
+          usage: qwenResult.usage,
+        });
         this.store.transition(task.id, 'ready', { leaseOwner: null, leaseExpiresAt: null, lastError: null });
         return;
       }
@@ -556,7 +560,7 @@ export class HarnessSupervisor {
 
   private async publishRewardCheck(scorecard: RewardScorecard): Promise<void> {
     await this.github.publishCheck({
-      name: 'Qwen Harness / reward',
+      name: 'Fern Delivery Harness / reward',
       sha: scorecard.commitSha,
       conclusion: scorecard.passed ? 'success' : 'failure',
       title: scorecard.passed ? 'Universal reward passed' : 'Universal reward failed',

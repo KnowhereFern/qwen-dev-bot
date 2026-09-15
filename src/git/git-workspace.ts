@@ -175,10 +175,10 @@ export class GitWorkspace {
       const message = `harness: ${summary.slice(0, 68)}\n\nIssue: #${task.issueNumber}\nTask: ${task.id}`;
       await this.git(['commit', '-m', message], worktree, true, {
         ...process.env,
-        GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? 'Qwen Harness',
-        GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? 'qwen-harness@users.noreply.github.com',
-        GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? 'Qwen Harness',
-        GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? 'qwen-harness@users.noreply.github.com',
+        GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? 'Fern Delivery Harness',
+        GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? 'fern-delivery-harness@users.noreply.github.com',
+        GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? 'Fern Delivery Harness',
+        GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? 'fern-delivery-harness@users.noreply.github.com',
       });
     } else {
       const head = (await this.git(['rev-parse', 'HEAD'], worktree)).stdout.trim();

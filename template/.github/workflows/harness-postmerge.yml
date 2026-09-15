@@ -1,8 +1,8 @@
-name: Qwen Harness Post-merge Repair
+name: Fern Delivery Harness Post-merge Repair
 
 on:
   workflow_run:
-    workflows: ["Qwen Harness CI"]
+    workflows: ["Fern Delivery Harness CI"]
     types: [completed]
 
 permissions:

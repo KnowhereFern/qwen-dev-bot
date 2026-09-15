@@ -2,12 +2,32 @@ import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { qwenCodeVersionAtLeast } from '../src/qwen/runtime-compat.js';
-import { goalPromptFor, renderObjective } from '../src/qwen/qwen-code-executor.js';
+import {
+  classifyGoalDisposition,
+  goalDetailsFromStreamEvent,
+  goalPromptFor,
+  renderObjective,
+} from '../src/qwen/qwen-code-executor.js';
 import type { TaskRecord } from '../src/core/types.js';
 
 const root = path.resolve(import.meta.dirname, '..');
 
 describe('Qwen extension packaging', () => {
+  it('classifies canonical Goal snapshots and bounds non-budget pauses', () => {
+    expect(goalDetailsFromStreamEvent({
+      type: 'stream_event',
+      event: {
+        type: 'goal_state',
+        goal_state: { goal: { status: 'usage_limited', lastReason: 'Session token limit reached', limitKind: 'tokens' } },
+      },
+    })).toEqual({ state: 'usage_limited', reason: 'Session token limit reached', limitKind: 'tokens' });
+    expect(classifyGoalDisposition({ budgetExit: true, state: 'paused' })).toBe('continue');
+    expect(classifyGoalDisposition({ budgetExit: false, state: 'active' })).toBe('retry');
+    expect(classifyGoalDisposition({ budgetExit: false, state: 'paused', reason: 'manual pause' })).toBe('retry');
+    expect(classifyGoalDisposition({ budgetExit: false, state: 'blocked', reason: 'no progress' })).toBe('retry');
+    expect(classifyGoalDisposition({ budgetExit: false, state: 'usage_limited' })).toBe('retry');
+    expect(classifyGoalDisposition({ budgetExit: false, state: 'complete' })).toBe('complete');
+  });
   it('keeps extension-loaded agents and reward skill in sync with project templates', () => {
     const agentNames = readdirSync(path.join(root, 'agents')).sort();
     expect(agentNames).toHaveLength(6);
@@ -25,7 +45,7 @@ describe('Qwen extension packaging', () => {
     const manifest = JSON.parse(readFileSync(path.join(root, 'qwen-extension.json'), 'utf8'));
     expect(manifest).toMatchObject({
       name: 'qwen-dev-harness',
-      contextFileName: 'QWEN-HARNESS.md',
+      contextFileName: 'DELIVERY-HARNESS.md',
     });
   });
 

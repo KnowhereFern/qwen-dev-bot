@@ -5,6 +5,7 @@ import { defaultProjectConfig } from '../src/core/config.js';
 import type { TaskRecord } from '../src/core/types.js';
 import { GitWorkspace, branchFor, githubSlugFromRemote } from '../src/git/git-workspace.js';
 import { runProcess } from '../src/runtime/safe-process.js';
+import { createGitFixture } from './fixtures/git.js';
 import { makeTmp } from './helpers.js';
 
 describe('real Git worktree delivery', () => {
@@ -121,29 +122,6 @@ describe('real Git worktree delivery', () => {
     expect(existsSync(verification)).toBe(false);
   });
 });
-
-export async function createGitFixture(): Promise<{ repo: string; remote: string }> {
-  const root = makeTmp('git-fixture');
-  const repo = path.join(root, 'repo');
-  const remote = path.join(root, 'remote.git');
-  mkdirSync(repo);
-  mkdirSync(remote);
-  await command(['init', '--bare'], remote);
-  await command(['init', '-b', 'main'], repo);
-  await command(['config', 'user.name', 'Fixture'], repo);
-  await command(['config', 'user.email', 'fixture@example.com'], repo);
-  writeFileSync(path.join(repo, 'README.md'), '# fixture\n');
-  writeFileSync(path.join(repo, 'AUTONOMY.md'), '# protected contract\n');
-  writeFileSync(
-    path.join(repo, 'check.mjs'),
-    "import { existsSync } from 'node:fs'; process.exit(existsSync('feature.txt') ? 0 : 1);\n",
-  );
-  await command(['add', '.'], repo);
-  await command(['commit', '-m', 'initial'], repo);
-  await command(['remote', 'add', 'origin', remote], repo);
-  await command(['push', '-u', 'origin', 'main'], repo);
-  return { repo, remote };
-}
 
 export function taskRecord(): TaskRecord {
   return {

@@ -18,10 +18,10 @@ export function qwenCredentialCompatibilityProblem(
 ): string | null {
   const planKey = credential.apiKey.startsWith('sk-sp-');
   if (config.qwen.billingPlan === 'standard' && planKey) {
-    return 'A plan-specific sk-sp credential is paired with the standard QwenCloud endpoint. Token Plan, Coding Plan, and pay-as-you-go keys/endpoints are not interchangeable. Token Plan Personal also prohibits this unattended harness; use Token Plan Team or pay-as-you-go.';
+    return 'A Token Plan sk-sp credential is paired with the standard QwenCloud route. Token Plan and standard keys/endpoints are not interchangeable.';
   }
-  if (config.qwen.billingPlan === 'token-plan-team' && !planKey) {
-    return 'Token Plan Team requires its dedicated sk-sp credential and Token Plan endpoint.';
+  if (config.qwen.billingPlan.startsWith('token-plan-') && !planKey) {
+    return 'Token Plan requires its dedicated sk-sp credential and Token Plan endpoint.';
   }
   return null;
 }
@@ -32,25 +32,6 @@ export function assertQwenCredentialCompatibility(
 ): void {
   const problem = qwenCredentialCompatibilityProblem(config, credential);
   if (problem) throw new Error(problem);
-}
-
-export function detectQwenCredentialEnvKey(
-  options: {
-    environment?: NodeJS.ProcessEnv;
-    qwenSettingsFile?: string;
-    qwenEnvironmentFile?: string;
-  } = {},
-): string {
-  const environment = options.environment ?? process.env;
-  const qwenHome = path.join(os.homedir(), '.qwen');
-  const settingsFile = options.qwenSettingsFile ?? path.join(qwenHome, 'settings.json');
-  const environmentFile = options.qwenEnvironmentFile ?? path.join(qwenHome, '.env');
-  for (const envKey of ['BAILIAN_TOKEN_PLAN_API_KEY', 'BAILIAN_API_KEY', 'DASHSCOPE_API_KEY', 'BAILIAN_CODING_PLAN_API_KEY']) {
-    if (environment[envKey] || readQwenSettingsValue(settingsFile, envKey) || readDotEnvValue(environmentFile, envKey)) {
-      return envKey;
-    }
-  }
-  return 'DASHSCOPE_API_KEY';
 }
 
 /** Resolve the configured Qwen credential without copying it into tracked project files. */
