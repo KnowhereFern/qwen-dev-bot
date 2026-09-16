@@ -8,6 +8,7 @@ All notable changes to this project are documented here.
 
 - Audit exact merge CI separately from candidate-only governance/reward checks.
 - Accept explicit in-repository review evidence during pre-approval redrafting while keeping the objective frozen and feedback outside execution authority.
+- Separate product implementation gaps from harness-owned operational proof so target programs do not duplicate the controller or evidence-export machinery.
 
 ## [1.0.0-rc.23] - 2026-09-16
 
