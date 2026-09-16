@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.13] - 2026-09-16
+
+- Normalize an exact deployment technology decision id to its declared provider value while continuing to reject unknown providers and targets.
+
 ## [1.0.0-rc.12] - 2026-09-16
 
 - Ignore blank optional repository-risk notes from model output while preserving strict validation of evidence and non-blank fields.

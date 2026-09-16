@@ -70,7 +70,7 @@ describe('portfolio planner validation', () => {
           { id: 'QUEUE', category: 'queue', technology: 'Example Queue', rationale: 'Required exception' },
         ],
         deploymentDecisions: [
-          { id: 'PREVIEW', component: 'web', provider: 'Vercel', environment: 'preview', rationale: 'Build preview' },
+          { id: 'PREVIEW', component: 'web', provider: 'WEB', environment: 'preview', rationale: 'Build preview' },
         ],
         stories: [{
           ...story('S1'),
@@ -89,6 +89,7 @@ describe('portfolio planner validation', () => {
     );
 
     expect(result.technologyDecisions.map((decision) => decision.source)).toEqual(['approved', 'exception']);
+    expect(result.deploymentDecisions[0]?.provider).toBe('Vercel');
     expect(result.deploymentDecisions[0]?.authority).toBe('build-test-only');
     expect(() => validatePortfolioDraft(
       {
