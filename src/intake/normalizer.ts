@@ -216,7 +216,7 @@ function isDeploymentDecisions(value: unknown): value is TaskSpec['deploymentDec
       isText(decision.component) &&
       isText(decision.provider) &&
       ['local', 'preview', 'staging', 'production'].includes(decision.environment) &&
-      decision.authority === 'build-test-only' &&
+      ['build-test-only', 'staging'].includes(decision.authority) &&
       isText(decision.rationale),
   );
 }

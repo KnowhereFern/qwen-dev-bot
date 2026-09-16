@@ -25,7 +25,7 @@ describe('Qwen extension packaging', () => {
     expect(classifyGoalDisposition({ budgetExit: false, state: 'active' })).toBe('retry');
     expect(classifyGoalDisposition({ budgetExit: false, state: 'paused', reason: 'manual pause' })).toBe('retry');
     expect(classifyGoalDisposition({ budgetExit: false, state: 'blocked', reason: 'no progress' })).toBe('retry');
-    expect(classifyGoalDisposition({ budgetExit: false, state: 'usage_limited' })).toBe('retry');
+    expect(classifyGoalDisposition({ budgetExit: false, state: 'usage_limited' })).toBe('continue');
     expect(classifyGoalDisposition({ budgetExit: false, state: 'complete' })).toBe('complete');
   });
   it('keeps extension-loaded agents and reward skill in sync with project templates', () => {

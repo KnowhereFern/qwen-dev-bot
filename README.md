@@ -2,7 +2,7 @@
 
 A software product designed and built by Fern. It uses Qwen Code and `qwen3.8-max` as its execution engine to turn approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.4`. The deterministic and mocked production paths are verified. Promotion to stable `v1.0.0` is gated on a complete live run with a configured Qwen account.
+**Release status:** `v1.0.0-rc.5`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
 
 See [live test readiness](docs/live-test-readiness.md) for the current machine and end-to-end proof status.
 
@@ -22,8 +22,12 @@ Qwen Code and `qwen3.8-max` provide the model runtime. The harness supplies the 
 | Long-running autonomous implementation | Headless Qwen Code `/goal`, saved session IDs, `/goal resume`, stream-JSON monitoring, hard wall/tool/turn budgets, and isolated Git worktrees |
 | Build, unit, integration, E2E, lifecycle, and security checks | Auto-discovered and project-configurable gates, bounded subprocesses, a built-in secret/symlink scan, GitHub CI, and fresh-worktree post-merge verification |
 | Universal reward system | Hard execution vetoes plus weighted Qwen rubric, independent agentic review, and optional rendered-visual scoring; every result is an evidence-linked scorecard |
-| Multi-source evolution | Allowlisted HTTPS source snapshots, content hashing, Qwen proposal extraction, deduplication, and review-only GitHub issues that must still be approved and normalized |
+| Multi-source evolution | GitHub feedback, CI and staging failures, approved metrics, and allowlisted HTTPS engineering sources are provenance-preserving, hashed, relevance-checked, deduplicated, and kept inside the approval boundary |
 | Requirements-to-delivery planning | A project-local requirements file becomes a durable master-plan issue plus bounded, dependency-aware review stories; explicit approval freezes exact normalized task contracts |
+| Repository-aware objective programs | Parallel read-only repository assessment records an exact clean commit, maps objective coverage to verified evidence, activates one dependency wave at a time, and reassesses the objective after delivery |
+| Staging delivery | A credential-isolated deployment controller deploys an immutable merged commit to an explicitly configured Railway or command provider, verifies the reported revision, runs lifecycle gates, and records rollback evidence |
+| Continuous maintenance | GitHub feedback, CI failures, staging failures, approved metrics, and allowlisted engineering sources become provenance-preserving, deduplicated signals; material changes still require approval |
+| Controlled harness evolution | An immutable controller can evaluate a successor without credentials, require Node/Python/Go/Rust canaries, promote it through a protected launcher at an idle boundary, observe probation, and roll back |
 | Dynamic workflows and multi-agent work | A Qwen workflow with parallel read-only reconnaissance, one mutating implementer, and independent review; six bounded Qwen subagents ship in the extension |
 | Multimodal-native work | Visual reward artifacts are supported directly; setup can also install the official Qwen-MM-Plugins core capability for Qwen's implementation agents |
 | Continuous delivery and self-repair | Exact remote-head checks, guarded auto-merge by default, verification of the actual merge commit, and one deduplicated repair issue per post-merge regression |
@@ -35,9 +39,11 @@ The Qwen Code integration follows its official documentation for [headless goals
 ## Runtime loop
 
 ```text
-requirements file -> draft epic + review stories -> explicit plan approval
+objective + repository snapshot -> evidence map -> program + explicit approval
                                       |
-approved issue / allowlisted source / CI regression
+                   current dependency wave only
+                                      v
+approved issue / accepted signal / CI or staging regression
                          |
                   untrusted intake
                          v
@@ -55,7 +61,15 @@ approved issue / allowlisted source / CI regression
                          |
         fresh merge-commit verification
                   |                 |
-                 done       deduplicated repair issue
+            wave complete    deduplicated repair issue
+                  |
+       immutable staging deployment
+                  |
+       revision check + lifecycle gates
+                  |
+     objective audit -> next wave / delivered
+                  |
+     maintenance signals; no invented backlog
 ```
 
 Supported task states are `intake`, `normalized`, `ready`, `leased`, `active`, `verifying`, `pr_open`, `waiting_ci`, `merge_ready`, `post_merge`, `waiting`, `failed`, `quarantined`, `cancelled`, and `done`.
@@ -85,6 +99,7 @@ You can also provide the path up front: `npm run bootstrap -- /absolute/path/to/
 The wizard detects the GitHub repository and project scripts, then asks about:
 
 - trusted issue author and merge policy;
+- repository-aware objective delivery; new installations enable it by default, while existing version 1 projects retain their prior authority until explicitly upgraded;
 - the Qwen billing plan, matching endpoint/credential name, and optional Qwen Code install or upgrade;
 - reuse of a credential already saved in Qwen Code; accepting the matching default normally requires no token copying or shell export;
 - allowlisted community-source scanning;
@@ -115,7 +130,7 @@ npm run setup -- /absolute/path/to/your-project --yes \
   --persist-api-key --configure-github
 ```
 
-Guarded auto-merge defaults on for new projects so a fully passing story can unblock its dependents without human polling. Answer `no` in the wizard or pass `--no-auto-merge` to opt out; `--auto-merge` can explicitly opt an existing project back in during `update`. Existing project choices are preserved unless a flag changes them. The installer is idempotent: it updates unchanged harness-owned files, preserves project customizations, backs up pre-existing settings, and records hashes for safe uninstall. Optional GitHub configuration creates only missing labels and adds only missing required status contexts; it does not replace existing label metadata or branch-protection rules.
+Guarded auto-merge defaults on for new projects so a fully passing story can unblock its dependents without human polling. Answer `no` in the wizard or pass `--no-auto-merge` to opt out; `--auto-merge` can explicitly opt an existing project back in during `update`. Existing project choices are preserved unless a flag changes them. The installer is idempotent: it updates unchanged harness-owned files, preserves project customizations, backs up pre-existing settings, and records hashes for safe uninstall. Before linking the extension, CLI, or worker service, it packs the current release into a versioned controller installation under harness state; services never depend on a temporary bootstrap clone or mutable development checkout. Optional GitHub configuration creates only missing labels and adds only missing required status contexts; it does not replace existing label metadata or branch-protection rules.
 
 Setup writes additive project `.qwen/settings.json` entries for `qwen3.8-max`, sandboxing, leaf-only delegation, and dynamic workflows, referring only to the configured credential environment name; it never writes the credential into tracked project settings. The harness resolves that name from the same untracked user locations Qwen Code uses. Model-driven Qwen subprocesses receive a least-privilege environment, never inherit GitHub/OpenAI/npm/cloud credentials, and use an invocation-level MCP allowlist. The allowlist is empty by default; `--with-mm` adds only `qwen-mm-plugins-core`. The main session and reviewers remain non-mutating; each headless run auto-approves only the exact installed saved workflow path, and only that workflow's implementer receives YOLO approval. The implementer remains inside Qwen's sandbox, an isolated worktree, and the supervisor's external protected-path checks. The saved dynamic workflow receives explicit concurrency, total-agent, wall-time, output-token, per-agent turn, and per-agent time limits from project configuration.
 
@@ -149,7 +164,7 @@ The readiness matrix checks Node, Git, GitHub auth/repository/protection, the ac
 
 Create a GitHub issue and apply `harness:accept`. The raw issue is never executed. Qwen creates a separate normalized issue, the persistent worker claims it, and the task proceeds through the loop.
 
-For a larger project, give the planner one project-local requirements file (committing it is recommended). It uses Qwen only to propose a bounded acyclic delivery graph, validates every story/gate/reward ID, and publishes a review-only master issue plus story issues. Nothing can execute until you approve the plan:
+For a larger project, give the planner one project-local requirements file (committing it is recommended). With program mode enabled, the harness first inspects a clean repository snapshot at an exact commit. It records architecture, features, tests, dependencies, deployment configuration, and operational evidence; maps each requirement to `implemented`, `partial`, `missing`, `unverified`, or `externally_blocked`; then proposes a bounded acyclic delivery program. Nothing can execute until you approve it:
 
 ```sh
 qwen-harness plan /path/to/project --requirements PROJECT.md
@@ -158,9 +173,11 @@ qwen-harness plan-approve /path/to/project --plan PLAN_ID
 qwen-harness plan-status /path/to/project --plan PLAN_ID
 ```
 
-Use `plan ... --approve` only when you intentionally want planning and approval in one command. Re-running the same requirements snapshot is idempotent. Editing the file creates a new draft; the harness refuses to approve that revision while an earlier plan for the same source is active or blocked, so accepted work is never silently rewritten.
+Approval freezes the objective, acceptance criteria, technology choices, deployment targets, and authority. Only the current dependency wave becomes executable. After its exact merge commit passes staging and lifecycle verification, the harness reassesses the entire objective and may revise only unstarted work within those boundaries. Material changes pause at `awaiting_material_approval`; task completion alone never marks the objective delivered.
 
-The minimum useful requirements file needs only: a product objective, intended user/use case, MVP scope, constraints, and observable definition of done. A story list is optional—the planner can propose it—but specific acceptance examples improve the result. The planner also records the relevant technology and deployment choices. Catalog exceptions are visibly marked; approval freezes the reviewed choices into each normalized story contract. Deployment choices remain build-and-test-only and never grant credentials, resource creation, or live deployment authority. The starter repository’s `PROJECT.md` is a fill-in template.
+Use `plan ... --approve` only when you intentionally want planning and approval in one command. Re-running the same requirements snapshot is idempotent. Editing the file creates a new draft; accepted work is never silently rewritten.
+
+The minimum useful requirements file needs only: a product objective, intended user/use case, MVP scope, constraints, and observable definition of done. A story list is optional—the planner can propose it—but specific acceptance examples improve the result. The planner also records the relevant technology and deployment choices. Catalog exceptions are visibly marked; approval freezes the reviewed choices into each normalized story contract. Deployment choices remain build-and-test-only unless version 2 explicitly enables an existing staging target. Staging credentials stay inside the deployment controller, resource creation is never inferred, and production always requires approval. The starter repository’s `PROJECT.md` is a fill-in template.
 
 Useful commands:
 
@@ -175,6 +192,15 @@ qwen-harness community /path/to/project [--force]
 qwen-harness plan /path/to/project --requirements FILE [--max-stories N] [--approve]
 qwen-harness plan-approve /path/to/project --plan PLAN_ID
 qwen-harness plan-status /path/to/project [--plan PLAN_ID]
+qwen-harness plan-reassess /path/to/project --plan PLAN_ID
+qwen-harness plan-approve-revision /path/to/project --plan PLAN_ID
+qwen-harness signals /path/to/project [--scan] [--accept ID | --reject ID]
+qwen-harness deploy-status /path/to/project [--plan PLAN_ID]
+qwen-harness evidence-report /path/to/project --plan PLAN_ID [--json]
+qwen-harness controller-status /path/to/project
+qwen-harness controller-evaluate /path/to/project --sha COMMIT_SHA
+qwen-harness controller-promote /path/to/project --release RELEASE_ID
+qwen-harness controller-rollback /path/to/project --release RELEASE_ID
 qwen-harness update /path/to/project
 qwen-harness uninstall /path/to/project --yes [--remove-service]
 ```
@@ -192,6 +218,12 @@ The Qwen extension also contributes `/harness:doctor`, `/harness:status`, and `/
 - `worker`: retry/quarantine policy, lease timing, polling, read-only workflow concurrency, and auto-merge. The mutation capacity is fixed at one;
 - `qwen`: reasoning tiers; main-run, workflow, token, and subagent budgets; and `allowedMcpServers`. The model is intentionally fixed to `qwen3.8-max`; ambient user MCP servers are not inherited and subagent nesting is disabled.
 - `technologyPolicy`: approved category/technology pairs used by portfolio planning. Choices outside the catalog are plan exceptions, and delivery authority is fixed at `build-test-only`.
+- `program`: repository assessment, wave reassessment, maintenance, snapshot cleanliness, and material-change approval.
+- `evolution`: approved feedback sources and polling. External content is evidence only and cannot grant execution authority.
+- `deployment.staging`: explicit existing Railway identifiers or an argument-array command adapter, revision health endpoint, lifecycle gates, timeout, and optional data-compatible rollback. Deployment credentials are available only to this controller.
+- `selfHosting`: disabled by default; names the proven delivery project, isolated evaluation commands, all four stack canaries, probation period, and whether a validated release may promote automatically. Enabling it also requires protecting the launcher, fixed acceptance runner, configuration validator, release manager, and reward evaluator paths listed by config validation.
+
+Version 1 configurations continue with program, deployment, and self-hosting capabilities disabled. Migrating to version 2 never enables staging or self-promotion by itself. Production activation always remains outside autonomous authority.
 
 For visual scoring, add a `visual` reward criterion with `artifactGlobs` pointing to deterministic screenshots or renders produced by a gate. Missing or out-of-worktree artifacts fail closed.
 
@@ -202,11 +234,15 @@ Normalized task gate/reward IDs are trace metadata only: a task cannot weaken pr
 - Issues, comments, linked pages, source pages, logs, test output, and model output are untrusted data.
 - Only normalized issues created by configured trusted identities can become runnable tasks.
 - Portfolio story issues are review-only; approval creates separate normalized task issues from the validated, frozen plan graph, including only the technology/deployment decisions referenced by each story.
+- Repository assessment evidence is tied to the recorded commit and checked against the snapshot; source code without a passing test or operational receipt remains unverified where runtime behavior matters.
+- Required checks and the objective contract cannot be weakened by model review, a later signal, a replacement task, or a controller candidate.
 - One worker mutates one harness-owned worktree; research and review agents are read-only.
 - Shell execution uses argument arrays with `shell: false`, bounded output, timeouts, process-tree termination, a reduced gate environment, and a credential-minimized Qwen environment.
 - A passing summary cannot compensate for a failed hard gate, critical rubric, security finding, or changed PR head.
 - Auto-merge defaults on, can be disabled per project, and uses GitHub's expected-head SHA guard.
 - `done` means the actual merge commit passed a fresh post-merge run—not merely that code, a PR, or CI exists.
+- Program delivery additionally requires the objective acceptance audit and, when enabled, an exact-revision verified staging deployment.
+- A successor controller cannot modify the running controller, its credentials, governance, launcher, or the evaluation that approves it.
 - SQLite state, checkpoints, service credentials, transcripts, and redacted JSONL ledgers stay outside tracked project content.
 
 See the installed project's `AUTONOMY.md` for the enforceable project contract.

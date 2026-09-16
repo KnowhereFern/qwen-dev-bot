@@ -27,6 +27,7 @@ export interface QwenCodeRunResult {
   goalState: string | null;
   goalReason: string | null;
   needsContinuation: boolean;
+  continuationKind?: 'budget' | 'provider' | null;
   usage: Record<string, unknown>;
   durationMs: number;
 }
@@ -177,6 +178,9 @@ export class QwenCodeExecutor implements QwenExecutor {
       );
     }
     const needsContinuation = disposition === 'continue';
+    const continuationKind = needsContinuation
+      ? isProviderWaiting({ state: latest.goalState, reason: latest.goalReason, limitKind: latest.goalLimitKind }) ? 'provider' : 'budget'
+      : null;
     const summary =
       latest.resultEvent?.result?.trim() ||
       (needsContinuation ? 'Qwen run paused at its configured budget' : 'Qwen goal completed');
@@ -188,6 +192,7 @@ export class QwenCodeExecutor implements QwenExecutor {
       goalState: latest.goalState,
       goalReason: latest.goalReason,
       needsContinuation,
+      continuationKind,
       usage: latest.resultEvent?.usage ?? {},
       durationMs: receipt.durationMs,
     };
@@ -200,9 +205,23 @@ export function classifyGoalDisposition(input: {
   reason?: string | null;
   limitKind?: string | null;
 }): 'complete' | 'continue' | 'retry' {
-  if (input.budgetExit) return 'continue';
-  if (input.state === null || input.state === 'complete' || input.state === 'completed') return 'complete';
+  const state = input.state?.trim().toLowerCase() ?? null;
+  const reason = `${input.reason ?? ''} ${input.limitKind ?? ''}`.trim().toLowerCase();
+  if (state === 'complete' || state === 'completed') return 'complete';
+  if (['failed', 'error', 'cancelled', 'canceled', 'blocked'].includes(state ?? '')) return 'retry';
+  if (isProviderWaiting(input)) return 'continue';
+  const resumableReason = /(budget|token|turn|tool|time|limit|rate.?limit|overload|temporar|network|provider|service.?unavailable|timeout)/.test(reason);
+  if (input.budgetExit && (state === null || ['paused', 'waiting', 'active', 'running'].includes(state))) return 'continue';
+  if (['paused', 'waiting'].includes(state ?? '') && resumableReason) return 'continue';
+  if (state === null && !input.budgetExit) return 'complete';
   return 'retry';
+}
+
+export function isProviderWaiting(input: { state?: string | null; reason?: string | null; limitKind?: string | null }): boolean {
+  const state = input.state?.trim().toLowerCase() ?? '';
+  const reason = `${input.reason ?? ''} ${input.limitKind ?? ''}`.trim().toLowerCase();
+  return ['usage_limited', 'rate_limited', 'provider_waiting', 'service_unavailable'].includes(state) ||
+    /(rate.?limit|usage.?limit|quota|overload|temporar|network|provider|service.?unavailable)/.test(reason);
 }
 
 export function goalDetailsFromStreamEvent(value: unknown): {
@@ -258,7 +277,7 @@ export function renderObjective(task: TaskRecord, feedback: string[], workflowPa
             `- ${decision.id}: ${decision.component} on ${decision.provider}/${decision.environment}; authority=${decision.authority}; ${decision.rationale}`,
         )
       : ['- None']),
-    'Do not substitute frozen choices. Build-test-only authority never permits credentials, resource creation, or live deployment.',
+    'Do not substitute frozen choices. Staging deployment is performed only by the controller; this implementation session never receives deployment credentials or production authority.',
     `Rollback: ${spec.rollback}`,
     ...(feedback.length > 0 ? ['', 'Verifier feedback to repair:', ...feedback.map((item) => `- ${item}`)] : []),
     '',

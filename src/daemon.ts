@@ -23,7 +23,16 @@ export async function runDaemon(options: {
         shortestPoll = Math.min(shortestPoll, config.worker.pollIntervalMs);
         harness = await createProductionHarness(config, { logger });
         const result = await harness.supervisor.tick(options.signal);
-        logger.info('worker tick complete', { projectId: registration.id, ...result });
+        const program = await harness.program.tick(options.signal);
+        const controller = config.selfHosting.enabled ? await harness.selfHosting.tickAuto(options.signal) : null;
+        logger.info('worker tick complete', { projectId: registration.id, ...result, program, controller: controller?.release?.status ?? null });
+        if (controller?.promoted) {
+          logger.info('controller promotion prepared; exiting at idle boundary for launcher handoff', {
+            projectId: registration.id,
+            releaseId: controller.release?.id ?? null,
+          });
+          return;
+        }
       } catch (error) {
         logger.error('project tick failed', {
           projectId: registration.id,

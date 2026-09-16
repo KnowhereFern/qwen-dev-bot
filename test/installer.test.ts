@@ -287,7 +287,7 @@ describe('guided installer', () => {
       timeoutMs: 20_000,
     });
     expect(receipt.exitCode).toBe(0);
-    expect(receipt.stdout.trim()).toBe('1.0.0-rc.4');
+    expect(receipt.stdout.trim()).toBe('1.0.0-rc.5');
   });
 
   it('shows setup help without entering the interactive wizard', async () => {
@@ -305,7 +305,8 @@ describe('guided installer', () => {
 
   it('leaves a recovery receipt when an optional external setup step fails', async () => {
     const root = makeTmp('installer-partial-failure');
-    process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-partial-failure-state');
+    const state = makeTmp('installer-partial-failure-state');
+    process.env.QWEN_HARNESS_STATE_DIR = state;
     writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'fixture' }));
     const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
     config.qwen.command = 'qwen-command-that-does-not-exist';
@@ -330,6 +331,7 @@ describe('guided installer', () => {
     ).rejects.toThrow('extension link failed');
 
     expect(existsSync(path.join(root, '.qwen-harness', 'install-receipt.json'))).toBe(true);
+    expect(existsSync(path.join(state, 'controller', 'installed', '1.0.0-rc.5', 'node_modules', 'qwen-dev-bot', 'bin', 'qwen-harness-launcher.mjs'))).toBe(true);
     expect(await uninstallProject(root)).toContain('unregistered project');
   });
 

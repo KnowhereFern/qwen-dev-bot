@@ -3,7 +3,7 @@ import path from 'node:path';
 import { CommunityCollector } from './community/collector.js';
 import { loadProjectConfig, PROJECT_CONFIG_PATH } from './core/config.js';
 import { projectIdFor, projectStateDir } from './core/state-paths.js';
-import type { PortfolioPlan, QwenBillingPlan } from './core/types.js';
+import type { ControllerRelease, DeploymentRecord, EvolutionSignal, PortfolioPlan, QwenBillingPlan } from './core/types.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
 import { runDaemon } from './daemon.js';
@@ -20,8 +20,10 @@ import {
 import { QwenApiClient } from './qwen/qwen-api.js';
 import { assertQwenCredentialCompatibility, resolveQwenCredential } from './qwen/credential-resolver.js';
 import { ProjectRegistry } from './registry.js';
+import { RepositoryAssessor } from './program/repository-assessor.js';
+import { buildEvidenceReport, formatEvidenceReport } from './program/evidence-report.js';
 
-const VERSION = '1.0.0-rc.4';
+const VERSION = '1.0.0-rc.5';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? 'help';
@@ -58,6 +60,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           qwenBillingPlan: billingPlanValue(args),
           autoMerge: toggleFlagValue(args, '--auto-merge', '--no-auto-merge'),
           enableCommunity: hasFlag(args, '--community') || undefined,
+          enableProgram: toggleFlagValue(args, '--program', '--no-program'),
           installQwen: hasFlag(args, '--install-qwen') || undefined,
           installService: hasFlag(args, '--install-service') ? true : hasFlag(args, '--no-service') ? false : undefined,
           linkExtension: hasFlag(args, '--no-link-extension') ? false : undefined,
@@ -93,6 +96,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           qwenBillingPlan: billingPlanValue(args) ?? current.qwen.billingPlan,
           autoMerge: toggleFlagValue(args, '--auto-merge', '--no-auto-merge') ?? current.worker.autoMerge,
           enableCommunity: current.intake.communityEnabled,
+          enableProgram: toggleFlagValue(args, '--program', '--no-program') ?? current.program.enabled,
           installQwen: hasFlag(args, '--install-qwen'),
           installService: hasFlag(args, '--install-service') ? true : hasFlag(args, '--no-service') ? false : undefined,
           linkExtension: hasFlag(args, '--no-link-extension') ? false : undefined,
@@ -234,17 +238,22 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         if (existing) {
           created = { plan: existing, created: false };
         } else {
+          const qwenApi = new QwenApiClient({
+            model: config.qwen.model,
+            baseUrl: config.qwen.baseUrl,
+            credentialEnvKey: config.qwen.credentialEnvKey,
+            apiKey: credential?.apiKey,
+          });
+          const assessment = config.program.enabled
+            ? await new RepositoryAssessor(config, qwenApi).assess(document)
+            : undefined;
+          if (assessment) store.saveRepositoryAssessment(assessment);
           const planner = new PortfolioPlanner(
             config,
-            new QwenApiClient({
-              model: config.qwen.model,
-              baseUrl: config.qwen.baseUrl,
-              credentialEnvKey: config.qwen.credentialEnvKey,
-              apiKey: credential?.apiKey,
-            }),
+            qwenApi,
           );
-          const draft = await planner.plan(document, maxStories);
-          created = await coordinator.createDraft({ ...document, draft });
+          const draft = await planner.plan(document, maxStories, assessment);
+          created = await coordinator.createDraft({ ...document, draft, assessment });
         }
         const plan = hasFlag(args, '--approve') ? await coordinator.approve(created.plan.id) : created.plan;
         const view = coordinator.status(plan);
@@ -274,6 +283,39 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         return 0;
       } finally {
         store.close();
+      }
+    }
+    case 'plan-approve-revision': {
+      const config = loadProjectConfig(root);
+      const planId = valueOf(args, '--plan');
+      if (!planId) throw new Error('plan-approve-revision requires --plan PLAN_ID');
+      const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      try {
+        const github = new OctokitControlPlane({ repo: config.project.githubRepo, token: await resolveGitHubToken(root) });
+        const coordinator = new PortfolioCoordinator(config, store, github);
+        const plan = await coordinator.approve(planId);
+        const view = coordinator.status(plan);
+        console.log(json ? JSON.stringify(view, null, 2) : formatPortfolioPlan(view));
+        return 0;
+      } finally {
+        store.close();
+      }
+    }
+    case 'plan-reassess': {
+      const config = loadProjectConfig(root);
+      const planId = valueOf(args, '--plan');
+      if (!planId) throw new Error('plan-reassess requires --plan PLAN_ID');
+      const harness = await createProductionHarness(config);
+      try {
+        const plan = harness.store.getPortfolioPlan(planId);
+        if (!plan) throw new Error(`Unknown portfolio plan: ${planId}`);
+        const result = await harness.program.reassess(plan, 'manual');
+        const coordinator = new PortfolioCoordinator(config, harness.store, harness.github);
+        const updated = harness.store.getPortfolioPlan(planId) as PortfolioPlan;
+        console.log(json ? JSON.stringify({ result, plan: coordinator.status(updated) }, null, 2) : `${result.action}\n\n${formatPortfolioPlan(coordinator.status(updated))}`);
+        return 0;
+      } finally {
+        harness.close();
       }
     }
     case 'plan-status': {
@@ -306,11 +348,85 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const harness = await createProductionHarness(config);
       try {
         const result = await harness.supervisor.tick();
-        console.log(json ? JSON.stringify(result, null, 2) : `${result.action}${result.processedTaskId ? ` ${result.processedTaskId}` : ''}`);
+        const program = await harness.program.tick();
+        console.log(json ? JSON.stringify({ supervisor: result, program }, null, 2) : `${result.action}${result.processedTaskId ? ` ${result.processedTaskId}` : ''}; program=${program.action}${program.planId ? ` ${program.planId}` : ''}`);
       } finally {
         harness.close();
       }
       return 0;
+    }
+    case 'signals': {
+      const config = loadProjectConfig(root);
+      const harness = await createProductionHarness(config);
+      try {
+        const accepted = valueOf(args, '--accept');
+        const rejected = valueOf(args, '--reject');
+        if (accepted && rejected) throw new Error('signals accepts only one of --accept or --reject');
+        const decision = accepted ? harness.program.decideSignal(accepted, true) : rejected ? harness.program.decideSignal(rejected, false) : null;
+        const scan = hasFlag(args, '--scan') || hasFlag(args, '--force') ? await harness.program.scanSignals(true) : null;
+        const signals = harness.store.listSignals();
+        console.log(json ? JSON.stringify({ decision, scan, signals }, null, 2) : formatSignals(signals));
+        return 0;
+      } finally {
+        harness.close();
+      }
+    }
+    case 'deploy-status': {
+      const config = loadProjectConfig(root);
+      const planId = valueOf(args, '--plan');
+      const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      try {
+        const deployments = store.listDeployments(planId);
+        console.log(json ? JSON.stringify(deployments, null, 2) : formatDeployments(deployments));
+        return 0;
+      } finally {
+        store.close();
+      }
+    }
+    case 'evidence-report': {
+      const config = loadProjectConfig(root);
+      const planId = valueOf(args, '--plan');
+      if (!planId) throw new Error('evidence-report requires --plan PLAN_ID');
+      const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      try {
+        const plan = store.getPortfolioPlan(planId);
+        if (!plan) throw new Error(`Unknown portfolio plan: ${planId}`);
+        const report = buildEvidenceReport(store, plan);
+        console.log(json ? JSON.stringify(report, null, 2) : formatEvidenceReport(report));
+        return 0;
+      } finally {
+        store.close();
+      }
+    }
+    case 'controller-status':
+    case 'controller-evaluate':
+    case 'controller-promote':
+    case 'controller-rollback': {
+      const config = loadProjectConfig(root);
+      const harness = await createProductionHarness(config);
+      try {
+        let result = null;
+        if (command === 'controller-evaluate') {
+          const sha = valueOf(args, '--sha');
+          if (!sha) throw new Error('controller-evaluate requires --sha COMMIT_SHA');
+          result = await harness.selfHosting.evaluate(sha);
+        } else if (command === 'controller-promote') {
+          const release = valueOf(args, '--release');
+          if (!release) throw new Error('controller-promote requires --release RELEASE_ID');
+          result = await harness.selfHosting.promote(release);
+        } else if (command === 'controller-rollback') {
+          const release = valueOf(args, '--release');
+          if (!release) throw new Error('controller-rollback requires --release RELEASE_ID');
+          result = harness.selfHosting.rollback(release);
+        } else {
+          result = await harness.selfHosting.observe();
+        }
+        const releases = harness.store.listControllerReleases();
+        console.log(json ? JSON.stringify({ result, releases }, null, 2) : formatControllerReleases(releases));
+        return 0;
+      } finally {
+        harness.close();
+      }
     }
     case 'worker': {
       const controller = new AbortController();
@@ -357,8 +473,34 @@ function formatReward(scorecard: NonNullable<ReturnType<PersistentTaskStore['get
   ].join('\n');
 }
 
+function formatSignals(signals: EvolutionSignal[]): string {
+  if (signals.length === 0) return 'No evolution signals recorded.';
+  return signals.map((signal) =>
+    `${signal.id}  ${signal.status.padEnd(10)} ${signal.material ? 'material' : 'non-material'}  ${signal.source}:${signal.sourceKey}\n  ${signal.title}\n  ${signal.summary.slice(0, 500)}`,
+  ).join('\n\n');
+}
+
+function formatDeployments(deployments: DeploymentRecord[]): string {
+  if (deployments.length === 0) return 'No staging deployments recorded.';
+  return deployments.map((deployment) =>
+    `${deployment.id}  ${deployment.status.padEnd(12)} ${deployment.commitSha.slice(0, 12)}  plan=${deployment.planId} wave=${deployment.wave}` +
+    `${deployment.externalId ? ` external=${deployment.externalId}` : ''}` +
+    `${deployment.observedRevision ? ` observed=${deployment.observedRevision.slice(0, 12)}` : ''}` +
+    `${deployment.error ? `\n  error: ${deployment.error.slice(0, 500)}` : ''}`,
+  ).join('\n');
+}
+
+function formatControllerReleases(releases: ControllerRelease[]): string {
+  if (releases.length === 0) return 'No controller releases recorded.';
+  return releases.map((release) =>
+    `${release.id}  ${release.status.padEnd(11)} ${release.version} ${release.commitSha.slice(0, 12)}` +
+    `${release.evaluationHash ? ` evaluation=${release.evaluationHash.slice(0, 12)}` : ''}` +
+    `${release.probationEndsAt ? ` probationEnds=${new Date(release.probationEndsAt).toISOString()}` : ''}`,
+  ).join('\n');
+}
+
 function firstPositional(args: string[]): string | undefined {
-  const valueOptions = new Set(['--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan']);
+  const valueOptions = new Set(['--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release']);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] as string;
     if (valueOptions.has(arg)) {
@@ -424,12 +566,21 @@ Commands:
   plan                 Turn a requirements file into a review-only delivery graph
   plan-approve         Approve one plan and create executable normalized tasks
   plan-status          Refresh the master issue and show story/task progress
+  plan-reassess        Reassess the approved objective against the current repository
+  plan-approve-revision Approve a material program revision
+  signals              List or scan normalized evolution signals
+  deploy-status        Show exact-revision staging deployment evidence
+  evidence-report      Export the objective, intervention, test, deploy, and evolution ledger
+  controller-status    Show evaluated and active harness controller releases
+  controller-evaluate  Evaluate an exact controller commit without credentials
+  controller-promote   Promote a validated controller at an idle boundary
+  controller-rollback  Restore the previous controller release
   uninstall --yes      Remove unchanged installer-owned files
 
 Init options:
   --dry-run --yes --name NAME --repo OWNER/NAME --trusted-author LOGIN --billing-plan PLAN
   --base-url URL --api-key-env NAME
-  --auto-merge --no-auto-merge --community --configure-github --install-qwen --with-mm --with-browser --install-cli --persist-api-key
+  --auto-merge --no-auto-merge --community --program --no-program --configure-github --install-qwen --with-mm --with-browser --install-cli --persist-api-key
   --install-service --no-service --no-link-extension --skip-dependencies
 
 Reward options:
@@ -439,6 +590,15 @@ Plan options:
   plan PROJECT --requirements FILE [--max-stories N] [--approve] [--json]
   plan-approve PROJECT --plan PLAN_ID [--json]
   plan-status PROJECT [--plan PLAN_ID] [--json]
+  plan-reassess PROJECT --plan PLAN_ID [--json]
+  plan-approve-revision PROJECT --plan PLAN_ID [--json]
+  signals PROJECT [--scan] [--accept ID | --reject ID] [--json]
+  deploy-status PROJECT [--plan PLAN_ID] [--json]
+  evidence-report PROJECT --plan PLAN_ID [--json]
+  controller-status PROJECT [--json]
+  controller-evaluate PROJECT --sha COMMIT_SHA [--json]
+  controller-promote PROJECT --release RELEASE_ID [--json]
+  controller-rollback PROJECT --release RELEASE_ID [--json]
 `;
 }
 

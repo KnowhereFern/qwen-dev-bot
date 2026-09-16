@@ -11,6 +11,11 @@ import { Logger } from './logger.js';
 import { QwenApiClient } from './qwen/qwen-api.js';
 import { assertQwenCredentialCompatibility, resolveQwenCredential } from './qwen/credential-resolver.js';
 import { QwenCodeExecutor } from './qwen/qwen-code-executor.js';
+import { PortfolioPlanner } from './portfolio/planner.js';
+import { RepositoryAssessor } from './program/repository-assessor.js';
+import { ProgramController } from './program/controller.js';
+import { EvolutionSignalCollector } from './evolution/signals.js';
+import { ControllerReleaseManager } from './self-hosting/releases.js';
 import { UniversalRewardEngine } from './rewards/engine.js';
 import {
   ExecutionEvaluator,
@@ -25,6 +30,8 @@ export interface ProductionHarness {
   supervisor: HarnessSupervisor;
   store: PersistentTaskStore;
   github: GitHubControl;
+  program: ProgramController;
+  selfHosting: ControllerReleaseManager;
   close(): void;
 }
 
@@ -74,7 +81,17 @@ export async function createProductionHarness(
       options.workerId ?? `${os.hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`,
       new CommunityCollector(config, store, github, qwenApi),
     );
-    return { supervisor, store, github, close: () => store.close() };
+    const planner = new PortfolioPlanner(config, qwenApi);
+    const program = new ProgramController(
+      config,
+      store,
+      github,
+      new RepositoryAssessor(config, qwenApi),
+      planner,
+      new EvolutionSignalCollector(config, store, github, qwenApi),
+    );
+    const selfHosting = new ControllerReleaseManager(config, store);
+    return { supervisor, program, selfHosting, store, github, close: () => store.close() };
   } catch (error) {
     store.close();
     throw error;

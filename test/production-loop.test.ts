@@ -50,6 +50,28 @@ class BlockingQwenExecutor implements QwenExecutor {
   }
 }
 
+class ProviderWaitingQwenExecutor implements QwenExecutor {
+  async execute(input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
+    input.onSession?.('qwen-session-provider-wait');
+    return {
+      sessionId: 'qwen-session-provider-wait', workflowRunId: null, summary: 'provider overloaded',
+      goalState: 'usage_limited', goalReason: 'provider temporarily overloaded', needsContinuation: true,
+      continuationKind: 'provider', usage: {}, durationMs: 1,
+    };
+  }
+}
+
+class BudgetPausedQwenExecutor implements QwenExecutor {
+  async execute(input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
+    input.onSession?.('qwen-session-budget');
+    return {
+      sessionId: 'qwen-session-budget', workflowRunId: null, summary: 'turn budget reached',
+      goalState: 'paused', goalReason: 'turn budget limit', needsContinuation: true,
+      continuationKind: 'budget', usage: {}, durationMs: 1,
+    };
+  }
+}
+
 class MockNormalizer implements TaskNormalizer {
   async normalize(
     issue: RemoteIssue,
@@ -261,6 +283,49 @@ describe('production supervisor trace', () => {
     expect(task?.lastError).toContain('Worker shutdown interrupted');
     store.close();
   }, 30_000);
+
+  it('waits and resumes provider-limited work without recording a code failure', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('provider-wait-state');
+    const store = new PersistentTaskStore('provider-wait-project', state);
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      new ProviderWaitingQwenExecutor(), new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-provider-wait',
+    );
+
+    await supervisor.tick();
+    let task = store.findByIssue(2);
+    expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0, continuations: 1 });
+    store.patch(task?.id as string, { resumeAfter: Date.now() - 1 });
+    await supervisor.tick();
+    task = store.findByIssue(2);
+    expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0, continuations: 2 });
+    expect(store.listEvents('task.provider_resumed')).toHaveLength(1);
+    store.close();
+  });
+
+  it('converts repeated budget-only continuations into a bounded repair attempt', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    config.worker.maxContinuations = 1;
+    const state = makeTmp('budget-continuation-state');
+    const store = new PersistentTaskStore('budget-continuation-project', state);
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      new BudgetPausedQwenExecutor(), new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-budget-continuation',
+    );
+
+    await supervisor.tick();
+    expect(store.findByIssue(2)).toMatchObject({ state: 'ready', attempts: 1, continuations: 1 });
+    store.close();
+  });
 
   it('propagates worker shutdown through verification gates', async () => {
     const { repo } = await createGitFixture();

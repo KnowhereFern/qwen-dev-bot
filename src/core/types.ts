@@ -1,4 +1,6 @@
-export const CONFIG_VERSION = 1 as const;
+export const CONFIG_VERSION = 2 as const;
+export const SUPPORTED_CONFIG_VERSIONS = [1, CONFIG_VERSION] as const;
+export type ConfigVersion = (typeof SUPPORTED_CONFIG_VERSIONS)[number];
 
 export const TASK_STATES = [
   'intake',
@@ -56,7 +58,7 @@ export interface RewardCriterionConfig {
   artifactGlobs?: string[];
 }
 
-export type DeliveryAuthority = 'build-test-only';
+export type DeliveryAuthority = 'build-test-only' | 'staging';
 
 export interface ApprovedTechnology {
   category: string;
@@ -64,7 +66,7 @@ export interface ApprovedTechnology {
 }
 
 export interface TechnologyPolicy {
-  authority: DeliveryAuthority;
+  authority: 'build-test-only';
   approved: ApprovedTechnology[];
   requirePlanApprovalForExceptions: true;
 }
@@ -89,7 +91,7 @@ export interface DeploymentDecision {
 export type QwenBillingPlan = 'standard' | 'token-plan-personal' | 'token-plan-team' | 'custom';
 
 export interface ProjectConfig {
-  configVersion: typeof CONFIG_VERSION;
+  configVersion: ConfigVersion;
   project: {
     name: string;
     root: string;
@@ -123,6 +125,7 @@ export interface ProjectConfig {
     maxConcurrentMutations: number;
     maxReadOnlyAgents: number;
     maxAttempts: number;
+    maxContinuations: number;
     identicalFailureLimit: number;
     autoMerge: boolean;
   };
@@ -147,6 +150,51 @@ export interface ProjectConfig {
     criteria: RewardCriterionConfig[];
   };
   technologyPolicy: TechnologyPolicy;
+  program: {
+    enabled: boolean;
+    reassessAfterWave: boolean;
+    maintenance: boolean;
+    maxAssessmentFiles: number;
+    maxAssessmentBytes: number;
+    requireCleanSnapshot: boolean;
+    materialChangesRequireApproval: true;
+  };
+  evolution: {
+    enabled: boolean;
+    githubFeedback: boolean;
+    ciFailures: boolean;
+    stagingFailures: boolean;
+    productMetrics: Array<{ name: string; url: string }>;
+    pollIntervalMs: number;
+  };
+  deployment: {
+    staging: {
+      enabled: boolean;
+      provider: 'railway' | 'command';
+      project: string;
+      environment: string;
+      service: string;
+      healthUrl: string;
+      revisionJsonPath: string;
+      timeoutMs: number;
+      lifecycleGateIds: string[];
+      command?: { command: string; args: string[] };
+      rollback?: { command: string; args: string[]; dataCompatible: boolean };
+    };
+    production: {
+      requiresApproval: true;
+    };
+  };
+  selfHosting: {
+    enabled: boolean;
+    autoPromote: boolean;
+    probationMs: number;
+    deliveryObservationMs: number;
+    requiredProjectId: string;
+    candidateRoot: string;
+    evaluationCommands: Array<{ command: string; args: string[] }>;
+    canaryCommands: Array<{ stack: 'node' | 'python' | 'go' | 'rust'; command: string; args: string[] }>;
+  };
   protectedPaths: string[];
 }
 
@@ -180,8 +228,13 @@ export interface TaskRecord {
   spec: TaskSpec | null;
   priority: number;
   attempts: number;
+  continuations?: number;
+  waitKind?: 'provider' | null;
+  resumeAfter?: number | null;
   identicalFailures: number;
   lastFailureFingerprint: string | null;
+  failureLineageId?: string | null;
+  lineageFailures?: number;
   maxAttempts: number;
   leaseOwner: string | null;
   leaseExpiresAt: number | null;
@@ -203,14 +256,75 @@ export interface TaskRecord {
 
 export const PORTFOLIO_PLAN_STATUSES = [
   'draft',
+  'awaiting_initial_approval',
   'approving',
   'active',
+  'assessing',
+  'awaiting_material_approval',
+  'deploying_staging',
+  'verifying_staging',
+  'delivered',
+  'maintaining',
+  'paused',
   'done',
   'blocked',
   'superseded',
 ] as const;
 
 export type PortfolioPlanStatus = (typeof PORTFOLIO_PLAN_STATUSES)[number];
+
+export type CapabilityStatus = 'implemented' | 'partial' | 'missing' | 'unverified' | 'externally_blocked';
+
+export interface EvidenceReference {
+  kind: 'file' | 'test' | 'deployment' | 'git' | 'config' | 'signal';
+  locator: string;
+  summary: string;
+  commitSha: string;
+}
+
+export interface ObjectiveCoverage {
+  id: string;
+  requirement: string;
+  status: CapabilityStatus;
+  rationale: string;
+  evidence: EvidenceReference[];
+}
+
+export interface RepositoryAnalysis {
+  area: 'product' | 'architecture' | 'verification' | 'operations';
+  summary: string;
+  findings: Array<{
+    capability: string;
+    status: CapabilityStatus;
+    rationale: string;
+    evidence: EvidenceReference[];
+  }>;
+  risks: string[];
+}
+
+export interface RepositoryAssessment {
+  id: string;
+  projectId: string;
+  commitSha: string;
+  dirty: boolean;
+  detectedStacks: Array<'node' | 'python' | 'go' | 'rust' | 'unknown'>;
+  files: string[];
+  analyses: RepositoryAnalysis[];
+  coverage: ObjectiveCoverage[];
+  createdAt: number;
+}
+
+export interface ProgramRevision {
+  number: number;
+  assessmentId: string;
+  repositorySha: string;
+  reason: 'initial' | 'wave-complete' | 'quarantine' | 'staging-failure' | 'signal' | 'manual';
+  material: boolean;
+  summary: string;
+  createdAt: number;
+  approvedAt: number | null;
+  sourceSignalId?: string | null;
+}
 
 export interface PortfolioStory {
   key: string;
@@ -225,10 +339,15 @@ export interface PortfolioStory {
   rollback: string;
   technologyDecisionIds: string[];
   deploymentDecisionIds: string[];
+  coverageIds?: string[];
   sourceIssueNumber: number | null;
   sourceIssueUrl: string | null;
   normalizedIssueNumber: number | null;
   normalizedIssueUrl: string | null;
+  wave?: number;
+  revision?: number;
+  supersededAt?: number | null;
+  failureOriginIssueNumber?: number | null;
 }
 
 export interface PortfolioPlan {
@@ -236,6 +355,7 @@ export interface PortfolioPlan {
   projectId: string;
   sourcePath: string;
   contentHash: string;
+  sourceContent?: string;
   title: string;
   objective: string;
   constraints: string[];
@@ -249,6 +369,68 @@ export interface PortfolioPlan {
   createdAt: number;
   updatedAt: number;
   approvedAt: number | null;
+  assessmentId?: string | null;
+  repositorySha?: string | null;
+  revision?: number;
+  currentWave?: number;
+  coverage?: ObjectiveCoverage[];
+  revisions?: ProgramRevision[];
+  latestDeploymentId?: string | null;
+  deliveredAt?: number | null;
+  maintenanceStartedAt?: number | null;
+}
+
+export type SignalStatus = 'observed' | 'normalized' | 'deduplicated' | 'relevant' | 'proposed' | 'accepted' | 'rejected';
+
+export interface EvolutionSignal {
+  id: string;
+  projectId: string;
+  source: 'github' | 'ci' | 'staging' | 'metric' | 'community';
+  sourceKey: string;
+  contentHash: string;
+  title: string;
+  summary: string;
+  evidence: EvidenceReference[];
+  status: SignalStatus;
+  material: boolean;
+  observedAt: number;
+  updatedAt: number;
+}
+
+export type DeploymentStatus = 'pending' | 'uploading' | 'building' | 'deploying' | 'verifying' | 'succeeded' | 'failed' | 'rolled_back';
+
+export interface DeploymentRecord {
+  id: string;
+  projectId: string;
+  planId: string;
+  wave: number;
+  provider: 'railway' | 'command';
+  commitSha: string;
+  previousVerifiedCommitSha: string | null;
+  externalId: string | null;
+  status: DeploymentStatus;
+  healthUrl: string;
+  observedRevision: string | null;
+  error: string | null;
+  startedAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+}
+
+export type ControllerReleaseStatus = 'candidate' | 'evaluating' | 'ready' | 'active' | 'inactive' | 'probation' | 'rejected' | 'rolled_back';
+
+export interface ControllerRelease {
+  id: string;
+  version: string;
+  commitSha: string;
+  root: string;
+  status: ControllerReleaseStatus;
+  baselineReleaseId: string | null;
+  evaluationHash: string | null;
+  promotedAt: number | null;
+  probationEndsAt: number | null;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface RunCheckpoint {

@@ -12,8 +12,9 @@ The harness may turn approved user feedback, allowlisted community evidence, CI 
 - Only a validated normalized issue created by an identity listed in `.qwen-harness/project.yml` may enter `ready`.
 - The worker may edit product code only inside its owned Git worktree.
 - The worker may not change this contract, harness policy/configuration, GitHub workflows, CODEOWNERS, delivery harness agents/skills/workflows, branch protection, credentials, billing, deployment authority, or reward thresholds.
-- External publication, package releases, deployments, financial operations, and new credentials require explicit human authority outside an issue body.
-- When an approved portfolio task contains frozen technology or deployment decisions, the worker must use those choices and may not substitute alternatives. A deployment target in a task grants build-and-test work only, never credentials, resource creation, or live deployment authority.
+- Production activation, external publication, package releases, financial operations, new accounts, purchases, and new credentials require explicit human authority outside an issue body.
+- When an approved program contains frozen technology or deployment decisions, the worker must use those choices and may not substitute alternatives. Staging authority exists only when version 2 configuration explicitly enables an existing target; it belongs to the deployment controller, never an implementation session.
+- A program may revise unstarted work after reassessment, but it may not silently rewrite active or completed task contracts. Material scope, technology, deployment, security, spending, or authority changes require approval.
 
 ## Delivery invariant
 
@@ -29,10 +30,16 @@ The exact remote PR head must equal the locally tested and rewarded commit. A ta
 6. Wait for required exact-head GitHub checks.
 7. Merge only when the configured auto-merge policy is enabled and every exact-head check still passes; otherwise stop at merge-ready.
 8. Verify the merged commit from a fresh detached worktree; create one deduplicated self-repair issue on regression.
+9. After the current dependency wave, deploy the immutable merge commit to configured staging, verify the application reports that revision, run lifecycle checks, and reassess the complete objective.
+10. Mark the objective delivered only when its acceptance audit passes. In maintenance, wait for relevant accepted evidence instead of inventing backlog.
 
 ## Failure policy
 
-Transient or new failures return evidence to the same task and Qwen session. The third identical failure fingerprint quarantines the task. No retry may weaken or remove a gate, rubric, feature, intended model, or safety boundary.
+Provider waiting and bounded-session continuation are not code failures. Transient or new code failures return evidence to the same task and Qwen session. Failure history follows replacement and repair tasks; the third identical failure fingerprint across that lineage quarantines the work. No retry may weaken or remove a gate, rubric, feature, intended model, or safety boundary.
+
+## Controller evolution
+
+The running controller is immutable. A candidate successor has no controller or deployment credentials and cannot alter governance, protected workflows, the launcher, or its own evaluation. Promotion requires the configured delivery proof, fixed regression and recovery checks, all four stack canaries, an idle boundary, a durable handover record, and probation with rollback.
 
 ## Secrets and state
 
