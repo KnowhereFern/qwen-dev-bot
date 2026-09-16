@@ -99,7 +99,13 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
       ['api', `repos/${config.project.githubRepo}/branches/${config.project.defaultBranch}/protection`, '--jq', '.required_status_checks.contexts'],
       root,
     );
-    checks.push(check('branch-protection', protection.ok ? 'pass' : config.worker.autoMerge ? 'fail' : 'warn', protection.ok ? 'Branch protection is readable' : 'Branch protection is absent or unavailable'));
+    checks.push(check(
+      'branch-protection',
+      protection.ok ? 'pass' : 'warn',
+      protection.ok
+        ? 'Branch protection is readable'
+        : 'Remote branch protection is absent or unavailable; the supervisor still requires exact-head CI, governance, and reward checks before merge',
+    ));
   }
 
   const qwen = await commandCheck(config.qwen.command, ['--version'], root);

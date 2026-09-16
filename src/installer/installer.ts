@@ -393,8 +393,12 @@ export async function installProject(options: InstallOptions): Promise<{ config:
     );
   }
   if (answers.configureGitHub && answers.githubRepo) {
-    await configureGitHubRepository(config, Boolean(options.dryRun));
-    summary.push(`${options.dryRun ? 'would configure' : 'configured'} GitHub labels and branch protection`);
+    const githubSetup = await configureGitHubRepository(config, Boolean(options.dryRun));
+    summary.push(
+      githubSetup === 'protection-unavailable'
+        ? 'configured GitHub labels; branch protection is unavailable on the current repository plan, so exact-head merge enforcement remains inside the supervisor'
+        : `${options.dryRun ? 'would configure' : 'configured'} GitHub labels and branch protection`,
+    );
   }
 
   receipt.service = service;
@@ -786,8 +790,11 @@ function gitignoreBlock(): string {
   return '# qwen-harness managed state\n.qwen-harness/install-receipt.json\n.qwen-harness/backups/\n.qwen-harness/state/\n';
 }
 
-async function configureGitHubRepository(config: ProjectConfig, dryRun: boolean): Promise<void> {
-  if (dryRun) return;
+async function configureGitHubRepository(
+  config: ProjectConfig,
+  dryRun: boolean,
+): Promise<'configured' | 'protection-unavailable' | 'dry-run'> {
+  if (dryRun) return 'dry-run';
   const labels: Array<[string, string, string]> = [
     [config.intake.readyLabel, '1d76db', 'Normalized task ready for the harness'],
     [config.intake.approvalLabel, '0e8a16', 'Maintainer approved for normalization'],
@@ -844,7 +851,7 @@ async function configureGitHubRepository(config: ProjectConfig, dryRun: boolean)
     const missingContexts = requiredContexts.filter(
       (context) => !current.required_status_checks?.contexts?.includes(context),
     );
-    if (current.required_status_checks && missingContexts.length === 0) return;
+    if (current.required_status_checks && missingContexts.length === 0) return 'configured';
     const statusChecks = current.required_status_checks
       ? { contexts: missingContexts }
       : { strict: true, contexts: requiredContexts };
@@ -865,7 +872,10 @@ async function configureGitHubRepository(config: ProjectConfig, dryRun: boolean)
     if (updated.exitCode !== 0) {
       throw new Error(`Could not add harness checks without altering existing branch protection: ${updated.stderr}`);
     }
-    return;
+    return 'configured';
+  }
+  if (existingProtection.exitCode !== 0 && githubBranchProtectionUnavailable(existingProtection.stderr)) {
+    return 'protection-unavailable';
   }
   if (!existingProtection.stderr.includes('HTTP 404')) {
     throw new Error(`Could not read existing branch protection; no protection was changed: ${existingProtection.stderr}`);
@@ -890,6 +900,11 @@ async function configureGitHubRepository(config: ProjectConfig, dryRun: boolean)
     timeoutMs: 30_000,
   });
   if (result.exitCode !== 0) throw new Error(`Could not configure branch protection: ${result.stderr}`);
+  return 'configured';
+}
+
+export function githubBranchProtectionUnavailable(message: string): boolean {
+  return /Upgrade to GitHub Pro|branch protection.*not available/i.test(message);
 }
 
 function listFiles(root: string): string[] {

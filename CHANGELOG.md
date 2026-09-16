@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.10] - 2026-09-16
+
+- Recorded private-repository branch-protection plan limits without blocking the independently gated supervisor merge path or claiming that remote protection was configured.
+
 ## [1.0.0-rc.9] - 2026-09-16
 
 - Updated readiness detection to recognize the display name emitted by current Qwen Code extension listings.
