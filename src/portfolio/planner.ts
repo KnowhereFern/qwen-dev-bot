@@ -80,7 +80,7 @@ export class PortfolioPlanner {
         'Do not implement anything, call tools, or invent product scope. Return JSON only.',
         'Return exactly: {title, objective, constraints, definitionOfDone, technologyDecisions, deploymentDecisions, stories}.',
         'Technology decisions contain: id, category, technology, rationale. Include only choices relevant to this plan.',
-        'Deployment decisions contain: id, component, provider, environment, rationale. environment is local, preview, staging, or production; provider must reference a technology decision.',
+        'Deployment decisions contain: id, component, provider, environment, rationale. environment is local, preview, staging, or production; provider must equal a declared technology value (for example Railway), not a decision id.',
         'Each story must contain: key, title, goal, acceptanceCriteria, constraints, requiredGateIds, rewardCriterionIds, risk, dependsOn, rollback, technologyDecisionIds, deploymentDecisionIds, coverageIds.',
         'When repository coverage is supplied, create work only for partial, missing, or unverified requirements and map every story to at least one coverage id.',
         'Do not create file-oriented cleanup, speculative infrastructure, or stories for capabilities proven implemented.',
@@ -304,10 +304,16 @@ function validateDeploymentDecisions(
   const decisions = value.map((entry, index): DeploymentDecision => {
     if (!isRecord(entry)) throw new Error(`Deployment decision ${index + 1} must be an object`);
     const id = decisionId(entry.id, `deploymentDecisions[${index}].id`);
-    const provider = requiredText(entry.provider, `${id}.provider`);
-    if (!technologies.some((decision) => decision.technology.toLowerCase() === provider.toLowerCase())) {
-      throw new Error(`Deployment decision ${id} provider ${provider} has no matching technology decision`);
+    const requestedProvider = requiredText(entry.provider, `${id}.provider`);
+    const providerTechnology = technologies.find(
+      (decision) =>
+        decision.technology.toLowerCase() === requestedProvider.toLowerCase() ||
+        decision.id.toLowerCase() === requestedProvider.toLowerCase(),
+    );
+    if (!providerTechnology) {
+      throw new Error(`Deployment decision ${id} provider ${requestedProvider} has no matching technology decision`);
     }
+    const provider = providerTechnology.technology;
     const environment = entry.environment;
     if (!['local', 'preview', 'staging', 'production'].includes(String(environment))) {
       throw new Error(`Deployment decision ${id} has invalid environment`);
