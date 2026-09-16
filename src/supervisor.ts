@@ -4,7 +4,7 @@ import type { CommunityCollector, CommunityScanResult } from './community/collec
 import type { ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
-import type { GitHubControl } from './github/control-plane.js';
+import { REQUIRED_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
 import { GitWorkspace, branchFor } from './git/git-workspace.js';
 import { parseNormalizedSpec, type TaskNormalizer } from './intake/normalizer.js';
 import { Logger } from './logger.js';
@@ -14,12 +14,6 @@ import { UniversalRewardEngine } from './rewards/engine.js';
 import { resolveVisualArtifacts } from './rewards/evaluators.js';
 import { GateRunner } from './rewards/gates.js';
 import { prepareProjectCheckout } from './runtime/checkout-preflight.js';
-
-export const REQUIRED_GITHUB_CHECKS = [
-  'Fern Delivery Harness / CI',
-  'Fern Delivery Harness / governance',
-  'Fern Delivery Harness / reward',
-] as const;
 
 const RECONCILIATION_STATES = ['pr_open', 'waiting_ci', 'merge_ready', 'post_merge'] as const;
 

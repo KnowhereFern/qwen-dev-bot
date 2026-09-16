@@ -293,7 +293,7 @@ describe('guided installer', () => {
       timeoutMs: 20_000,
     });
     expect(receipt.exitCode).toBe(0);
-    expect(receipt.stdout.trim()).toBe('1.0.0-rc.21');
+    expect(receipt.stdout.trim()).toBe('1.0.0-rc.22');
   });
 
   it.skipIf(process.platform === 'win32')('replaces a stale extension link with the immutable runtime', async () => {
@@ -341,7 +341,7 @@ exit 1
       },
     });
 
-    const immutableRuntime = path.join(state, 'controller', 'installed', '1.0.0-rc.21', 'node_modules', 'qwen-dev-bot');
+    const immutableRuntime = path.join(state, 'controller', 'installed', '1.0.0-rc.22', 'node_modules', 'qwen-dev-bot');
     expect(readFileSync(linkedPath, 'utf8')).toBe(immutableRuntime);
     expect(installed.receipt.extensionLinked).toBe(true);
   }, 15_000);
@@ -388,7 +388,7 @@ exit 1
     ).rejects.toThrow('extension link failed');
 
     expect(existsSync(path.join(root, '.qwen-harness', 'install-receipt.json'))).toBe(true);
-    expect(existsSync(path.join(state, 'controller', 'installed', '1.0.0-rc.21', 'node_modules', 'qwen-dev-bot', 'bin', 'qwen-harness-launcher.mjs'))).toBe(true);
+    expect(existsSync(path.join(state, 'controller', 'installed', '1.0.0-rc.22', 'node_modules', 'qwen-dev-bot', 'bin', 'qwen-harness-launcher.mjs'))).toBe(true);
     expect(await uninstallProject(root)).toContain('unregistered project');
   });
 

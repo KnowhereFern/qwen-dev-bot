@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.22] - 2026-09-16
+
+- Downgrade model claims of implemented behavior to unverified unless the controller has an exact-commit passing test or deployment result.
+- Feed successful required checks for the exact candidate commit into each post-wave objective audit as controller-owned test evidence.
+- Prevent planning from inventing polling or background work that conflicts with repository sleep, wake, idleness, or cost constraints.
+
 ## [1.0.0-rc.21] - 2026-09-16
 
 - Put a compact mandatory coverage/action matrix before planning evidence and omit repository inventory/findings that distract story synthesis; require an explicit final matrix audit in the model contract.

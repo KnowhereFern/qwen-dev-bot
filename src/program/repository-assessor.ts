@@ -116,6 +116,7 @@ export class RepositoryAssessor {
       files: snapshot.files,
       commitSha: snapshot.commitSha,
       gateIds: this.config.gates.map((gate) => gate.id),
+      verifiedTestLocators: operationalEvidence.filter((entry) => entry.kind === 'test' && entry.commitSha === snapshot.commitSha).map((entry) => entry.locator),
       deploymentIds: operationalEvidence.filter((entry) => entry.kind === 'deployment' && entry.commitSha === snapshot.commitSha).map((entry) => entry.locator),
       signalLocators: operationalEvidence.filter((entry) => entry.kind === 'signal' && entry.commitSha === snapshot.commitSha).map((entry) => entry.locator),
     };
@@ -263,6 +264,7 @@ interface EvidenceValidationContext {
   files: string[];
   commitSha: string;
   gateIds: string[];
+  verifiedTestLocators: string[];
   deploymentIds: string[];
   signalLocators: string[];
 }
@@ -299,13 +301,22 @@ function validateCoverage(value: unknown, context: EvidenceValidationContext): O
     const id = requiredText(entry.id, `coverage[${index}].id`).toUpperCase();
     if (!/^[A-Z][A-Z0-9_-]{0,31}$/.test(id) || ids.has(id)) throw new Error(`Invalid or duplicate coverage id ${id}`);
     ids.add(id);
+    const proposedStatus = entry.status as CapabilityStatus;
+    const evidence = validateEvidence(entry.evidence, context, `${id}.evidence`);
+    const lacksExactCommitProof = proposedStatus === 'implemented' && !evidence.some((item) =>
+      item.kind === 'deployment' || (item.kind === 'test' && context.verifiedTestLocators.includes(item.locator)),
+    );
+    const status: CapabilityStatus = lacksExactCommitProof ? 'unverified' : proposedStatus;
+    const rationale = requiredText(entry.rationale, `${id}.rationale`);
     return {
       id,
       requirement: requiredText(entry.requirement, `${id}.requirement`),
-      status: entry.status as CapabilityStatus,
-      requiredAction: validateCoverageAction(entry.requiredAction, entry.status as CapabilityStatus, id),
-      rationale: requiredText(entry.rationale, `${id}.rationale`),
-      evidence: validateEvidence(entry.evidence, context, `${id}.evidence`),
+      status,
+      requiredAction: validateCoverageAction(lacksExactCommitProof ? 'verify' : entry.requiredAction, status, id),
+      rationale: lacksExactCommitProof
+        ? `${rationale} Controller classification: unverified because no passing test or deployment result was supplied for the exact commit.`
+        : rationale,
+      evidence,
     };
   });
 }
