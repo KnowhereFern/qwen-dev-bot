@@ -176,6 +176,7 @@ export interface ProjectConfig {
       service: string;
       healthUrl: string;
       revisionJsonPath: string;
+      revisionEnvKey?: string;
       timeoutMs: number;
       lifecycleGateIds: string[];
       command?: { command: string; args: string[] };

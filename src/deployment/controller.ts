@@ -142,6 +142,22 @@ export class StagingDeploymentController {
 
   private async startRailway(checkout: string, record: DeploymentRecord, signal?: AbortSignal): Promise<string> {
     const staging = this.config.deployment.staging;
+    if (staging.revisionEnvKey) {
+      const revision = await this.processRunner({
+        command: 'railway',
+        args: [
+          'variable', 'set', `${staging.revisionEnvKey}=${record.commitSha}`, '--skip-deploys', '--json',
+          '--project', staging.project,
+          '--environment', staging.environment,
+          '--service', staging.service,
+        ],
+        cwd: checkout,
+        timeoutMs: 30_000,
+        signal,
+        env: { ...process.env, RAILWAY_CALLER: 'qwen-harness:staging-controller' },
+      });
+      if (revision.exitCode !== 0) throw new Error(`Railway revision variable failed: ${revision.stderr || revision.stdout}`);
+    }
     const result = await this.processRunner({
       command: 'railway',
       args: [

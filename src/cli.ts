@@ -23,7 +23,7 @@ import { ProjectRegistry } from './registry.js';
 import { RepositoryAssessor } from './program/repository-assessor.js';
 import { buildEvidenceReport, formatEvidenceReport } from './program/evidence-report.js';
 
-const VERSION = '1.0.0-rc.7';
+const VERSION = '1.0.0-rc.8';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? 'help';

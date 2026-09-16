@@ -20,6 +20,7 @@ describe('StagingDeploymentController', () => {
       environment: 'staging',
       service: 'service-id',
       healthUrl: 'https://fixture.example/api/health',
+      revisionEnvKey: 'SOS_RELEASE_SHA',
       lifecycleGateIds: ['staging-e2e'],
     };
     config.gates = [{ id: 'staging-e2e', kind: 'e2e', command: 'fixture-lifecycle', args: [], required: true, timeoutMs: 1_000 }];
@@ -45,6 +46,10 @@ describe('StagingDeploymentController', () => {
     expect(calls.find((call) => call.command === 'railway' && call.args?.[0] === 'up')?.args).toEqual(expect.arrayContaining([
       '--project', 'project-id', '--environment', 'staging', '--service', 'service-id', '--detach', '--json', '--path-as-root',
     ]));
+    expect(calls.find((call) => call.command === 'railway' && call.args?.[0] === 'variable')?.args).toEqual([
+      'variable', 'set', `SOS_RELEASE_SHA=${sha}`, '--skip-deploys', '--json',
+      '--project', 'project-id', '--environment', 'staging', '--service', 'service-id',
+    ]);
     expect(store.getDeployment(deployment.id)?.status).toBe('succeeded');
     const lifecycle = calls.find((call) => call.command === 'fixture-lifecycle');
     expect(lifecycle?.cwd).toContain(path.join('deployments', deployment.id, 'checkout'));
