@@ -74,6 +74,7 @@ describe('portfolio planner validation', () => {
         ],
         stories: [{
           ...story('S1'),
+          risk: 'HIGH',
           technologyDecisionIds: ['WEB', 'QUEUE'],
           deploymentDecisionIds: ['PREVIEW'],
         }],
@@ -89,6 +90,7 @@ describe('portfolio planner validation', () => {
     );
 
     expect(result.technologyDecisions.map((decision) => decision.source)).toEqual(['approved', 'exception']);
+    expect(result.stories[0]?.risk).toBe('high');
     expect(result.deploymentDecisions[0]?.provider).toBe('Vercel');
     expect(result.deploymentDecisions[0]?.authority).toBe('build-test-only');
     expect(() => validatePortfolioDraft(
