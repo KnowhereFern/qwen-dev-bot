@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.23] - 2026-09-16
+
+- Add a three-attempt planning correction loop that returns the exact validator error and rejected draft to Qwen without repeating the repository assessment; provider waiting errors remain outside this correction loop.
+
 ## [1.0.0-rc.22] - 2026-09-16
 
 - Downgrade model claims of implemented behavior to unverified unless the controller has an exact-commit passing test or deployment result.

@@ -68,6 +68,45 @@ describe('portfolio planner validation', () => {
     expect(prompt).not.toContain('SHOULD_NOT_REACH_PLANNER');
   });
 
+  it('corrects a rejected coverage contract using the exact validator error and original assessment', async () => {
+    let calls = 0;
+    let correction = '';
+    const model: PortfolioPlanningModel = {
+      async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]): Promise<{ value: T }> {
+        calls += 1;
+        correction = String(input.user);
+        return { value: coverageDraft(calls === 1 ? 'verify' : 'implement') as T };
+      },
+    };
+    const config = defaultProjectConfig(makeTmp('planner-repair'), 'fixture', 'owner/fixture');
+
+    const result = await new PortfolioPlanner(config, model).plan(
+      { sourcePath: 'OBJECTIVE.md', content: 'Build runner claims.' }, 5, runnerAssessment(),
+    );
+
+    expect(calls).toBe(2);
+    expect(correction).toContain('Coverage RUNNERS requires implement work, not verify');
+    expect(correction).toContain('<rejected-draft>');
+    expect(correction).toContain('Mandatory coverage/action matrix:');
+    expect(result.stories[0]?.workType).toBe('implement');
+  });
+
+  it('stops after three invalid planning outputs without coercing a verification story', async () => {
+    let calls = 0;
+    const model: PortfolioPlanningModel = {
+      async completeJson<T>(): Promise<{ value: T }> {
+        calls += 1;
+        return { value: coverageDraft('verify') as T };
+      },
+    };
+    const config = defaultProjectConfig(makeTmp('planner-repair-bound'), 'fixture', 'owner/fixture');
+
+    await expect(new PortfolioPlanner(config, model).plan(
+      { sourcePath: 'OBJECTIVE.md', content: 'Build runner claims.' }, 5, runnerAssessment(),
+    )).rejects.toThrow(/failed after 3 bounded attempts/);
+    expect(calls).toBe(3);
+  });
+
   it('normalizes a valid dependency graph into topological order', () => {
     const result = validatePortfolioDraft(
       {
@@ -180,6 +219,25 @@ describe('portfolio planner validation', () => {
     expect(result.stories[0]?.workType).toBe('implement');
   });
 });
+
+function coverageDraft(workType: 'implement' | 'verify'): Record<string, unknown> {
+  return {
+    title: 'Runner plan', objective: 'Deliver runner claims', constraints: [], definitionOfDone: ['Verified'],
+    technologyDecisions: [], deploymentDecisions: [],
+    stories: [{ ...story('S1'), workType, coverageIds: ['RUNNERS'], requiredGateIds: [], rewardCriterionIds: [] }],
+  };
+}
+
+function runnerAssessment(): RepositoryAssessment {
+  return {
+    id: 'assessment-runner', projectId: 'fixture', commitSha: 'a'.repeat(40), dirty: false,
+    detectedStacks: ['node'], files: [], analyses: [], createdAt: 1,
+    coverage: [{
+      id: 'RUNNERS', requirement: 'Runner claim flow', status: 'missing', requiredAction: 'implement',
+      rationale: 'No claim flow exists', evidence: [],
+    }],
+  };
+}
 
 describe('requirements document boundary', () => {
   it('reads tracked project text and rejects files outside the project or through symlinks', () => {
