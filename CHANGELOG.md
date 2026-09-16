@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.7] - 2026-09-16
+
+- Added an explicit `--link-extension` retry control so a noninteractive setup can recover after a partial extension-link failure.
+
 ## [1.0.0-rc.6] - 2026-09-16
 
 - Replace stale Qwen extension links during setup and verify the exact immutable runtime path reported by the installed Qwen CLI.
