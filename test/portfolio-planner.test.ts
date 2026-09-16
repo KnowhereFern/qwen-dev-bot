@@ -2,9 +2,13 @@ import { symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  PortfolioPlanner,
   readRequirementsDocument,
   validatePortfolioDraft,
 } from '../src/portfolio/planner.js';
+import type { PortfolioPlanningModel } from '../src/portfolio/planner.js';
+import type { RepositoryAssessment } from '../src/core/types.js';
+import { defaultProjectConfig } from '../src/core/config.js';
 import { makeTmp } from './helpers.js';
 
 function story(key: string, dependsOn: string[] = []): Record<string, unknown> {
@@ -26,6 +30,44 @@ function story(key: string, dependsOn: string[] = []): Record<string, unknown> {
 }
 
 describe('portfolio planner validation', () => {
+  it('puts a compact mandatory action matrix ahead of summarized assessment evidence', async () => {
+    let prompt = '';
+    const model: PortfolioPlanningModel = {
+      async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]): Promise<{ value: T }> {
+        prompt = String(input.user);
+        return { value: {
+          title: 'Runner plan', objective: 'Deliver runner claims', constraints: [], definitionOfDone: ['Verified'],
+          technologyDecisions: [], deploymentDecisions: [],
+          stories: [{
+            ...story('S1'), goal: 'Implement runner claims', workType: 'implement', coverageIds: ['RUNNERS'],
+            requiredGateIds: [], rewardCriterionIds: [],
+          }],
+        } as T };
+      },
+    };
+    const config = defaultProjectConfig(makeTmp('planner-context'), 'fixture', 'owner/fixture');
+    const assessment = {
+      id: 'assessment-context',
+      projectId: 'fixture',
+      commitSha: 'a'.repeat(40),
+      dirty: false,
+      detectedStacks: ['node'],
+      files: ['SHOULD_NOT_REACH_PLANNER'],
+      analyses: [{ area: 'product', summary: 'Runner claims are absent', findings: [], risks: [] }],
+      coverage: [{
+        id: 'RUNNERS', requirement: 'Runner claim flow', status: 'missing', requiredAction: 'implement',
+        rationale: 'No claim flow exists', evidence: [],
+      }],
+      createdAt: 1,
+    } as RepositoryAssessment;
+
+    await new PortfolioPlanner(config, model).plan({ sourcePath: 'OBJECTIVE.md', content: 'Build runner claims.' }, 5, assessment);
+
+    expect(prompt).toContain('Mandatory coverage/action matrix: [{"id":"RUNNERS"');
+    expect(prompt).toContain('"requiredAction":"implement"');
+    expect(prompt).not.toContain('SHOULD_NOT_REACH_PLANNER');
+  });
+
   it('normalizes a valid dependency graph into topological order', () => {
     const result = validatePortfolioDraft(
       {
