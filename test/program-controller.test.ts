@@ -19,9 +19,10 @@ describe('ProgramController', () => {
     const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
     config.program.enabled = true;
     config.evolution.enabled = false;
+    config.gates = [{ id: 'syntax', kind: 'custom', command: 'node', args: ['--check', 'README.md'], required: true, timeoutMs: 1_000 }];
     const store = new PersistentTaskStore(projectIdFor(config), makeTmp('program-controller-state'));
     const github = new EmptyGitHub();
-    const model = new ImplementedAssessmentModel();
+    const model = new ImplementedAssessmentModel(config.gates[0]?.id ?? 'syntax');
     const story = {
       key: 'S1', title: 'Objective', goal: 'Deliver', acceptanceCriteria: ['Verified'], constraints: [], requiredGateIds: [], rewardCriterionIds: [],
       risk: 'low' as const, workType: 'verify' as const, dependsOn: [], rollback: 'Revert', technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['REQ1'],
@@ -56,9 +57,10 @@ describe('ProgramController', () => {
 
 class ImplementedAssessmentModel implements PortfolioPlanningModel {
   calls = 0;
+  constructor(private readonly gateId: string) {}
   async completeJson<T>(): Promise<{ value: T }> {
     this.calls += 1;
-    const evidence = [{ kind: 'file', locator: 'README.md', summary: 'Verified fixture' }];
+    const evidence = [{ kind: 'test', locator: this.gateId, summary: 'Exact-commit checks passed' }];
     return this.calls <= 4
       ? { value: { summary: 'Verified', findings: [{ capability: 'Objective', status: 'implemented', rationale: 'Verified', evidence }], risks: [] } as T }
       : { value: { coverage: [{ id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Verified', evidence }] } as T };

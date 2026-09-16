@@ -1,6 +1,12 @@
 import { Octokit } from 'octokit';
 import { runProcess } from '../runtime/safe-process.js';
 
+export const REQUIRED_GITHUB_CHECKS = [
+  'Fern Delivery Harness / CI',
+  'Fern Delivery Harness / governance',
+  'Fern Delivery Harness / reward',
+] as const;
+
 export interface RemoteIssue {
   number: number;
   title: string;

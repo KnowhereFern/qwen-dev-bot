@@ -108,6 +108,7 @@ export class PortfolioPlanner {
         'When repository coverage is supplied, create work only for non-implemented requirements and map every story to at least one coverage id.',
         'Every coverage item requiring implement must have an implementation story that delivers the missing behavior; verification-only work is insufficient.',
         'Before returning, audit the mandatory coverage/action matrix item by item. Every non-none action must have a story whose workType exactly matches it (external maps to document), and implementation acceptance criteria must change product behavior rather than merely test or describe it.',
+        'Do not add periodic polling, background workers, keepalive traffic, or scheduled provider health checks unless the objective and repository evidence explicitly require them. Preserve documented sleep, wake, cost, and worker-idleness behavior; prefer request-time or on-demand recovery where compatible.',
         'Do not create file-oriented cleanup, speculative infrastructure, or stories for capabilities proven implemented.',
         'A story may reference only decision ids that it actually needs.',
         'Approved technologies are preferred. Any other choice is an exception that will be highlighted for explicit plan approval.',

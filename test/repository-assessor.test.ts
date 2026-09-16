@@ -58,6 +58,20 @@ class UnsupportedEvidenceModel implements PortfolioPlanningModel {
   }
 }
 
+class ImplementedCoverageModel implements PortfolioPlanningModel {
+  calls = 0;
+  constructor(private readonly evidence: Array<{ kind: 'file' | 'test'; locator: string; summary: string }>) {}
+  async completeJson<T>(): Promise<{ value: T }> {
+    this.calls += 1;
+    return this.calls <= 4
+      ? { value: { summary: 'Capability appears complete', findings: [], risks: [] } as T }
+      : { value: { coverage: [{
+          id: 'HEALTH', requirement: 'Expose health', status: 'implemented', requiredAction: 'none',
+          rationale: 'The implementation and test exist.', evidence: this.evidence,
+        }] } as T };
+  }
+}
+
 describe('RepositoryAssessor', () => {
   it('runs four independent evidence reviews and ties coverage to an exact clean commit', async () => {
     const root = gitRepo();
@@ -141,6 +155,36 @@ describe('RepositoryAssessor', () => {
     await expect(new RepositoryAssessor(config, new UnsupportedEvidenceModel('git', 'b'.repeat(40))).assess(
       { sourcePath: 'PROJECT.md', content: 'Expose health.' },
     )).rejects.toThrow(/stale git commit/);
+  });
+
+  it('downgrades source-only implemented claims until exact-commit execution proof exists', async () => {
+    const root = gitRepo();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.enabled = true;
+
+    const assessment = await new RepositoryAssessor(config, new ImplementedCoverageModel([
+      { kind: 'file', locator: 'server.ts', summary: 'Health implementation exists' },
+    ])).assess({ sourcePath: 'PROJECT.md', content: 'Expose health.' });
+
+    expect(assessment.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+    expect(assessment.coverage[0]?.rationale).toContain('no passing test or deployment result');
+  });
+
+  it('accepts implemented coverage with exact-commit test evidence supplied by the controller', async () => {
+    const root = gitRepo();
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.enabled = true;
+
+    const assessment = await new RepositoryAssessor(config, new ImplementedCoverageModel([
+      { kind: 'test', locator: 'server.ts', summary: 'Exact-commit health test passed' },
+    ])).assess(
+      { sourcePath: 'PROJECT.md', content: 'Expose health.' },
+      undefined,
+      [{ kind: 'test', locator: 'server.ts', summary: 'Passed', commitSha: sha }],
+    );
+
+    expect(assessment.coverage[0]).toMatchObject({ status: 'implemented', requiredAction: 'none' });
   });
 
   it('derives implementation work for partial requirements instead of trusting a contradictory model action', async () => {
