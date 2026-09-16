@@ -23,7 +23,7 @@ class AssessmentModel implements PortfolioPlanningModel {
           capability: 'Health route', status: 'partial', rationale: 'Source exists but runtime is unverified',
           evidence: [{ kind: 'file', locator: this.badEvidence ? 'invented.ts' : 'server.ts', summary: 'Health source' }],
         }],
-        risks: this.blankRisk ? [''] : [],
+        risks: this.blankRisk ? [null, '', '   '] : [],
       } as T };
     }
     return { value: { coverage: [{

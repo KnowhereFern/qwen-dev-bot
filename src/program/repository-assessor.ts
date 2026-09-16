@@ -206,8 +206,8 @@ function validateAnalysis(value: unknown, area: RepositoryAnalysis['area'], cont
       };
     }),
     risks: value.risks
-      .filter((risk) => typeof risk !== 'string' || Boolean(risk.trim()))
-      .map((risk, index) => requiredText(risk, `${area}.risks[${index}]`))
+      .filter((risk): risk is string => typeof risk === 'string' && Boolean(risk.trim()))
+      .map((risk) => risk.trim())
       .slice(0, 50),
   };
 }
