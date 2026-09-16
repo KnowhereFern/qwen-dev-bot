@@ -8,6 +8,7 @@ import type {
   ProjectConfig,
   RepositoryAnalysis,
   RepositoryAssessment,
+  StructuredOutputSchema,
 } from '../core/types.js';
 import { redactText } from '../core/ledger.js';
 import { projectIdFor } from '../core/state-paths.js';
@@ -24,6 +25,77 @@ const PRIORITY_FILES = new Set([
   'AGENTS.md', 'AUTONOMY.md', 'README.md', 'PROJECT.md', 'package.json', 'pyproject.toml', 'go.mod', 'Cargo.toml',
   'Dockerfile', 'railway.json', 'vercel.json', 'fly.toml', 'compose.yml', 'docker-compose.yml',
 ]);
+
+const EVIDENCE_JSON_SCHEMA = {
+  type: 'array',
+  maxItems: 50,
+  items: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['kind', 'locator', 'summary'],
+    properties: {
+      kind: { type: 'string', enum: ['file', 'test', 'deployment', 'git', 'config', 'signal'] },
+      locator: { type: 'string', minLength: 1 },
+      summary: { type: 'string', minLength: 1 },
+    },
+  },
+} as const;
+
+const REPOSITORY_ANALYSIS_JSON_SCHEMA: StructuredOutputSchema = {
+  name: 'repository_analysis',
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['summary', 'findings', 'risks'],
+    properties: {
+      summary: { type: 'string', minLength: 1 },
+      findings: {
+        type: 'array',
+        maxItems: 100,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['capability', 'status', 'rationale', 'evidence'],
+          properties: {
+            capability: { type: 'string', minLength: 1 },
+            status: { type: 'string', enum: ['implemented', 'partial', 'missing', 'unverified', 'externally_blocked'] },
+            rationale: { type: 'string', minLength: 1 },
+            evidence: EVIDENCE_JSON_SCHEMA,
+          },
+        },
+      },
+      risks: { type: 'array', maxItems: 50, items: { type: 'string', minLength: 1 } },
+    },
+  },
+};
+
+const OBJECTIVE_COVERAGE_JSON_SCHEMA: StructuredOutputSchema = {
+  name: 'objective_coverage',
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['coverage'],
+    properties: {
+      coverage: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 200,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['id', 'requirement', 'status', 'rationale', 'evidence'],
+          properties: {
+            id: { type: 'string', minLength: 1 },
+            requirement: { type: 'string', minLength: 1 },
+            status: { type: 'string', enum: ['implemented', 'partial', 'missing', 'unverified', 'externally_blocked'] },
+            rationale: { type: 'string', minLength: 1 },
+            evidence: EVIDENCE_JSON_SCHEMA,
+          },
+        },
+      },
+    },
+  },
+};
 
 export class RepositoryAssessor {
   constructor(
@@ -50,6 +122,7 @@ export class RepositoryAssessor {
       const response = await this.model.completeJson<unknown>({
         reasoningEffort: area === 'product' ? this.config.qwen.reviewReasoning : this.config.qwen.triageReasoning,
         maxTokens: 8_192,
+        jsonSchema: REPOSITORY_ANALYSIS_JSON_SCHEMA,
         signal,
         system: analysisPrompt(area),
         user: [
@@ -68,6 +141,7 @@ export class RepositoryAssessor {
     const synthesis = await this.model.completeJson<unknown>({
       reasoningEffort: this.config.qwen.reviewReasoning,
       maxTokens: 12_000,
+      jsonSchema: OBJECTIVE_COVERAGE_JSON_SCHEMA,
       signal,
       system: [
         'Map every distinct requirement in the supplied product objective to repository evidence.',

@@ -23,6 +23,11 @@ export const TASK_STATES = [
 export type TaskState = (typeof TASK_STATES)[number];
 
 export type ReasoningEffort = 'low' | 'medium' | 'xhigh';
+
+export interface StructuredOutputSchema {
+  name: string;
+  schema: Record<string, unknown>;
+}
 export type GateKind =
   | 'build'
   | 'typecheck'

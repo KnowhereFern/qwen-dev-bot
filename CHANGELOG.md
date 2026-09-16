@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.17] - 2026-09-16
+
+- Add strict provider-backed JSON Schemas for repository analysis, objective coverage, and delivery programs while retaining all local validation.
+
 ## [1.0.0-rc.16] - 2026-09-16
 
 - Request provider-backed JSON Object output for direct Qwen planning calls while retaining local schema and evidence validation.

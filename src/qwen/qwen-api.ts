@@ -1,4 +1,4 @@
-import type { ReasoningEffort } from '../core/types.js';
+import type { ReasoningEffort, StructuredOutputSchema } from '../core/types.js';
 import { DEFAULT_QWEN_BASE_URL, QWEN_HARNESS_MODEL } from './runtime-compat.js';
 
 export const DEFAULT_QWEN_API_TIMEOUT_MS = 5 * 60_000;
@@ -59,6 +59,7 @@ export class QwenApiClient {
     user: string | Array<Record<string, unknown>>;
     reasoningEffort: ReasoningEffort;
     maxTokens?: number;
+    jsonSchema?: StructuredOutputSchema;
     signal?: AbortSignal;
   }): Promise<{ value: T; raw: string; reasoning: string; usage: Record<string, unknown> }> {
     const maxTokens = input.maxTokens ?? 4_096;
@@ -74,7 +75,9 @@ export class QwenApiClient {
       temperature: 0,
       enable_thinking: true,
       preserve_thinking: true,
-      response_format: { type: 'json_object' },
+      response_format: input.jsonSchema
+        ? { type: 'json_schema', json_schema: { ...input.jsonSchema, strict: true } }
+        : { type: 'json_object' },
     };
     for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
       if (input.signal?.aborted) throw new Error('Qwen API request aborted');
