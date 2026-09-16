@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.6] - 2026-09-16
+
+- Replace stale Qwen extension links during setup and verify the exact immutable runtime path reported by the installed Qwen CLI.
+
 ## [1.0.0-rc.5] - 2026-09-16
 
 - Added configuration version 2 with opt-in repository-aware programs, explicit staging authority, evidence signals, and protected controller self-hosting while preserving version 1 behavior.

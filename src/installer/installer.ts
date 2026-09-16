@@ -284,23 +284,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
   if (answers.linkExtension) {
     summary.push(`${options.dryRun ? 'would link' : 'linked'} Qwen extension from ${runtimePackageRoot}`);
     if (!options.dryRun) {
-      const linked = await runProcess({
-        command: config.qwen.command,
-        args: ['extensions', 'link', runtimePackageRoot],
-        cwd: root,
-        input: 'y\n',
-        timeoutMs: 60_000,
-      });
-      if (linked.exitCode !== 0 && !linked.stderr.includes('already')) throw new Error(`Qwen extension link failed: ${linked.stderr}`);
-      const installed = await runProcess({
-        command: config.qwen.command,
-        args: ['extensions', 'list'],
-        cwd: root,
-        timeoutMs: 30_000,
-      });
-      if (installed.exitCode !== 0 || !installed.stdout.includes('qwen-dev-harness')) {
-        throw new Error('Qwen extension link was not accepted. Re-run setup interactively or pass --no-link-extension.');
-      }
+      await ensureQwenExtensionLink(config.qwen.command, root, runtimePackageRoot);
       receipt.extensionLinked = true;
       persistReceipt();
     }
@@ -962,6 +946,54 @@ async function installImmutableHarnessRuntime(sourceRoot: string): Promise<strin
     return installedPackage;
   } finally {
     if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+async function ensureQwenExtensionLink(command: string, cwd: string, runtimePackageRoot: string): Promise<void> {
+  const link = async () => runProcess({
+    command,
+    args: ['extensions', 'link', runtimePackageRoot],
+    cwd,
+    input: 'y\n',
+    timeoutMs: 60_000,
+  });
+  const list = async () => runProcess({
+    command,
+    args: ['extensions', 'list'],
+    cwd,
+    timeoutMs: 30_000,
+  });
+  const pointsAtRuntime = (output: string): boolean => {
+    const expected = existsSync(runtimePackageRoot) ? realpathSync(runtimePackageRoot) : path.resolve(runtimePackageRoot);
+    return output.includes(`Path: ${runtimePackageRoot}`) || output.includes(`Path: ${expected}`);
+  };
+
+  const firstLink = await link();
+  const firstList = await list();
+  if (firstList.exitCode === 0 && pointsAtRuntime(firstList.stdout)) return;
+
+  const existingHarness = firstList.exitCode === 0 && (
+    firstList.stdout.includes('qwen-dev-harness') ||
+    firstList.stdout.includes('Autonomous Software Delivery Harness')
+  );
+  if (!existingHarness) {
+    const detail = firstLink.stderr || firstLink.stdout || firstList.stderr || firstList.stdout;
+    throw new Error(`Qwen extension link failed: ${detail}`);
+  }
+
+  const removed = await runProcess({
+    command,
+    args: ['extensions', 'uninstall', 'qwen-dev-harness'],
+    cwd,
+    input: 'y\n',
+    timeoutMs: 60_000,
+  });
+  if (removed.exitCode !== 0) throw new Error(`Could not replace the existing Qwen extension link: ${removed.stderr || removed.stdout}`);
+  const relinked = await link();
+  if (relinked.exitCode !== 0) throw new Error(`Qwen extension relink failed: ${relinked.stderr || relinked.stdout}`);
+  const verified = await list();
+  if (verified.exitCode !== 0 || !pointsAtRuntime(verified.stdout)) {
+    throw new Error('Qwen extension link does not point to the immutable harness runtime. Re-run setup or pass --no-link-extension.');
   }
 }
 
