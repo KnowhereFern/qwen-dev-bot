@@ -2,7 +2,7 @@
 
 A software product designed and built by Fern. It uses Qwen Code and `qwen3.8-max` as its execution engine to turn approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.17`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
+**Release status:** `v1.0.0-rc.18`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
 
 See [live test readiness](docs/live-test-readiness.md) for the current machine and end-to-end proof status.
 
@@ -169,6 +169,8 @@ For a larger project, give the planner one project-local requirements file (comm
 ```sh
 qwen-harness plan /path/to/project --requirements PROJECT.md
 # Review the generated epic and stories on GitHub.
+# If it maps an implementation gap only to verification, redraft it before approval.
+qwen-harness plan-redraft /path/to/project --plan PLAN_ID --requirements PROJECT.md
 qwen-harness plan-approve /path/to/project --plan PLAN_ID
 qwen-harness plan-status /path/to/project --plan PLAN_ID
 ```
@@ -190,6 +192,7 @@ qwen-harness logs /path/to/project [--lines 100]
 qwen-harness reward /path/to/project [--task TASK_ID | --issue N]
 qwen-harness community /path/to/project [--force]
 qwen-harness plan /path/to/project --requirements FILE [--max-stories N] [--approve]
+qwen-harness plan-redraft /path/to/project --plan PLAN_ID --requirements FILE [--max-stories N]
 qwen-harness plan-approve /path/to/project --plan PLAN_ID
 qwen-harness plan-status /path/to/project [--plan PLAN_ID]
 qwen-harness plan-reassess /path/to/project --plan PLAN_ID

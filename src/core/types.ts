@@ -280,6 +280,8 @@ export const PORTFOLIO_PLAN_STATUSES = [
 export type PortfolioPlanStatus = (typeof PORTFOLIO_PLAN_STATUSES)[number];
 
 export type CapabilityStatus = 'implemented' | 'partial' | 'missing' | 'unverified' | 'externally_blocked';
+export type CoverageAction = 'none' | 'implement' | 'verify' | 'operate' | 'document' | 'external';
+export type ProgramWorkType = 'implement' | 'verify' | 'operate' | 'document';
 
 export interface EvidenceReference {
   kind: 'file' | 'test' | 'deployment' | 'git' | 'config' | 'signal';
@@ -292,6 +294,7 @@ export interface ObjectiveCoverage {
   id: string;
   requirement: string;
   status: CapabilityStatus;
+  requiredAction: CoverageAction;
   rationale: string;
   evidence: EvidenceReference[];
 }
@@ -341,6 +344,7 @@ export interface PortfolioStory {
   requiredGateIds: string[];
   rewardCriterionIds: string[];
   risk: 'low' | 'medium' | 'high';
+  workType?: ProgramWorkType;
   dependsOn: string[];
   rollback: string;
   technologyDecisionIds: string[];

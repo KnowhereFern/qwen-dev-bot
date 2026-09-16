@@ -71,10 +71,13 @@ try {
     title: 'Acceptance replay', objective: 'Deliver one verified capability', constraints: [], definitionOfDone: ['Verified'],
     technologyDecisions: [], deploymentDecisions: [], stories: [{
       key: 'S1', title: 'Capability', goal: 'Implement it', acceptanceCriteria: ['Test passes'], constraints: [],
-      requiredGateIds: [], rewardCriterionIds: [], risk: 'low', dependsOn: [], rollback: 'Revert',
+      requiredGateIds: [], rewardCriterionIds: [], risk: 'low', workType: 'implement', dependsOn: [], rollback: 'Revert',
       technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['REQ1'],
     }],
-  }, [], [], 5, defaults.technologyPolicy, ['REQ1']);
+  }, [], [], 5, defaults.technologyPolicy, [{
+    id: 'REQ1', requirement: 'Deliver one verified capability', status: 'missing', requiredAction: 'implement',
+    rationale: 'The capability is absent from the replay fixture.', evidence: [],
+  }]);
   assert(draft.stories[0]?.coverageIds?.[0] === 'REQ1', 'sanitized planning replay lost objective coverage');
 
   process.stdout.write('PASS protected controller acceptance\n');

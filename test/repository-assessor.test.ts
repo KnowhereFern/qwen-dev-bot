@@ -27,7 +27,7 @@ class AssessmentModel implements PortfolioPlanningModel {
       } as T };
     }
     return { value: { coverage: [{
-      id: 'HEALTH', requirement: 'Expose health', status: 'partial', rationale: 'Runtime is unverified',
+      id: 'HEALTH', requirement: 'Expose health', status: 'partial', requiredAction: 'verify', rationale: 'Runtime is unverified',
       evidence: [{ kind: 'file', locator: 'server.ts', summary: 'Health source' }],
     }] } as T };
   }
@@ -41,7 +41,7 @@ class UnsupportedEvidenceModel implements PortfolioPlanningModel {
     const evidence = [{ kind: this.kind, locator: this.locator, summary: 'Unsupported claim' }];
     return this.calls <= 4
       ? { value: { summary: 'Claim', findings: [{ capability: 'Health', status: 'implemented', rationale: 'Claimed', evidence }], risks: [] } as T }
-      : { value: { coverage: [{ id: 'HEALTH', requirement: 'Health', status: 'implemented', rationale: 'Claimed', evidence }] } as T };
+      : { value: { coverage: [{ id: 'HEALTH', requirement: 'Health', status: 'implemented', requiredAction: 'none', rationale: 'Claimed', evidence }] } as T };
   }
 }
 

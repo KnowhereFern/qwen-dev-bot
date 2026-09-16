@@ -24,7 +24,7 @@ describe('ProgramController', () => {
     const model = new ImplementedAssessmentModel();
     const story = {
       key: 'S1', title: 'Objective', goal: 'Deliver', acceptanceCriteria: ['Verified'], constraints: [], requiredGateIds: [], rewardCriterionIds: [],
-      risk: 'low' as const, dependsOn: [], rollback: 'Revert', technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['REQ1'],
+      risk: 'low' as const, workType: 'verify' as const, dependsOn: [], rollback: 'Revert', technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['REQ1'],
       sourceIssueNumber: 1, sourceIssueUrl: 'https://github.test/issues/1', normalizedIssueNumber: 10,
       normalizedIssueUrl: 'https://github.test/issues/10', wave: 1, revision: 1, supersededAt: null,
     };
@@ -33,7 +33,7 @@ describe('ProgramController', () => {
       title: 'Objective', objective: 'Ship it', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [],
       status: 'assessing', epicIssueNumber: null, epicIssueUrl: null, stories: [story], createdAt: 1, updatedAt: 1, approvedAt: 1,
       repositorySha: sha, assessmentId: 'initial', revision: 1, currentWave: 1,
-      coverage: [{ id: 'REQ1', requirement: 'Ship', status: 'unverified', rationale: 'Pending audit', evidence: [] }],
+      coverage: [{ id: 'REQ1', requirement: 'Ship', status: 'unverified', requiredAction: 'verify', rationale: 'Pending audit', evidence: [] }],
       revisions: [{ number: 1, assessmentId: 'initial', repositorySha: sha, reason: 'initial', material: false, summary: 'Initial', createdAt: 1, approvedAt: 1 }],
       latestDeploymentId: null, deliveredAt: null, maintenanceStartedAt: null,
     };
@@ -61,7 +61,7 @@ class ImplementedAssessmentModel implements PortfolioPlanningModel {
     const evidence = [{ kind: 'file', locator: 'README.md', summary: 'Verified fixture' }];
     return this.calls <= 4
       ? { value: { summary: 'Verified', findings: [{ capability: 'Objective', status: 'implemented', rationale: 'Verified', evidence }], risks: [] } as T }
-      : { value: { coverage: [{ id: 'REQ1', requirement: 'Ship', status: 'implemented', rationale: 'Verified', evidence }] } as T };
+      : { value: { coverage: [{ id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Verified', evidence }] } as T };
   }
 }
 

@@ -17,6 +17,7 @@ function story(key: string, dependsOn: string[] = []): Record<string, unknown> {
     requiredGateIds: ['test'],
     rewardCriterionIds: ['execution'],
     risk: 'low',
+    workType: 'verify',
     dependsOn,
     rollback: `Revert ${key}`,
     technologyDecisionIds: [],
@@ -103,6 +104,38 @@ describe('portfolio planner validation', () => {
       ['execution'],
       10,
     )).toThrow(/unknown technology decision/);
+  });
+
+  it('rejects verification-only stories for coverage that requires implementation', () => {
+    const input = {
+      title: 'Gap plan',
+      objective: 'Deliver missing behavior',
+      constraints: [],
+      definitionOfDone: ['Verified'],
+      technologyDecisions: [],
+      deploymentDecisions: [],
+      stories: [{ ...story('S1'), coverageIds: ['RUNNERS'], workType: 'verify' }],
+    };
+    const coverage = [{
+      id: 'RUNNERS',
+      requirement: 'Multi-runner claim flow',
+      status: 'missing' as const,
+      requiredAction: 'implement' as const,
+      rationale: 'No claim flow exists',
+      evidence: [],
+    }];
+
+    expect(() => validatePortfolioDraft(input, ['test'], ['execution'], 10, undefined, coverage))
+      .toThrow(/requires implement work/);
+    const result = validatePortfolioDraft(
+      { ...input, stories: [{ ...input.stories[0], workType: 'implement' }] },
+      ['test'],
+      ['execution'],
+      10,
+      undefined,
+      coverage,
+    );
+    expect(result.stories[0]?.workType).toBe('implement');
   });
 });
 

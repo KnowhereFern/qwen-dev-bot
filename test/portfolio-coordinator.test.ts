@@ -69,12 +69,12 @@ function draft(): PortfolioDraft {
     stories: [
       {
         key: 'S1', title: 'Foundation', goal: 'Build the foundation', acceptanceCriteria: ['Foundation test passes'],
-        constraints: [], requiredGateIds: ['test'], rewardCriterionIds: ['execution'], risk: 'low', dependsOn: [], rollback: 'Revert foundation',
+        constraints: [], requiredGateIds: ['test'], rewardCriterionIds: ['execution'], risk: 'low', workType: 'implement', dependsOn: [], rollback: 'Revert foundation',
         technologyDecisionIds: ['AUTH'], deploymentDecisionIds: [],
       },
       {
         key: 'S2', title: 'Feature', goal: 'Build the feature', acceptanceCriteria: ['Feature test passes'],
-        constraints: [], requiredGateIds: ['test'], rewardCriterionIds: ['execution'], risk: 'medium', dependsOn: ['S1'], rollback: 'Revert feature',
+        constraints: [], requiredGateIds: ['test'], rewardCriterionIds: ['execution'], risk: 'medium', workType: 'implement', dependsOn: ['S1'], rollback: 'Revert feature',
         technologyDecisionIds: ['WEB'], deploymentDecisionIds: ['WEB_PREVIEW'],
       },
     ],
@@ -128,6 +128,52 @@ describe('PortfolioCoordinator', () => {
     store.close();
   });
 
+  it('replaces an unapproved draft while retaining superseded proposal history', async () => {
+    const root = makeTmp('portfolio-redraft-root');
+    const config = defaultProjectConfig(root, 'project', 'owner/project');
+    config.program.enabled = true;
+    const store = new PersistentTaskStore('portfolio-redraft', makeTmp('portfolio-redraft-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    const initial = draft();
+    initial.stories[0]!.coverageIds = ['REQ1'];
+    initial.stories[1]!.coverageIds = ['REQ2'];
+    const assessment: RepositoryAssessment = {
+      id: 'assessment_initial', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+      detectedStacks: ['node'], files: ['package.json'], analyses: [],
+      coverage: [
+        { id: 'REQ1', requirement: 'Foundation', status: 'missing', requiredAction: 'implement', rationale: 'Missing', evidence: [] },
+        { id: 'REQ2', requirement: 'Feature', status: 'missing', requiredAction: 'implement', rationale: 'Missing', evidence: [] },
+      ],
+      createdAt: 1,
+    };
+    const created = await coordinator.createDraft({
+      sourcePath: 'PROJECT.md', content: 'program objective', draft: initial, assessment,
+    });
+    const replacement = draft();
+    replacement.stories[0]!.title = 'Implement foundation fully';
+    replacement.stories[0]!.coverageIds = ['REQ1'];
+    replacement.stories[1]!.coverageIds = ['REQ2'];
+
+    const redrafted = await coordinator.replaceUnapprovedDraft({
+      planId: created.plan.id,
+      sourcePath: 'PROJECT.md',
+      content: 'program objective',
+      draft: replacement,
+      assessment: { ...assessment, id: 'assessment_replacement', createdAt: 2 },
+      summary: 'Replace narrow verification plan',
+    });
+
+    expect(redrafted.status).toBe('awaiting_initial_approval');
+    expect(redrafted.revision).toBe(2);
+    expect(redrafted.stories.filter((story) => story.revision === 1).every((story) => Boolean(story.supersededAt))).toBe(true);
+    expect(redrafted.stories.filter((story) => story.revision === 2)).toHaveLength(2);
+    expect(redrafted.stories.find((story) => story.revision === 2)?.key).toMatch(/^R2_/);
+    expect(redrafted.stories.filter((story) => story.revision === 2).every((story) => story.sourceIssueNumber !== null)).toBe(true);
+    expect(redrafted.stories.every((story) => story.normalizedIssueNumber === null)).toBe(true);
+    store.close();
+  });
+
   it('activates only the current dependency wave in repository-aware program mode', async () => {
     const root = makeTmp('portfolio-wave-root');
     const config = defaultProjectConfig(root, 'project', 'owner/project');
@@ -144,8 +190,8 @@ describe('PortfolioCoordinator', () => {
       id: 'assessment_1', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
       detectedStacks: ['node'], files: ['package.json'], analyses: [],
       coverage: [
-        { id: 'REQ1', requirement: 'Foundation', status: 'missing' as const, rationale: 'Missing', evidence: [] },
-        { id: 'REQ2', requirement: 'Feature', status: 'missing' as const, rationale: 'Missing', evidence: [] },
+        { id: 'REQ1', requirement: 'Foundation', status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [] },
+        { id: 'REQ2', requirement: 'Feature', status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [] },
       ],
       createdAt: 1,
     };
@@ -185,8 +231,8 @@ describe('PortfolioCoordinator', () => {
       id: 'assessment_initial', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
       detectedStacks: ['node'], files: ['package.json'], analyses: [],
       coverage: [
-        { id: 'REQ1', requirement: 'Foundation', status: 'missing', rationale: 'Missing', evidence: [] },
-        { id: 'REQ2', requirement: 'Feature', status: 'missing', rationale: 'Missing', evidence: [] },
+        { id: 'REQ1', requirement: 'Foundation', status: 'missing', requiredAction: 'implement', rationale: 'Missing', evidence: [] },
+        { id: 'REQ2', requirement: 'Feature', status: 'missing', requiredAction: 'implement', rationale: 'Missing', evidence: [] },
       ],
       createdAt: 1,
     };

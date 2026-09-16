@@ -203,6 +203,7 @@ node bin/qwen-harness.mjs plan /absolute/path/to/demo-project --requirements PRO
 Review the generated GitHub epic and stories, then approve once:
 
 ```sh
+node bin/qwen-harness.mjs plan-redraft /absolute/path/to/demo-project --plan PLAN_ID --requirements PROJECT.md
 node bin/qwen-harness.mjs plan-approve /absolute/path/to/demo-project --plan PLAN_ID
 node bin/qwen-harness.mjs plan-status /absolute/path/to/demo-project --plan PLAN_ID
 node bin/qwen-harness.mjs status /absolute/path/to/demo-project
