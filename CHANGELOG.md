@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.9] - 2026-09-16
+
+- Updated readiness detection to recognize the display name emitted by current Qwen Code extension listings.
+
 ## [1.0.0-rc.8] - 2026-09-16
 
 - Added an optional Railway revision environment key so an immutable CLI deployment can report and verify its exact merged commit without triggering a separate variable deployment.

@@ -144,7 +144,8 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
     );
     const extensions = await commandCheck(config.qwen.command, ['extensions', 'list'], root, true);
     qwenExtensions = extensions.output;
-    checks.push(check('qwen-extension', extensions.ok && extensions.output.includes('qwen-dev-harness') ? 'pass' : 'warn', extensions.output.includes('qwen-dev-harness') ? 'Harness extension installed' : 'Harness extension is not linked; run setup/update'));
+    const harnessExtensionPresent = extensions.ok && qwenHarnessExtensionPresent(extensions.output);
+    checks.push(check('qwen-extension', harnessExtensionPresent ? 'pass' : 'warn', harnessExtensionPresent ? 'Harness extension installed' : 'Harness extension is not linked; run setup/update'));
   }
 
   const harnessCli = await commandCheck(process.platform === 'win32' ? 'qwen-harness.cmd' : 'qwen-harness', ['--version'], root);
@@ -239,6 +240,10 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
   }
 
   return { ready: checks.every((item) => item.status !== 'fail'), checks };
+}
+
+export function qwenHarnessExtensionPresent(output: string): boolean {
+  return output.includes('qwen-dev-harness') || output.includes('Autonomous Software Delivery Harness');
 }
 
 export function formatDoctor(report: DoctorReport): string {

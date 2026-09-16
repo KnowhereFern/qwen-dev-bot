@@ -2,10 +2,16 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
-import { projectDependencyChecks } from '../src/doctor.js';
+import { projectDependencyChecks, qwenHarnessExtensionPresent } from '../src/doctor.js';
 import { makeTmp } from './helpers.js';
 
 describe('dependency preflight', () => {
+  it('recognizes the Qwen CLI display name used for the harness extension', () => {
+    expect(qwenHarnessExtensionPresent('✓ Autonomous Software Delivery Harness (1.0.0-rc.9)')).toBe(true);
+    expect(qwenHarnessExtensionPresent('qwen-dev-harness')).toBe(true);
+    expect(qwenHarnessExtensionPresent('unrelated extension')).toBe(false);
+  });
+
   it('fails closed when a locked Node project has not installed dependencies', async () => {
     const root = makeTmp('doctor-dependencies-missing');
     writeFileSync(path.join(root, 'package.json'), JSON.stringify({ dependencies: { octokit: '^5.0.5' } }));
