@@ -83,6 +83,14 @@ describe('project configuration invariants', () => {
     expect(() => validateProjectConfig(config)).toThrow(/technologyPolicy/);
   });
 
+  it('validates an optional staging revision environment key', () => {
+    const config = defaultProjectConfig(makeTmp('config-staging-revision'), 'fixture', 'owner/fixture');
+    config.deployment.staging.revisionEnvKey = 'RELEASE_SHA';
+    expect(validateProjectConfig(config)).toBe(config);
+    config.deployment.staging.revisionEnvKey = 'release-sha';
+    expect(() => validateProjectConfig(config)).toThrow(/revisionEnvKey/);
+  });
+
   it.each(['token-plan-personal', 'token-plan-team'] as const)('requires the Token Plan endpoint for %s', (billingPlan) => {
     const config = defaultProjectConfig(makeTmp(`config-${billingPlan}`), 'fixture', 'owner/fixture');
     config.qwen.billingPlan = billingPlan;

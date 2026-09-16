@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.8] - 2026-09-16
+
+- Added an optional Railway revision environment key so an immutable CLI deployment can report and verify its exact merged commit without triggering a separate variable deployment.
+
 ## [1.0.0-rc.7] - 2026-09-16
 
 - Added an explicit `--link-extension` retry control so a noninteractive setup can recover after a partial extension-link failure, including commands that close confirmation input early.

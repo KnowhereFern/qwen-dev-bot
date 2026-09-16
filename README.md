@@ -2,7 +2,7 @@
 
 A software product designed and built by Fern. It uses Qwen Code and `qwen3.8-max` as its execution engine to turn approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.7`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
+**Release status:** `v1.0.0-rc.8`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
 
 See [live test readiness](docs/live-test-readiness.md) for the current machine and end-to-end proof status.
 
@@ -220,7 +220,7 @@ The Qwen extension also contributes `/harness:doctor`, `/harness:status`, and `/
 - `technologyPolicy`: approved category/technology pairs used by portfolio planning. Choices outside the catalog are plan exceptions, and delivery authority is fixed at `build-test-only`.
 - `program`: repository assessment, wave reassessment, maintenance, snapshot cleanliness, and material-change approval.
 - `evolution`: approved feedback sources and polling. External content is evidence only and cannot grant execution authority.
-- `deployment.staging`: explicit existing Railway identifiers or an argument-array command adapter, revision health endpoint, lifecycle gates, timeout, and optional data-compatible rollback. Deployment credentials are available only to this controller.
+- `deployment.staging`: explicit existing Railway identifiers or an argument-array command adapter, revision health endpoint, optional non-secret revision environment key, lifecycle gates, timeout, and optional data-compatible rollback. Deployment credentials are available only to this controller.
 - `selfHosting`: disabled by default; names the proven delivery project, isolated evaluation commands, all four stack canaries, probation period, and whether a validated release may promote automatically. Enabling it also requires protecting the launcher, fixed acceptance runner, configuration validator, release manager, and reward evaluator paths listed by config validation.
 
 Version 1 configurations continue with program, deployment, and self-hosting capabilities disabled. Migrating to version 2 never enables staging or self-promotion by itself. Production activation always remains outside autonomous authority.

@@ -132,6 +132,7 @@ export function defaultProjectConfig(root: string, name = path.basename(root), g
         service: '',
         healthUrl: '',
         revisionJsonPath: 'revision',
+        revisionEnvKey: '',
         timeoutMs: 20 * 60_000,
         lifecycleGateIds: [],
       },
@@ -507,6 +508,9 @@ function validateProgramConfig(config: ProjectConfig, source: string, gateIds: S
     !staging.lifecycleGateIds.every(isNonEmptyString)
   ) {
     throw new Error(`${source}: invalid staging deployment settings`);
+  }
+  if (staging.revisionEnvKey && !/^[A-Z_][A-Z0-9_]*$/.test(staging.revisionEnvKey)) {
+    throw new Error(`${source}: deployment.staging.revisionEnvKey must be an uppercase environment variable name`);
   }
   if (staging.enabled) {
     if (!isHttpsUrl(staging.healthUrl) || !isNonEmptyString(staging.revisionJsonPath)) {
