@@ -65,6 +65,43 @@ describe('Qwen API boundary', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it('uses strict JSON Schema output when a planning boundary supplies one', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({ choices: [{ message: { content: '{"ok":true}' } }] }),
+    );
+    const client = new QwenApiClient({ apiKey: 'test-key', fetchImpl, timeoutMs: 1_000 });
+
+    await client.completeJson({
+      system: 'Return JSON.',
+      user: 'Confirm.',
+      reasoningEffort: 'low',
+      jsonSchema: {
+        name: 'confirmation',
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['ok'],
+          properties: { ok: { type: 'boolean' } },
+        },
+      },
+    });
+
+    const request = JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body));
+    expect(request.response_format).toEqual({
+      type: 'json_schema',
+      json_schema: {
+        name: 'confirmation',
+        strict: true,
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['ok'],
+          properties: { ok: { type: 'boolean' } },
+        },
+      },
+    });
+  });
+
   it('honors an operator abort before issuing a request', async () => {
     const fetchImpl = vi.fn<typeof fetch>();
     const controller = new AbortController();
