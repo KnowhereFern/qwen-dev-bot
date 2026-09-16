@@ -74,6 +74,7 @@ export class QwenApiClient {
       temperature: 0,
       enable_thinking: true,
       preserve_thinking: true,
+      response_format: { type: 'json_object' },
     };
     for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
       if (input.signal?.aborted) throw new Error('Qwen API request aborted');

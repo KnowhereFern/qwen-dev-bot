@@ -52,6 +52,7 @@ describe('Qwen API boundary', () => {
       reasoning_effort: 'xhigh',
       enable_thinking: true,
       preserve_thinking: true,
+      response_format: { type: 'json_object' },
     });
   });
 
