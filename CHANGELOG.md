@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.14] - 2026-09-16
+
+- Keep only non-empty text in optional repository-risk notes so null-like model output cannot abort an otherwise valid assessment.
+
 ## [1.0.0-rc.13] - 2026-09-16
 
 - Normalize an exact deployment technology decision id to its declared provider value while continuing to reject unknown providers and targets.
