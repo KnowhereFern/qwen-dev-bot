@@ -20,16 +20,29 @@ class AssessmentModel implements PortfolioPlanningModel {
       return { value: {
         summary: 'Evidence reviewed',
         findings: [{
-          capability: 'Health route', status: 'partial', rationale: 'Source exists but runtime is unverified',
+          capability: 'Health route', status: 'unverified', rationale: 'Source exists but runtime is unverified',
           evidence: [{ kind: 'file', locator: this.badEvidence ? 'invented.ts' : 'server.ts', summary: 'Health source' }],
         }],
         risks: this.blankRisk ? [null, '', '   '] : [],
       } as T };
     }
     return { value: { coverage: [{
-      id: 'HEALTH', requirement: 'Expose health', status: 'partial', requiredAction: 'verify', rationale: 'Runtime is unverified',
+      id: 'HEALTH', requirement: 'Expose health', status: 'unverified', requiredAction: 'verify', rationale: 'Runtime is unverified',
       evidence: [{ kind: 'file', locator: 'server.ts', summary: 'Health source' }],
     }] } as T };
+  }
+}
+
+class InvalidPartialActionModel implements PortfolioPlanningModel {
+  calls = 0;
+  async completeJson<T>(): Promise<{ value: T }> {
+    this.calls += 1;
+    return this.calls <= 4
+      ? { value: { summary: 'Incomplete capability', findings: [], risks: [] } as T }
+      : { value: { coverage: [{
+          id: 'HEALTH', requirement: 'Expose health', status: 'partial', requiredAction: 'verify',
+          rationale: 'Only part of the required behavior exists.', evidence: [],
+        }] } as T };
   }
 }
 
@@ -57,7 +70,7 @@ describe('RepositoryAssessor', () => {
     expect(assessment.commitSha).toMatch(/^[0-9a-f]{40}$/);
     expect(assessment.dirty).toBe(false);
     expect(assessment.analyses.map((analysis) => analysis.area)).toEqual(['product', 'architecture', 'verification', 'operations']);
-    expect(assessment.coverage[0]).toMatchObject({ id: 'HEALTH', status: 'partial' });
+    expect(assessment.coverage[0]).toMatchObject({ id: 'HEALTH', status: 'unverified', requiredAction: 'verify' });
     expect(assessment.coverage[0]?.evidence[0]?.commitSha).toBe(assessment.commitSha);
   });
 
@@ -128,6 +141,17 @@ describe('RepositoryAssessor', () => {
     await expect(new RepositoryAssessor(config, new UnsupportedEvidenceModel('git', 'b'.repeat(40))).assess(
       { sourcePath: 'PROJECT.md', content: 'Expose health.' },
     )).rejects.toThrow(/stale git commit/);
+  });
+
+  it('rejects verification-only work for partially implemented requirements', async () => {
+    const root = gitRepo();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.enabled = true;
+
+    await expect(new RepositoryAssessor(config, new InvalidPartialActionModel()).assess({
+      sourcePath: 'PROJECT.md',
+      content: 'Expose health.',
+    })).rejects.toThrow(/Partial coverage HEALTH must require implementation/);
   });
 });
 

@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.19] - 2026-09-16
+
+- Define partial coverage as incomplete product behavior and require implementation work; reserve unverified coverage for complete behavior that lacks proof.
+
 ## [1.0.0-rc.18] - 2026-09-16
 
 - Distinguish implementation, verification, operation, documentation, and external coverage actions; reject plans that answer implementation gaps with verification-only work.
