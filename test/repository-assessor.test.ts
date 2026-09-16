@@ -1,9 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
-import { RepositoryAssessor } from '../src/program/repository-assessor.js';
+import { collectRepositorySnapshot, RepositoryAssessor } from '../src/program/repository-assessor.js';
 import type { PortfolioPlanningModel } from '../src/portfolio/planner.js';
 import { makeTmp } from './helpers.js';
 
@@ -82,6 +82,24 @@ describe('RepositoryAssessor', () => {
     expect(assessment.commitSha).toBe(sha);
     expect(assessment.dirty).toBe(false);
     expect(assessment.files).toContain('server.ts');
+  });
+
+  it('skips binary assets without omitting later source evidence', async () => {
+    const root = gitRepo();
+    const assetDir = path.join(root, 'server', 'assets');
+    const sourceDir = path.join(root, 'server', 'routes');
+    mkdirSync(assetDir, { recursive: true });
+    mkdirSync(sourceDir, { recursive: true });
+    writeFileSync(path.join(assetDir, 'icon.png'), Buffer.from([0, 1, 2, 3]));
+    writeFileSync(path.join(sourceDir, 'verified.ts'), 'export const verified = true;\n');
+    execFileSync('git', ['add', '.'], { cwd: root });
+    execFileSync('git', ['commit', '-qm', 'add binary and later source'], { cwd: root });
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+
+    const snapshot = await collectRepositorySnapshot(config);
+
+    expect(snapshot.excerpts.some((entry) => entry.path === 'server/assets/icon.png')).toBe(false);
+    expect(snapshot.excerpts.some((entry) => entry.path === 'server/routes/verified.ts')).toBe(true);
   });
 
   it('rejects invented deployment evidence and stale git evidence', async () => {
