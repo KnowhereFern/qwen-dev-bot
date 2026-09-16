@@ -15,6 +15,7 @@ import type {
 export const MAX_REQUIREMENTS_BYTES = 1024 * 1024;
 export const DEFAULT_MAX_PORTFOLIO_STORIES = 25;
 export const HARD_MAX_PORTFOLIO_STORIES = 100;
+export const MAX_PLANNING_ATTEMPTS = 3;
 
 export interface PortfolioStoryDraft {
   key: string;
@@ -92,7 +93,7 @@ export class PortfolioPlanner {
       })),
       coverage: assessment.coverage,
     } : null;
-    const response = await this.model.completeJson<unknown>({
+    const request = {
       reasoningEffort: this.config.qwen.triageReasoning,
       maxTokens: Math.min(32_768, 2_048 + maxStories * 750),
       jsonSchema: portfolioDraftSchema(maxStories),
@@ -128,15 +129,39 @@ export class PortfolioPlanner {
         document.content,
         '</requirements>',
       ].join('\n'),
-    });
-    const draft = validatePortfolioDraft(
-      response.value,
-      gateIds,
-      rewardIds,
-      maxStories,
-      this.config.technologyPolicy,
-      assessment?.coverage,
-    );
+    };
+    let response = await this.model.completeJson<unknown>(request);
+    let draft: PortfolioDraft | null = null;
+    for (let attempt = 1; attempt <= MAX_PLANNING_ATTEMPTS; attempt += 1) {
+      try {
+        draft = validatePortfolioDraft(
+          response.value,
+          gateIds,
+          rewardIds,
+          maxStories,
+          this.config.technologyPolicy,
+          assessment?.coverage,
+        );
+        break;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        if (attempt === MAX_PLANNING_ATTEMPTS) {
+          throw new Error(`Portfolio planning failed after ${MAX_PLANNING_ATTEMPTS} bounded attempts: ${detail}`);
+        }
+        response = await this.model.completeJson<unknown>({
+          ...request,
+          user: [
+            request.user,
+            `<validation-correction attempt="${attempt + 1}" maximum="${MAX_PLANNING_ATTEMPTS}">`,
+            `Controller rejected the previous draft: ${detail}`,
+            'Return a corrected complete program. Preserve the objective, frozen decisions, and all valid coverage. Do not weaken checks or relabel verification criteria as implementation.',
+            `<rejected-draft>${JSON.stringify(response.value)}</rejected-draft>`,
+            '</validation-correction>',
+          ].join('\n'),
+        });
+      }
+    }
+    if (!draft) throw new Error('Portfolio planning did not produce a validated draft');
     return {
       ...draft,
       deploymentDecisions: draft.deploymentDecisions.map((decision) => ({
