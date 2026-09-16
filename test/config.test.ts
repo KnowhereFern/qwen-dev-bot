@@ -1,8 +1,26 @@
+import { writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { defaultProjectConfig, validateProjectConfig } from '../src/core/config.js';
+import { defaultProjectConfig, discoverGates, validateProjectConfig } from '../src/core/config.js';
 import { makeTmp } from './helpers.js';
 
 describe('project configuration invariants', () => {
+  it('discovers aggregate checks and browser tests without rerunning a covered unit suite', () => {
+    const root = makeTmp('config-discovery');
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+      scripts: {
+        check: 'node scripts/check-syntax.mjs && npm run test && npm run check:budget',
+        test: 'node --test',
+        'test:browser': 'playwright test',
+      },
+    }));
+
+    expect(discoverGates(root).map((gate) => [gate.id, gate.kind])).toEqual([
+      ['check', 'custom'],
+      ['test-browser', 'e2e'],
+    ]);
+  });
+
   it('accepts the generated Qwen-native template configuration', () => {
     const config = defaultProjectConfig(makeTmp('config-valid'), 'fixture', 'owner/fixture');
     expect(config.worker.autoMerge).toBe(true);

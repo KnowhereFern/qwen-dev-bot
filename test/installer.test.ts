@@ -75,7 +75,11 @@ describe('guided installer', () => {
   it('installs idempotently and preserves modified files on uninstall', async () => {
     const root = makeTmp('installer-project');
     process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-state');
-    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'fixture', scripts: { test: 'node --test' } }));
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+      name: 'fixture',
+      engines: { node: '>=24' },
+      scripts: { test: 'node --test' },
+    }));
     writeFileSync(path.join(root, '.gitignore'), 'coverage/\n');
     const options = {
       root,
@@ -124,6 +128,7 @@ describe('guided installer', () => {
     expect(installedConfig.project.defaultBranch).toBe('develop');
     expect(installedConfig.gates.some((gate: { id: string }) => gate.id === 'custom-proof')).toBe(true);
     expect(readFileSync(path.join(root, '.github', 'workflows', 'harness-ci.yml'), 'utf8')).toContain('branches: ["develop"]');
+    expect(readFileSync(path.join(root, '.github', 'workflows', 'harness-ci.yml'), 'utf8')).toContain('node-version: 24');
     expect(readFileSync(path.join(root, '.gitignore'), 'utf8').match(/qwen-harness managed state/g)).toHaveLength(1);
     const installedSettings = JSON.parse(readFileSync(settingsFile, 'utf8'));
     expect(installedSettings.security.auth.selectedType).toBe('openai');

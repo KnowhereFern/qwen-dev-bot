@@ -4,6 +4,7 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Generated CI now follows the target project's declared Node major version and automatically gates common aggregate `check` and Playwright-style `test:browser` scripts.
 - Enabled guarded auto-merge by default for newly installed projects, with `--no-auto-merge` as the explicit opt-out and existing project choices preserved during updates.
 - Added Token Plan Personal as a first-class technical configuration using the same dedicated key and endpoint validation as Token Plan Team.
 - Removed the obsolete in-memory teaching pipeline so the package contains only the production supervisor and its tests.

@@ -1027,5 +1027,19 @@ function renderTemplate(source: string, config: ProjectConfig, answers: InstallA
     .replaceAll('{{PROJECT_NAME}}', config.project.name)
     .replaceAll('{{GITHUB_REPO}}', config.project.githubRepo)
     .replaceAll('{{DEFAULT_BRANCH}}', config.project.defaultBranch)
+    .replaceAll('{{NODE_VERSION}}', detectedNodeMajor(config.project.root))
     .replaceAll('{{TRUSTED_AUTHOR}}', answers.trustedAuthor || 'github-actions[bot]');
+}
+
+function detectedNodeMajor(root: string): string {
+  const packageFile = path.join(root, 'package.json');
+  if (!existsSync(packageFile)) return '22';
+  try {
+    const manifest = JSON.parse(readFileSync(packageFile, 'utf8')) as { engines?: { node?: unknown } };
+    const requirement = manifest.engines?.node;
+    if (typeof requirement !== 'string') return '22';
+    return /\d+/.exec(requirement)?.[0] ?? '22';
+  } catch {
+    return '22';
+  }
 }
