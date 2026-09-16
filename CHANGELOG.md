@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.20] - 2026-09-16
+
+- Derive the only valid action for implemented, partial, missing, and externally blocked coverage in the controller; retain model judgment only for test-versus-live proof of unverified behavior.
+
 ## [1.0.0-rc.19] - 2026-09-16
 
 - Define partial coverage as incomplete product behavior and require implementation work; reserve unverified coverage for complete behavior that lacks proof.

@@ -311,20 +311,21 @@ function validateCoverage(value: unknown, context: EvidenceValidationContext): O
 }
 
 function validateCoverageAction(value: unknown, status: CapabilityStatus, id: string): CoverageAction {
-  const action = requiredText(value, `${id}.requiredAction`) as CoverageAction;
-  if (!['none', 'implement', 'verify', 'operate', 'document', 'external'].includes(action)) {
+  const proposed = requiredText(value, `${id}.requiredAction`) as CoverageAction;
+  if (!['none', 'implement', 'verify', 'operate', 'document', 'external'].includes(proposed)) {
     throw new Error(`Invalid required action for coverage ${id}`);
   }
-  if (status === 'implemented' && action !== 'none') throw new Error(`Implemented coverage ${id} must require no work`);
-  if (status === 'missing' && action !== 'implement') throw new Error(`Missing coverage ${id} must require implementation`);
-  if (status === 'unverified' && !['verify', 'operate'].includes(action)) {
+  const derived: Partial<Record<CapabilityStatus, CoverageAction>> = {
+    implemented: 'none',
+    partial: 'implement',
+    missing: 'implement',
+    externally_blocked: 'external',
+  };
+  if (derived[status]) return derived[status] as CoverageAction;
+  if (!['verify', 'operate'].includes(proposed)) {
     throw new Error(`Unverified coverage ${id} must require verification or operation`);
   }
-  if (status === 'externally_blocked' && action !== 'external') {
-    throw new Error(`Externally blocked coverage ${id} must require external access`);
-  }
-  if (status === 'partial' && action !== 'implement') throw new Error(`Partial coverage ${id} must require implementation`);
-  return action;
+  return proposed;
 }
 
 function validateEvidence(value: unknown, context: EvidenceValidationContext, key: string): EvidenceReference[] {

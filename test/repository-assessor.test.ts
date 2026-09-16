@@ -33,7 +33,7 @@ class AssessmentModel implements PortfolioPlanningModel {
   }
 }
 
-class InvalidPartialActionModel implements PortfolioPlanningModel {
+class ContradictoryPartialActionModel implements PortfolioPlanningModel {
   calls = 0;
   async completeJson<T>(): Promise<{ value: T }> {
     this.calls += 1;
@@ -143,15 +143,17 @@ describe('RepositoryAssessor', () => {
     )).rejects.toThrow(/stale git commit/);
   });
 
-  it('rejects verification-only work for partially implemented requirements', async () => {
+  it('derives implementation work for partial requirements instead of trusting a contradictory model action', async () => {
     const root = gitRepo();
     const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
     config.program.enabled = true;
 
-    await expect(new RepositoryAssessor(config, new InvalidPartialActionModel()).assess({
+    const assessment = await new RepositoryAssessor(config, new ContradictoryPartialActionModel()).assess({
       sourcePath: 'PROJECT.md',
       content: 'Expose health.',
-    })).rejects.toThrow(/Partial coverage HEALTH must require implementation/);
+    });
+
+    expect(assessment.coverage[0]).toMatchObject({ status: 'partial', requiredAction: 'implement' });
   });
 });
 
