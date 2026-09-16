@@ -232,7 +232,7 @@ function validateStory(
   if (unknownGate) throw new Error(`Story ${key} names unknown gate ${unknownGate}`);
   const unknownReward = rewardCriterionIds.find((id) => !rewardIds.includes(id));
   if (unknownReward) throw new Error(`Story ${key} names unknown reward criterion ${unknownReward}`);
-  const risk = value.risk;
+  const risk = typeof value.risk === 'string' ? value.risk.trim().toLowerCase() : value.risk;
   if (risk !== 'low' && risk !== 'medium' && risk !== 'high') {
     throw new Error(`Story ${key} has invalid risk`);
   }

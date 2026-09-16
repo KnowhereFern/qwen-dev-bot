@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.15] - 2026-09-16
+
+- Normalize case and surrounding whitespace for the fixed low, medium, and high story-risk vocabulary while rejecting unknown categories.
+
 ## [1.0.0-rc.14] - 2026-09-16
 
 - Keep only non-empty text in optional repository-risk notes so null-like model output cannot abort an otherwise valid assessment.
