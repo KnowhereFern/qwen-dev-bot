@@ -287,7 +287,57 @@ describe('guided installer', () => {
       timeoutMs: 20_000,
     });
     expect(receipt.exitCode).toBe(0);
-    expect(receipt.stdout.trim()).toBe('1.0.0-rc.5');
+    expect(receipt.stdout.trim()).toBe('1.0.0-rc.6');
+  });
+
+  it.skipIf(process.platform === 'win32')('replaces a stale extension link with the immutable runtime', async () => {
+    const root = makeTmp('installer-extension-project');
+    const state = makeTmp('installer-extension-state');
+    const bin = makeTmp('installer-extension-bin');
+    const linkedPath = path.join(state, 'linked-path');
+    const qwen = path.join(bin, 'qwen');
+    process.env.QWEN_HARNESS_STATE_DIR = state;
+    writeFileSync(linkedPath, '/old/development/checkout');
+    writeFileSync(qwen, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo 0.23.3; exit 0; fi
+if [ "$1" = "extensions" ] && [ "$2" = "list" ]; then
+  echo "Autonomous Software Delivery Harness"
+  echo " Path: $(cat "${linkedPath}")"
+  exit 0
+fi
+if [ "$1" = "extensions" ] && [ "$2" = "link" ]; then
+  if [ -f "${linkedPath}" ]; then echo already linked >&2; exit 1; fi
+  printf '%s' "$3" > "${linkedPath}"
+  exit 0
+fi
+if [ "$1" = "extensions" ] && [ "$2" = "uninstall" ]; then rm -f "${linkedPath}"; exit 0; fi
+exit 1
+`);
+    chmodSync(qwen, 0o755);
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'fixture' }));
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.qwen.command = qwen;
+    const configFile = path.join(root, '.qwen-harness', 'project.yml');
+    mkdirSync(path.dirname(configFile), { recursive: true });
+    writeFileSync(configFile, serializeProjectConfig(config));
+
+    const installed = await installProject({
+      root,
+      yes: true,
+      answers: {
+        projectName: 'fixture',
+        githubRepo: 'owner/fixture',
+        trustedAuthor: 'owner',
+        linkExtension: true,
+        installService: false,
+        bootstrapDependencies: false,
+        configureGitHub: false,
+      },
+    });
+
+    const immutableRuntime = path.join(state, 'controller', 'installed', '1.0.0-rc.6', 'node_modules', 'qwen-dev-bot');
+    expect(readFileSync(linkedPath, 'utf8')).toBe(immutableRuntime);
+    expect(installed.receipt.extensionLinked).toBe(true);
   });
 
   it('shows setup help without entering the interactive wizard', async () => {
@@ -331,7 +381,7 @@ describe('guided installer', () => {
     ).rejects.toThrow('extension link failed');
 
     expect(existsSync(path.join(root, '.qwen-harness', 'install-receipt.json'))).toBe(true);
-    expect(existsSync(path.join(state, 'controller', 'installed', '1.0.0-rc.5', 'node_modules', 'qwen-dev-bot', 'bin', 'qwen-harness-launcher.mjs'))).toBe(true);
+    expect(existsSync(path.join(state, 'controller', 'installed', '1.0.0-rc.6', 'node_modules', 'qwen-dev-bot', 'bin', 'qwen-harness-launcher.mjs'))).toBe(true);
     expect(await uninstallProject(root)).toContain('unregistered project');
   });
 

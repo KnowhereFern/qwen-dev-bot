@@ -12,7 +12,7 @@ if (currentNode[0] < minimumNode[0] || (currentNode[0] === minimumNode[0] && cur
 const git = spawnSync('git', ['--version'], { encoding: 'utf8', shell: false });
 if (git.status !== 0) fail('Git is required. Install Git, then rerun node setup.mjs.');
 
-const ref = 'v1.0.0-rc.5';
+const ref = 'v1.0.0-rc.6';
 const source = 'https://github.com/KnowhereFern/qwen-dev-bot.git';
 const temp = mkdtempSync(path.join(os.tmpdir(), 'qwen-dev-bot-'));
 
