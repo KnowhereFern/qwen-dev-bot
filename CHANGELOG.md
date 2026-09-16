@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.12] - 2026-09-16
+
+- Ignore blank optional repository-risk notes from model output while preserving strict validation of evidence and non-blank fields.
+
 ## [1.0.0-rc.11] - 2026-09-16
 
 - Increased the bounded direct-model request window for real repository planning, reduced the default evidence payload, and continued past binary assets so later source files remain assessable.
