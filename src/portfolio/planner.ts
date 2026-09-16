@@ -76,6 +76,22 @@ export class PortfolioPlanner {
     const approvedTechnologies = this.config.technologyPolicy.approved
       .map((entry) => `${entry.category}: ${entry.technology}`)
       .join(', ');
+    const coverageActionMatrix = assessment?.coverage.map((entry) => ({
+      id: entry.id,
+      requirement: entry.requirement,
+      status: entry.status,
+      requiredAction: entry.requiredAction,
+    })) ?? [];
+    const assessmentContext = assessment ? {
+      commitSha: assessment.commitSha,
+      detectedStacks: assessment.detectedStacks,
+      analyses: assessment.analyses.map((analysis) => ({
+        area: analysis.area,
+        summary: analysis.summary,
+        risks: analysis.risks,
+      })),
+      coverage: assessment.coverage,
+    } : null;
     const response = await this.model.completeJson<unknown>({
       reasoningEffort: this.config.qwen.triageReasoning,
       maxTokens: Math.min(32_768, 2_048 + maxStories * 750),
@@ -91,6 +107,7 @@ export class PortfolioPlanner {
         'workType is implement, verify, operate, or document and must match each mapped coverage item requiredAction; external coverage is handled by document work that records the blocker.',
         'When repository coverage is supplied, create work only for non-implemented requirements and map every story to at least one coverage id.',
         'Every coverage item requiring implement must have an implementation story that delivers the missing behavior; verification-only work is insufficient.',
+        'Before returning, audit the mandatory coverage/action matrix item by item. Every non-none action must have a story whose workType exactly matches it (external maps to document), and implementation acceptance criteria must change product behavior rather than merely test or describe it.',
         'Do not create file-oriented cleanup, speculative infrastructure, or stories for capabilities proven implemented.',
         'A story may reference only decision ids that it actually needs.',
         'Approved technologies are preferred. Any other choice is an exception that will be highlighted for explicit plan approval.',
@@ -104,7 +121,8 @@ export class PortfolioPlanner {
         `Allowed reward ids: ${rewardIds.join(', ') || '(none)'}`,
         `Approved technology catalog: ${approvedTechnologies || '(none)'}`,
         `Delivery authority: ${this.config.technologyPolicy.authority}`,
-        `Repository assessment: ${assessment ? JSON.stringify(assessment) : '(not enabled)'}`,
+        `Mandatory coverage/action matrix: ${assessment ? JSON.stringify(coverageActionMatrix) : '(not enabled)'}`,
+        `Repository assessment evidence: ${assessment ? JSON.stringify(assessmentContext) : '(not enabled)'}`,
         `<requirements path="${escapeAttribute(document.sourcePath)}">`,
         document.content,
         '</requirements>',

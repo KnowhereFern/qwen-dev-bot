@@ -7,7 +7,7 @@ import { makeTmp } from './helpers.js';
 
 describe('dependency preflight', () => {
   it('recognizes the Qwen CLI display name used for the harness extension', () => {
-    expect(qwenHarnessExtensionPresent('✓ Autonomous Software Delivery Harness (1.0.0-rc.20)')).toBe(true);
+    expect(qwenHarnessExtensionPresent('✓ Autonomous Software Delivery Harness (1.0.0-rc.21)')).toBe(true);
     expect(qwenHarnessExtensionPresent('qwen-dev-harness')).toBe(true);
     expect(qwenHarnessExtensionPresent('unrelated extension')).toBe(false);
   });

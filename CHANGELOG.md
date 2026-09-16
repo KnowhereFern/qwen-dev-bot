@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.21] - 2026-09-16
+
+- Put a compact mandatory coverage/action matrix before planning evidence and omit repository inventory/findings that distract story synthesis; require an explicit final matrix audit in the model contract.
+
 ## [1.0.0-rc.20] - 2026-09-16
 
 - Derive the only valid action for implemented, partial, missing, and externally blocked coverage in the controller; retain model judgment only for test-versus-live proof of unverified behavior.
