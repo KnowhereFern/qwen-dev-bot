@@ -23,7 +23,7 @@ import { ProjectRegistry } from './registry.js';
 import { RepositoryAssessor } from './program/repository-assessor.js';
 import { buildEvidenceReport, formatEvidenceReport } from './program/evidence-report.js';
 
-const VERSION = '1.0.0-rc.23';
+const VERSION = '1.0.0-rc.24';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? 'help';
@@ -290,12 +290,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const planId = valueOf(args, '--plan');
       const requirementsPath = valueOf(args, '--requirements');
       if (!planId || !requirementsPath) throw new Error('plan-redraft requires --plan PLAN_ID --requirements FILE');
+      const feedbackPath = valueOf(args, '--feedback');
       const maxStories = integerValue(args, '--max-stories') ?? DEFAULT_MAX_PORTFOLIO_STORIES;
       const credential = resolveQwenCredential(config);
       if (credential) assertQwenCredentialCompatibility(config, credential);
       const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
       try {
         const document = readRequirementsDocument(config.project.root, requirementsPath);
+        const feedback = feedbackPath ? readRequirementsDocument(config.project.root, feedbackPath) : null;
         const github = new OctokitControlPlane({
           repo: config.project.githubRepo,
           token: await resolveGitHubToken(root),
@@ -308,14 +310,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         });
         const assessment = await new RepositoryAssessor(config, qwenApi).assess(document);
         store.saveRepositoryAssessment(assessment);
-        const draft = await new PortfolioPlanner(config, qwenApi).plan(document, maxStories, assessment);
+        const draft = await new PortfolioPlanner(config, qwenApi).plan(document, maxStories, assessment, feedback?.content);
         const coordinator = new PortfolioCoordinator(config, store, github);
         const plan = await coordinator.replaceUnapprovedDraft({
           planId,
           ...document,
           draft,
           assessment,
-          summary: 'Replaced an unapproved draft after plan-quality review',
+          summary: feedback ? `Replaced an unapproved draft using review evidence from ${feedback.sourcePath}` : 'Replaced an unapproved draft after plan-quality review',
         });
         const view = coordinator.status(plan);
         console.log(json ? JSON.stringify(view, null, 2) : formatPortfolioPlan(view));
@@ -628,7 +630,7 @@ Reward options:
 
 Plan options:
   plan PROJECT --requirements FILE [--max-stories N] [--approve] [--json]
-  plan-redraft PROJECT --plan PLAN_ID --requirements FILE [--max-stories N] [--json]
+  plan-redraft PROJECT --plan PLAN_ID --requirements FILE [--feedback FILE] [--max-stories N] [--json]
   plan-approve PROJECT --plan PLAN_ID [--json]
   plan-status PROJECT [--plan PLAN_ID] [--json]
   plan-reassess PROJECT --plan PLAN_ID [--json]

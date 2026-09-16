@@ -3,7 +3,7 @@ import type { PersistentTaskStore } from '../core/persistent-store.js';
 import type { PortfolioPlan, ProgramRevision, ProjectConfig } from '../core/types.js';
 import { StagingDeploymentController } from '../deployment/controller.js';
 import { EvolutionSignalCollector } from '../evolution/signals.js';
-import { REQUIRED_GITHUB_CHECKS, type GitHubControl } from '../github/control-plane.js';
+import { REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from '../github/control-plane.js';
 import { PortfolioCoordinator } from '../portfolio/coordinator.js';
 import { PortfolioPlanner, readRequirementsDocument } from '../portfolio/planner.js';
 import { runProcess } from '../runtime/safe-process.js';
@@ -97,7 +97,7 @@ export class ProgramController {
     const document = frozenRequirements(this.config.project.root, plan);
     const targetCommitSha = repositorySha ?? await this.remoteHead(signal);
     const deployment = plan.latestDeploymentId ? this.store.getDeployment(plan.latestDeploymentId) : null;
-    const checks = await this.github.checksForRef(targetCommitSha, [...REQUIRED_GITHUB_CHECKS]);
+    const checks = await this.github.checksForRef(targetCommitSha, [...REQUIRED_POST_MERGE_GITHUB_CHECKS]);
     const checkEvidence = checks.complete && checks.successful
       ? this.config.gates.filter((gate) => gate.required).map((gate) => ({
           kind: 'test' as const,

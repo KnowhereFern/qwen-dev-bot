@@ -7,6 +7,8 @@ export const REQUIRED_GITHUB_CHECKS = [
   'Fern Delivery Harness / reward',
 ] as const;
 
+export const REQUIRED_POST_MERGE_GITHUB_CHECKS = ['Fern Delivery Harness / CI'] as const;
+
 export interface RemoteIssue {
   number: number;
   title: string;

@@ -61,11 +61,14 @@ describe('portfolio planner validation', () => {
       createdAt: 1,
     } as RepositoryAssessment;
 
-    await new PortfolioPlanner(config, model).plan({ sourcePath: 'OBJECTIVE.md', content: 'Build runner claims.' }, 5, assessment);
+    await new PortfolioPlanner(config, model).plan(
+      { sourcePath: 'OBJECTIVE.md', content: 'Build runner claims.' }, 5, assessment, 'Review evidence: pickup coverage is missing.',
+    );
 
     expect(prompt).toContain('Mandatory coverage/action matrix: [{"id":"RUNNERS"');
     expect(prompt).toContain('"requiredAction":"implement"');
     expect(prompt).not.toContain('SHOULD_NOT_REACH_PLANNER');
+    expect(prompt).toContain('<program-review-evidence>Review evidence: pickup coverage is missing.</program-review-evidence>');
   });
 
   it('corrects a rejected coverage contract using the exact validator error and original assessment', async () => {

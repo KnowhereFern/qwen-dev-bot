@@ -1,6 +1,6 @@
 # Live Test Readiness
 
-Status checked: September 15, 2026
+Status checked: September 16, 2026
 
 This document describes Fern's software-delivery product: a governed system for turning approved objectives into verified releases through Qwen Code and `qwen3.8-max`.
 
@@ -10,12 +10,14 @@ The repository now has the complete architecture for a repository-aware objectiv
 
 The honest status is:
 
-- **Architecture:** ready for the controlled Festival SOS live run after this release is merged and installed.
-- **Current machine:** installation, registration, and service state must be rechecked against the merged release before starting the clock.
-- **Provider:** Qwen Code `0.22.1` is active. Token Plan Personal and Team are supported through their dedicated key and endpoint configuration.
+- **Architecture:** implemented for a controlled Festival SOS live run, but the generated program must pass review and approval first.
+- **Current machine:** immutable installation, Festival registration, credentials, dependencies, and browser runtime are verified. The worker service is intentionally not started before program approval.
+- **Provider:** Qwen Code `0.23.3` is active. Token Plan Personal and Team are supported through their dedicated key and endpoint configuration.
 - **Release proof:** deterministic tests cover the new program, staging, feedback, recovery, and controller-release boundaries; the real observation periods remain required before stable `v1.0.0` or a proven self-evolving claim.
 
 A normal user provides one objective file, runs guided setup, reviews the repository assessment and proposed program, and approves it. The harness handles bounded execution, reassessment, staging verification, repairs, and in-scope maintenance after that.
+
+Live planning exposed coverage omissions and unsupported completion claims. The controller now derives fixed coverage actions, downgrades source-only claims to unverified, checks the mandatory action matrix, and permits at most two synthesis corrections. Passing this structural validation does not replace review of behavior coverage, dependency timing, and authority before approval.
 
 ## What a 16-day run actually is
 
@@ -124,10 +126,10 @@ It does **not** keep the worker alive. Long-run continuity comes from the servic
 | PR, CI, merge, and post-merge loop | Ready, default-on | Exact-head checks and post-merge verification exist. New projects default `autoMerge` to `true`; projects can opt out and pause at `merge_ready`. |
 | Dependency and browser preflight | Ready | Setup/bootstrap and doctor check package managers, dependencies, configured gate executables, and declared Playwright/Cypress runtimes. |
 | Persistent worker | Implemented, not installed here | macOS uses `RunAtLoad` plus `KeepAlive`; Linux uses `Restart=always`. This Mac currently has no worker service. |
-| Current Qwen executable | Ready | `PATH` resolves Qwen Code version `0.22.1`. |
-| Current harness installation | Not ready | `qwen-harness` is not on `PATH`; the local source command can still be used. |
-| Registered target | Recheck required | Festival SOS is the designated target, but registration must be verified after the merged release is installed. |
-| Configured model credential | Recheck required | The selected Token Plan credential and endpoint must pass `doctor --live` without copying the secret into tracked configuration. |
+| Current Qwen executable | Ready | `PATH` resolves Qwen Code version `0.23.3`. |
+| Current harness installation | Ready via immutable CLI | The immutable absolute CLI and extension are installed. `qwen-harness` is not on `PATH`; this is a convenience warning, not an execution blocker. |
+| Registered target | Verified | Festival SOS is registered and clean at the recorded starting revision. Its generated program remains review-only until approved. |
+| Configured model credential | Verified for planning | The Token Plan route and credential pass doctor, and live Qwen3.8-Max repository assessment/program synthesis has completed without copying the secret into tracked configuration. |
 | Always-on host | Not established | A sleeping or powered-off Mac does not execute work. A 16-day run needs an always-on host and network. |
 | Health alerting | Missing | Status and logs exist, but there is no proactive alert when the worker stops, a credential expires, disk fills, or a task is quarantined. |
 | State backup and log retention | Missing | SQLite and JSONL state are durable on one disk, but there is no scheduled backup, integrity check, or log rotation/retention policy. |
