@@ -2,7 +2,7 @@
 
 A software product designed and built by Fern. It uses Qwen Code and `qwen3.8-max` as its execution engine to turn approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.9`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
+**Release status:** `v1.0.0-rc.10`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
 
 See [live test readiness](docs/live-test-readiness.md) for the current machine and end-to-end proof status.
 
@@ -240,6 +240,7 @@ Normalized task gate/reward IDs are trace metadata only: a task cannot weaken pr
 - Shell execution uses argument arrays with `shell: false`, bounded output, timeouts, process-tree termination, a reduced gate environment, and a credential-minimized Qwen environment.
 - A passing summary cannot compensate for a failed hard gate, critical rubric, security finding, or changed PR head.
 - Auto-merge defaults on, can be disabled per project, and uses GitHub's expected-head SHA guard.
+- When a repository plan does not expose remote branch protection, setup records that provider limitation and the supervisor continues to enforce exact-head CI, governance, and reward checks before calling the merge API.
 - `done` means the actual merge commit passed a fresh post-merge run—not merely that code, a PR, or CI exists.
 - Program delivery additionally requires the objective acceptance audit and, when enabled, an exact-revision verified staging deployment.
 - A successor controller cannot modify the running controller, its credentials, governance, launcher, or the evaluation that approves it.

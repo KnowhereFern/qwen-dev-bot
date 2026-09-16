@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { installProject, uninstallProject } from '../src/installer/installer.js';
+import { githubBranchProtectionUnavailable, installProject, uninstallProject } from '../src/installer/installer.js';
 import { defaultProjectConfig, serializeProjectConfig } from '../src/core/config.js';
 import { templateAssetProblems } from '../src/doctor.js';
 import { runProcess } from '../src/runtime/safe-process.js';
@@ -14,6 +14,12 @@ afterEach(() => {
 });
 
 describe('guided installer', () => {
+  it('recognizes GitHub plan limits without hiding unrelated protection failures', () => {
+    expect(githubBranchProtectionUnavailable('Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)')).toBe(true);
+    expect(githubBranchProtectionUnavailable('branch protection is not available for this repository')).toBe(true);
+    expect(githubBranchProtectionUnavailable('HTTP 500')).toBe(false);
+  });
+
   it.skipIf(process.platform === 'win32')('selects a compatible Qwen binary when PATH shadows it with an older copy', async () => {
     const root = makeTmp('installer-qwen-path');
     const oldBin = makeTmp('installer-qwen-old-bin');
@@ -287,7 +293,7 @@ describe('guided installer', () => {
       timeoutMs: 20_000,
     });
     expect(receipt.exitCode).toBe(0);
-    expect(receipt.stdout.trim()).toBe('1.0.0-rc.9');
+    expect(receipt.stdout.trim()).toBe('1.0.0-rc.10');
   });
 
   it.skipIf(process.platform === 'win32')('replaces a stale extension link with the immutable runtime', async () => {
@@ -335,7 +341,7 @@ exit 1
       },
     });
 
-    const immutableRuntime = path.join(state, 'controller', 'installed', '1.0.0-rc.9', 'node_modules', 'qwen-dev-bot');
+    const immutableRuntime = path.join(state, 'controller', 'installed', '1.0.0-rc.10', 'node_modules', 'qwen-dev-bot');
     expect(readFileSync(linkedPath, 'utf8')).toBe(immutableRuntime);
     expect(installed.receipt.extensionLinked).toBe(true);
   });
@@ -382,7 +388,7 @@ exit 1
     ).rejects.toThrow('extension link failed');
 
     expect(existsSync(path.join(root, '.qwen-harness', 'install-receipt.json'))).toBe(true);
-    expect(existsSync(path.join(state, 'controller', 'installed', '1.0.0-rc.9', 'node_modules', 'qwen-dev-bot', 'bin', 'qwen-harness-launcher.mjs'))).toBe(true);
+    expect(existsSync(path.join(state, 'controller', 'installed', '1.0.0-rc.10', 'node_modules', 'qwen-dev-bot', 'bin', 'qwen-harness-launcher.mjs'))).toBe(true);
     expect(await uninstallProject(root)).toContain('unregistered project');
   });
 
