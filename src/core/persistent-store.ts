@@ -5,10 +5,14 @@ import { DatabaseSync } from 'node:sqlite';
 import { EventLedger, redactForLedger, redactText } from './ledger.js';
 import { assertTaskTransition, isTaskLeased } from './task-state.js';
 import type {
+  ControllerRelease,
+  DeploymentRecord,
+  EvolutionSignal,
   HarnessEvent,
   PortfolioPlan,
   PortfolioPlanStatus,
   RewardScorecard,
+  RepositoryAssessment,
   RunCheckpoint,
   TaskRecord,
   TaskSpec,
@@ -48,6 +52,10 @@ export interface NewPersistentTask {
   spec?: TaskSpec | null;
   priority?: number;
   maxAttempts?: number;
+  failureLineageId?: string | null;
+  lineageFailures?: number;
+  identicalFailures?: number;
+  lastFailureFingerprint?: string | null;
 }
 
 export interface SourceSnapshot {
@@ -133,6 +141,44 @@ export class PersistentTaskStore {
       );
       CREATE INDEX IF NOT EXISTS portfolio_plans_source_idx
         ON portfolio_plans(project_id, source_path, updated_at);
+      CREATE TABLE IF NOT EXISTS repository_assessments (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        commit_sha TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        data TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS repository_assessments_project_idx
+        ON repository_assessments(project_id, created_at);
+      CREATE TABLE IF NOT EXISTS evolution_signals (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        source_key TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        data TEXT NOT NULL,
+        UNIQUE(project_id, source_key, content_hash)
+      );
+      CREATE TABLE IF NOT EXISTS deployments (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        plan_id TEXT NOT NULL,
+        commit_sha TEXT NOT NULL,
+        status TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        data TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS deployments_plan_idx
+        ON deployments(project_id, plan_id, updated_at);
+      CREATE TABLE IF NOT EXISTS controller_releases (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        commit_sha TEXT NOT NULL,
+        status TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        data TEXT NOT NULL
+      );
     `);
     this.ledger = new EventLedger(path.dirname(stateDir), projectId);
   }
@@ -177,8 +223,13 @@ export class PersistentTaskStore {
       spec: input.spec ?? null,
       priority: input.priority ?? 0,
       attempts: 0,
-      identicalFailures: 0,
-      lastFailureFingerprint: null,
+      continuations: 0,
+      waitKind: null,
+      resumeAfter: null,
+      identicalFailures: input.identicalFailures ?? 0,
+      lastFailureFingerprint: input.lastFailureFingerprint ?? null,
+      failureLineageId: input.failureLineageId ?? null,
+      lineageFailures: input.lineageFailures ?? 0,
       maxAttempts: input.maxAttempts ?? 5,
       leaseOwner: null,
       leaseExpiresAt: null,
@@ -271,6 +322,95 @@ export class PersistentTaskStore {
         .prepare('SELECT * FROM portfolio_plans WHERE project_id = ? ORDER BY updated_at DESC, id DESC')
         .all(this.projectId) as unknown as PortfolioPlanRow[]
     ).map(rowToPortfolioPlan);
+  }
+
+  saveRepositoryAssessment(assessment: RepositoryAssessment): RepositoryAssessment {
+    if (assessment.projectId !== this.projectId) throw new Error(`Repository assessment ${assessment.id} belongs to another project`);
+    this.db.prepare(
+      `INSERT INTO repository_assessments(id, project_id, commit_sha, created_at, data)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET commit_sha=excluded.commit_sha, created_at=excluded.created_at, data=excluded.data`,
+    ).run(assessment.id, assessment.projectId, assessment.commitSha, assessment.createdAt, JSON.stringify(assessment));
+    this.recordEvent('program.assessment_saved', null, { assessmentId: assessment.id, commitSha: assessment.commitSha });
+    return assessment;
+  }
+
+  getRepositoryAssessment(id: string): RepositoryAssessment | null {
+    const row = this.db.prepare('SELECT data FROM repository_assessments WHERE id = ? AND project_id = ?').get(id, this.projectId) as { data?: string } | undefined;
+    return row?.data ? JSON.parse(row.data) as RepositoryAssessment : null;
+  }
+
+  listRepositoryAssessments(): RepositoryAssessment[] {
+    const rows = this.db.prepare('SELECT data FROM repository_assessments WHERE project_id = ? ORDER BY created_at DESC, id DESC').all(this.projectId) as Array<{ data: string }>;
+    return rows.map((row) => JSON.parse(row.data) as RepositoryAssessment);
+  }
+
+  saveSignal(signal: EvolutionSignal): EvolutionSignal {
+    if (signal.projectId !== this.projectId) throw new Error(`Signal ${signal.id} belongs to another project`);
+    const existing = this.db.prepare(
+      'SELECT data FROM evolution_signals WHERE project_id = ? AND source_key = ? AND content_hash = ?',
+    ).get(this.projectId, signal.sourceKey, signal.contentHash) as { data?: string } | undefined;
+    if (existing?.data) {
+      const parsed = JSON.parse(existing.data) as EvolutionSignal;
+      if (parsed.id !== signal.id || (parsed.status === signal.status && parsed.updatedAt >= signal.updatedAt)) return parsed;
+    }
+    this.db.prepare(
+      `INSERT INTO evolution_signals(id, project_id, source_key, content_hash, status, updated_at, data)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at, data=excluded.data`,
+    ).run(signal.id, signal.projectId, signal.sourceKey, signal.contentHash, signal.status, signal.updatedAt, JSON.stringify(signal));
+    this.recordEvent('evolution.signal_saved', null, { signalId: signal.id, source: signal.source, status: signal.status }, `signal:${signal.sourceKey}:${signal.contentHash}`);
+    return signal;
+  }
+
+  listSignals(): EvolutionSignal[] {
+    const rows = this.db.prepare('SELECT data FROM evolution_signals WHERE project_id = ? ORDER BY updated_at DESC, id DESC').all(this.projectId) as Array<{ data: string }>;
+    return rows.map((row) => JSON.parse(row.data) as EvolutionSignal);
+  }
+
+  saveDeployment(deployment: DeploymentRecord): DeploymentRecord {
+    if (deployment.projectId !== this.projectId) throw new Error(`Deployment ${deployment.id} belongs to another project`);
+    this.db.prepare(
+      `INSERT INTO deployments(id, project_id, plan_id, commit_sha, status, updated_at, data)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at, data=excluded.data`,
+    ).run(deployment.id, deployment.projectId, deployment.planId, deployment.commitSha, deployment.status, deployment.updatedAt, JSON.stringify(deployment));
+    this.recordEvent('deployment.saved', null, { deploymentId: deployment.id, planId: deployment.planId, commitSha: deployment.commitSha, status: deployment.status });
+    return deployment;
+  }
+
+  getDeployment(id: string): DeploymentRecord | null {
+    const row = this.db.prepare('SELECT data FROM deployments WHERE id = ? AND project_id = ?').get(id, this.projectId) as { data?: string } | undefined;
+    return row?.data ? JSON.parse(row.data) as DeploymentRecord : null;
+  }
+
+  listDeployments(planId?: string): DeploymentRecord[] {
+    const rows = (planId
+      ? this.db.prepare('SELECT data FROM deployments WHERE project_id = ? AND plan_id = ? ORDER BY updated_at DESC, id DESC').all(this.projectId, planId)
+      : this.db.prepare('SELECT data FROM deployments WHERE project_id = ? ORDER BY updated_at DESC, id DESC').all(this.projectId)) as Array<{ data: string }>;
+    return rows.map((row) => JSON.parse(row.data) as DeploymentRecord);
+  }
+
+  saveControllerRelease(release: ControllerRelease): ControllerRelease {
+    this.db.prepare(
+      `INSERT INTO controller_releases(id, project_id, commit_sha, status, updated_at, data)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at, data=excluded.data`,
+    ).run(release.id, this.projectId, release.commitSha, release.status, release.updatedAt, JSON.stringify(release));
+    this.recordEvent('controller.release_saved', null, { releaseId: release.id, commitSha: release.commitSha, status: release.status });
+    return release;
+  }
+
+  listControllerReleases(): ControllerRelease[] {
+    const rows = this.db.prepare('SELECT data FROM controller_releases WHERE project_id = ? ORDER BY updated_at DESC, id DESC').all(this.projectId) as Array<{ data: string }>;
+    return rows.map((row) => JSON.parse(row.data) as ControllerRelease);
+  }
+
+  listEvents(type?: string): HarnessEvent[] {
+    const rows = (type
+      ? this.db.prepare('SELECT * FROM events WHERE project_id = ? AND type = ? ORDER BY created_at').all(this.projectId, type)
+      : this.db.prepare('SELECT * FROM events WHERE project_id = ? ORDER BY created_at').all(this.projectId)) as Array<Record<string, unknown>>;
+    return rows.map(eventRowToEvent);
   }
 
   transition(id: string, to: TaskState, patch: Partial<TaskRecord> = {}, now = Date.now()): TaskRecord {
@@ -464,6 +604,8 @@ export class PersistentTaskStore {
         attempts,
         identicalFailures,
         lastFailureFingerprint: fingerprint,
+        failureLineageId: task.failureLineageId ?? task.id,
+        lineageFailures: (task.lineageFailures ?? 0) + 1,
         lastError: error,
         leaseOwner: null,
         leaseExpiresAt: null,
@@ -490,6 +632,8 @@ export class PersistentTaskStore {
       attempts,
       identicalFailures,
       lastFailureFingerprint: fingerprint,
+      failureLineageId: task.failureLineageId ?? task.id,
+      lineageFailures: (task.lineageFailures ?? 0) + 1,
       lastError: error,
       leaseOwner: null,
       leaseExpiresAt: null,
@@ -537,6 +681,11 @@ export class PersistentTaskStore {
   getScorecard(id: string): RewardScorecard | null {
     const row = this.db.prepare('SELECT data FROM scorecards WHERE id = ?').get(id) as { data?: string } | undefined;
     return row?.data ? (JSON.parse(row.data) as RewardScorecard) : null;
+  }
+
+  listScorecards(): RewardScorecard[] {
+    const rows = this.db.prepare('SELECT data FROM scorecards ORDER BY created_at, id').all() as Array<{ data: string }>;
+    return rows.map((row) => JSON.parse(row.data) as RewardScorecard);
   }
 
   getSourceSnapshot(url: string): SourceSnapshot | null {
@@ -699,6 +848,11 @@ function rowToTask(row: TaskRow): TaskRecord {
         }
       : null,
     state: row.state,
+    continuations: parsed.continuations ?? 0,
+    waitKind: parsed.waitKind ?? null,
+    resumeAfter: parsed.resumeAfter ?? null,
+    failureLineageId: parsed.failureLineageId ?? null,
+    lineageFailures: parsed.lineageFailures ?? parsed.attempts ?? 0,
     priority: row.priority,
     attempts: row.attempts,
     maxAttempts: row.max_attempts,

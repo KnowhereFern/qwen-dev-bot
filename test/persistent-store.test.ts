@@ -88,6 +88,36 @@ describe('PersistentTaskStore', () => {
     store.close();
   });
 
+  it('carries identical failure history into a replacement task', () => {
+    const store = new PersistentTaskStore('project-lineage', makeTmp('persistent-lineage'));
+    const original = store.upsert({ issueNumber: 1, title: 'original', state: 'ready', maxAttempts: 5 });
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      store.claimNext('worker', 100, attempt * 1_000);
+      store.transition(original.id, 'active');
+      store.recordFailure(original.id, `compiler failed at /tmp/run-${attempt}/main.ts line ${attempt}`, 3);
+    }
+    const lineage = store.get(original.id);
+    store.transition(original.id, 'cancelled');
+    const replacement = store.upsert({
+      issueNumber: 2,
+      title: 'replacement',
+      state: 'ready',
+      maxAttempts: 5,
+      failureLineageId: lineage.failureLineageId,
+      lineageFailures: lineage.lineageFailures,
+      identicalFailures: lineage.identicalFailures,
+      lastFailureFingerprint: lineage.lastFailureFingerprint,
+    });
+    store.claimNext('worker', 100, 3_000);
+    store.transition(replacement.id, 'active');
+
+    const quarantined = store.recordFailure(replacement.id, 'compiler failed at /tmp/run-3/main.ts line 3', 3);
+    expect(quarantined.state).toBe('quarantined');
+    expect(quarantined.failureLineageId).toBe(original.id);
+    expect(quarantined.lineageFailures).toBe(3);
+    store.close();
+  });
+
   it('skips blocked ready tasks and claims them only after every dependency is done', () => {
     const blockedStore = new PersistentTaskStore('project-dependencies-blocked', makeTmp('dependencies-blocked'));
     blockedStore.upsert({ issueNumber: 1, title: 'dependency in progress', state: 'active', spec: taskSpec([]) });

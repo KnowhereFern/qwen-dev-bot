@@ -6,25 +6,27 @@ This document describes Fern's software-delivery product: a governed system for 
 
 ## Bottom line
 
-The repository has the core architecture for a long-running, multi-story development loop. It does **not** yet have everything operationally in place on this Mac, and it has **not** proved a 16-day unattended run.
+The repository now has the complete architecture for a repository-aware objective program, verified staging, continuous maintenance, and controlled controller evolution. It has **not** yet completed the measured Festival SOS run, seven-day observation, or N to N+1 promotion and rollback proof.
 
 The honest status is:
 
-- **Architecture:** ready for a controlled live demo.
-- **Current machine:** not running yet. No target project is registered and no persistent worker service is installed.
+- **Architecture:** ready for the controlled Festival SOS live run after this release is merged and installed.
+- **Current machine:** installation, registration, and service state must be rechecked against the merged release before starting the clock.
 - **Provider:** Qwen Code `0.22.1` is active. Token Plan Personal and Team are supported through their dedicated key and endpoint configuration.
-- **Release proof:** deterministic tests and mocked production boundaries pass; a real end-to-end soak is still required before calling this stable `v1.0.0`.
+- **Release proof:** deterministic tests cover the new program, staging, feedback, recovery, and controller-release boundaries; the real observation periods remain required before stable `v1.0.0` or a proven self-evolving claim.
 
-A normal user should only need to provide one requirements file, run guided setup, review the proposed plan, and approve it. The harness handles the individual stories after that.
+A normal user provides one objective file, runs guided setup, reviews the repository assessment and proposed program, and approves it. The harness handles bounded execution, reassessment, staging verification, repairs, and in-scope maintenance after that.
 
 ## What a 16-day run actually is
 
 It is not one enormous model conversation. It is a durable supervisor repeatedly starting bounded Qwen sessions and connecting them through persisted state:
 
 ```text
-PROJECT.md
+PROJECT.md + exact clean repository commit
    ↓
-draft epic + dependency-ordered stories
+parallel read-only assessment + evidence-backed coverage
+   ↓
+draft program + dependency-ordered waves
    ↓
 human reviews and approves the plan once
    ↓
@@ -39,7 +41,13 @@ test exact candidate commit + calculate reward scorecard
    ├─ FAIL  → persist verifier feedback → retry the same story/session
    └─ CRASH → service restarts → lease expires → recover durable state
                                                    ↓
-                                      next unblocked dependency
+                                      repair or next assessment
+   ↓
+immutable staging deploy → reported revision + lifecycle checks
+   ↓
+objective acceptance audit → next revised wave or delivered
+   ↓
+maintenance signals → relevant work or wait
 ```
 
 The default implementation window is one hour, with 200 tool calls and 80 session turns. Reaching a budget is not treated as a failed attempt: the story returns to `ready`, keeps its Qwen session ID and worktree, and continues in a later bounded run.
@@ -49,6 +57,8 @@ The default implementation window is one hour, with 200 tool calls and 80 sessio
 | Stage | Current implementation |
 | --- | --- |
 | Requirements to stories | The portfolio planner turns one in-repository requirements file into a bounded acyclic story graph. The coordinator persists the plan and requires explicit approval before work becomes executable. |
+| Repository assessment | Product, architecture, verification, and operations assessments run read-only against an exact clean commit. A synthesis maps each objective requirement to a status and validates referenced files against the snapshot. |
+| Program reassessment | Only the current dependency wave executes. After it finishes, staging and repository evidence drive an objective audit and a persisted revision of unstarted work. Material changes stop for approval. |
 | Claim story | A transactional SQLite `BEGIN IMMEDIATE` claim selects only `ready` stories whose dependencies are `done`, then assigns an expiring lease. |
 | Resume Qwen | Each task persists its Qwen session ID. The next bounded run passes `--resume`; unfinished work uses `/goal resume`. Verifier feedback creates a repaired Goal inside the resumed session so prior context is retained. |
 | Bounded implementation | Qwen runs in an isolated Git worktree with sandboxing, protected paths, a saved workflow, one mutating implementer, bounded read-only agents, and hard time/tool/turn/token limits. |
@@ -58,6 +68,9 @@ The default implementation window is one hour, with 200 tool calls and 80 sessio
 | Fail | The error and a fingerprint are stored. The task returns to `ready`, and the next run receives the failure as repair feedback. Five total attempts and three identical failures are the defaults; repeated failures stop in `failed` or `quarantined`. |
 | Crash | `launchd` or `systemd` restarts the worker. An expired implementation lease is routed back through recovery; PR/CI leases are cleared and reconciled from GitHub. The owned branch/worktree and saved Qwen session are reused. |
 | Next story | A dependent story cannot be claimed until its prerequisite task reaches `done` after post-merge verification. |
+| Staging | The deployment controller checks out the intended merge commit, targets explicit existing Railway identifiers or a configured command, polls one deployment to terminal state, verifies the served revision, and runs lifecycle gates. |
+| Maintenance | GitHub, CI, staging, metrics, and allowlisted-source findings are provenance-preserving and deduplicated. Accepted in-scope signals can trigger reassessment; an empty backlog waits. |
+| Harness successor | A credential-free immutable candidate must pass fixed evaluations and Node/Python/Go/Rust canaries. A protected launcher promotes only at idle and can restore the baseline during probation. |
 
 Primary code paths: [supervisor](src/supervisor.ts), [persistent store](src/core/persistent-store.ts), [Qwen executor](src/qwen/qwen-code-executor.ts), [Git worktrees](src/git/git-workspace.ts), [reward engine](src/rewards/engine.ts), [worker daemon](src/daemon.ts), and [service installer](src/installer/service.ts).
 
@@ -101,6 +114,10 @@ It does **not** keep the worker alive. Long-run continuity comes from the servic
 | Capability | Status | Evidence or gap |
 | --- | --- | --- |
 | Multi-story requirements intake | Ready | Durable plan, dependency validation, idempotent requirements hash, and explicit approval are implemented. |
+| Evidence-backed objective program | Ready for live proof | Exact repository assessment, objective coverage, frozen decisions, waves, revisions, and acceptance audit are implemented and deterministically tested. |
+| Staging and repair loop | Ready for Railway live proof | Exact-revision deployment, terminal-status polling, health revision verification, lifecycle gates, durable reconciliation, and repair deduplication are implemented. |
+| Continuous maintenance signals | Ready for live proof | Provenance, relevance classification, deduplication, material approval, and idle polling are implemented. |
+| Controlled self-evolution | Implemented, intentionally locked | Evaluation, four-stack canaries, promotion, protected launcher handoff, probation, and rollback exist; enabling requires Festival SOS delivery plus its observation period. |
 | Bounded Qwen continuation | Ready | Session IDs, `/goal resume`, hard budgets, and no-attempt continuation on budget exit are implemented. |
 | Durable dispatch and lease recovery | Ready with caveat | SQLite/WAL, atomic claims, heartbeats, retries, and quarantine are implemented. Checkpoints are written but not read for restoration. |
 | Exact-commit testing and rewards | Ready | Gates and reward review run before push against a detached worktree at the candidate SHA. |
@@ -109,8 +126,8 @@ It does **not** keep the worker alive. Long-run continuity comes from the servic
 | Persistent worker | Implemented, not installed here | macOS uses `RunAtLoad` plus `KeepAlive`; Linux uses `Restart=always`. This Mac currently has no worker service. |
 | Current Qwen executable | Ready | `PATH` resolves Qwen Code version `0.22.1`. |
 | Current harness installation | Not ready | `qwen-harness` is not on `PATH`; the local source command can still be used. |
-| Registered target | Not ready | The local registry contains zero projects. |
-| Configured model credential | Not ready | A standard credential is present in Qwen user settings; the selected Token Plan credential and endpoint still need to be connected and verified for the test project. |
+| Registered target | Recheck required | Festival SOS is the designated target, but registration must be verified after the merged release is installed. |
+| Configured model credential | Recheck required | The selected Token Plan credential and endpoint must pass `doctor --live` without copying the secret into tracked configuration. |
 | Always-on host | Not established | A sleeping or powered-off Mac does not execute work. A 16-day run needs an always-on host and network. |
 | Health alerting | Missing | Status and logs exist, but there is no proactive alert when the worker stops, a credential expires, disk fills, or a task is quarantined. |
 | State backup and log retention | Missing | SQLite and JSONL state are durable on one disk, but there is no scheduled backup, integrity check, or log rotation/retention policy. |
@@ -127,16 +144,18 @@ These are the minimum blockers, not optional polish:
 5. Keep the default `autoMerge` setting enabled if no human will merge PRs, and configure the required branch-protection checks.
 6. Run on an always-on machine. On macOS, the LaunchAgent also assumes the user session is available; sleep still pauses execution.
 7. Add at least a simple external heartbeat alert plus daily SQLite backup/integrity check and log rotation before trusting a 16-day unattended period.
-8. Prove it progressively: one live story, a three-story dependency chain, a forced restart/resume test, 24 hours, three days, then 16 days.
+8. Prove it progressively: repository assessment, one wave, forced staging failure and repair, restart/resume and duplicate-effect recovery, objective audit, seven-day observation, then controller promotion and rollback.
 
-## Minimum demo project
+## Designated proof project
 
-Do not start with a large production application. The minimum useful demo is an existing clean GitHub repository with:
+Festival SOS is the first measured project. Before starting, its existing repository must be clean, pushed, repeatably installable, and connected to an existing staging environment with a revision health endpoint. Its objective must cover the complete festival runner-network vision, while production sales and payouts remain outside staging authority.
+
+The target needs:
 
 - a lockfile and repeatable dependency install;
 - at least `build` and `test` commands;
-- a small product objective and observable definition of done;
-- three reviewable stories with dependencies;
+- the complete approved objective and observable definition of done;
+- reviewable outcomes with dependencies proposed from repository evidence;
 - one browser E2E path if browser/visual work is part of the intended use case.
 
 A simple dependency chain is enough:
@@ -192,7 +211,7 @@ node bin/qwen-harness.mjs logs /absolute/path/to/demo-project --lines 100
 
 Once setup has linked `qwen-harness`, the shorter commands work without `node bin/qwen-harness.mjs`.
 
-## Definition of a successful 16-day proof
+## Definition of a successful autonomous proof
 
 Do not measure success only by commit count. A credible run should show:
 
@@ -206,6 +225,10 @@ Do not measure success only by commit count. A credible run should show:
 - state survived worker restarts and was backed up;
 - worker uptime and stalled/quarantined tasks were externally visible;
 - no protected harness files or unrelated target work were modified.
+- staging failure created or resumed one repair and the repaired merge was reverified successfully;
+- the objective audit, rather than issue count, determined delivery;
+- the seven-day observation recorded waiting separately from useful work;
+- controller N promoted a validated N+1 and rollback restored N without unreadable state.
 
 ## Runtime documentation
 

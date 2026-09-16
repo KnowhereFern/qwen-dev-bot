@@ -10,7 +10,7 @@ For harness tasks:
 - keep research/review agents read-only and require structured findings;
 - run relevant project gates before declaring completion;
 - never modify protected harness governance or retrieve credentials;
-- preserve frozen technology and deployment decisions exactly, within their stated build-and-test-only authority;
+- preserve frozen technology and deployment decisions exactly; implementation sessions remain build-and-test-only even when the separate controller has configured staging authority;
 - report concrete changed files, tests, assumptions, and remaining limits.
 
 The external supervisor—not this session—owns leases, reward scoring, PR creation, merge authority, and the final definition of done.

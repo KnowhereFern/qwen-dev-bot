@@ -4,6 +4,7 @@ import {
   cpSync,
   existsSync,
   lstatSync,
+  mkdtempSync,
   mkdirSync,
   readFileSync,
   realpathSync,
@@ -23,7 +24,7 @@ import {
   serializeProjectConfig,
   validateProjectConfig,
 } from '../core/config.js';
-import { projectIdFor } from '../core/state-paths.js';
+import { harnessStateRoot, projectIdFor } from '../core/state-paths.js';
 import type { ProjectConfig, QwenBillingPlan } from '../core/types.js';
 import { ProjectRegistry } from '../registry.js';
 import { runProcess } from '../runtime/safe-process.js';
@@ -49,6 +50,7 @@ export interface InstallAnswers {
   qwenBillingPlan: QwenBillingPlan;
   autoMerge: boolean;
   enableCommunity: boolean;
+  enableProgram: boolean;
   installQwen: boolean;
   linkExtension: boolean;
   installMultimodal: boolean;
@@ -121,6 +123,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
     qwenBillingPlan: existingConfig?.qwen.billingPlan ?? 'standard',
     autoMerge: existingConfig?.worker.autoMerge ?? true,
     enableCommunity: existingConfig?.intake.communityEnabled ?? false,
+    enableProgram: existingConfig?.program.enabled ?? true,
     installQwen: !options.yes && !qwenCodeVersionAtLeast(qwenRuntime.version),
     linkExtension: previousReceipt?.extensionLinked ?? true,
     installMultimodal: false,
@@ -156,6 +159,9 @@ export async function installProject(options: InstallOptions): Promise<{ config:
       );
     }
   }
+  const runtimePackageRoot = !options.dryRun && (answers.linkExtension || answers.installCli || answers.installService)
+    ? await installImmutableHarnessRuntime(packageRoot)
+    : packageRoot;
   const config = existingConfig ?? defaultProjectConfig(root, answers.projectName, answers.githubRepo);
   config.project.root = root;
   config.project.name = answers.projectName;
@@ -166,6 +172,11 @@ export async function installProject(options: InstallOptions): Promise<{ config:
   config.qwen.command = qwenRuntime.command;
   config.worker.autoMerge = answers.autoMerge;
   config.intake.communityEnabled = answers.enableCommunity;
+  config.program.enabled = answers.enableProgram;
+  if (answers.enableProgram && config.configVersion === 1) config.configVersion = 2;
+  for (const protectedPath of defaultProjectConfig(root).protectedPaths) {
+    if (!config.protectedPaths.includes(protectedPath)) config.protectedPaths.push(protectedPath);
+  }
   if (answers.installMultimodal && !config.qwen.allowedMcpServers.includes(QWEN_MM_CORE_MCP_SERVER)) {
     config.qwen.allowedMcpServers.push(QWEN_MM_CORE_MCP_SERVER);
   }
@@ -271,11 +282,11 @@ export async function installProject(options: InstallOptions): Promise<{ config:
     );
   }
   if (answers.linkExtension) {
-    summary.push(`${options.dryRun ? 'would link' : 'linked'} Qwen extension from ${packageRoot}`);
+    summary.push(`${options.dryRun ? 'would link' : 'linked'} Qwen extension from ${runtimePackageRoot}`);
     if (!options.dryRun) {
       const linked = await runProcess({
         command: config.qwen.command,
-        args: ['extensions', 'link', packageRoot],
+        args: ['extensions', 'link', runtimePackageRoot],
         cwd: root,
         input: 'y\n',
         timeoutMs: 60_000,
@@ -350,7 +361,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
       const linked = await runProcess({
         command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
         args: ['link', '--ignore-scripts'],
-        cwd: packageRoot,
+        cwd: runtimePackageRoot,
         timeoutMs: 2 * 60_000,
       });
       if (linked.exitCode !== 0) throw new Error(`Could not expose qwen-harness CLI: ${linked.stderr}`);
@@ -381,7 +392,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
     if (answers.persistCredentials && !credential) {
       throw new Error(`--persist-api-key requires ${config.qwen.credentialEnvKey} in Qwen user settings or the setup process environment`);
     }
-    service = await installWorkerService(path.join(packageRoot, 'bin', 'qwen-harness.mjs'), {
+    service = await installWorkerService(path.join(runtimePackageRoot, 'bin', 'qwen-harness.mjs'), {
       dryRun: Boolean(options.dryRun),
       persistCredentials: answers.persistCredentials,
       credentialEnvKey: config.qwen.credentialEnvKey,
@@ -483,6 +494,7 @@ async function guidedAnswers(defaults: InstallAnswers): Promise<InstallAnswers> 
     const qwenCredentialEnvKey = await ask('Qwen credential name (press Enter to accept)', suggestedCredential);
     const autoMerge = await yesNo('Enable automatic merge after every gate passes?', defaults.autoMerge);
     const enableCommunity = await yesNo('Scan allowlisted community sources for reviewable improvement ideas?', defaults.enableCommunity);
+    const enableProgram = await yesNo('Enable repository-aware objective programs and dependency waves?', defaults.enableProgram);
     const installQwen = await yesNo(
       `Install/upgrade Qwen Code globally with npm (requires ${MIN_QWEN_CODE_VERSION}+)?`,
       defaults.installQwen,
@@ -509,6 +521,7 @@ async function guidedAnswers(defaults: InstallAnswers): Promise<InstallAnswers> 
       qwenBillingPlan,
       autoMerge,
       enableCommunity,
+      enableProgram,
       installQwen,
       linkExtension,
       installMultimodal,
@@ -911,6 +924,45 @@ function findPackageRoot(): string {
     cursor = path.dirname(cursor);
   }
   throw new Error('Cannot locate qwen-dev-harness package root');
+}
+
+async function installImmutableHarnessRuntime(sourceRoot: string): Promise<string> {
+  const version = readHarnessVersion(sourceRoot);
+  if (!/^[0-9A-Za-z][0-9A-Za-z._-]*$/.test(version)) throw new Error(`Harness version is unsafe for installation: ${version}`);
+  const installedRoot = path.join(harnessStateRoot(), 'controller', 'installed', version);
+  const installedPackage = path.join(installedRoot, 'node_modules', 'qwen-dev-bot');
+  if (existsSync(path.join(installedPackage, 'bin', 'qwen-harness.mjs'))) return installedPackage;
+  const parent = path.dirname(installedRoot);
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const staging = mkdtempSync(path.join(parent, `.staging-${version}-`));
+  try {
+    const packed = await runProcess({
+      command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
+      args: ['pack', '--json', '--pack-destination', staging, sourceRoot],
+      cwd: sourceRoot,
+      timeoutMs: 5 * 60_000,
+      maxOutputBytes: 5 * 1024 * 1024,
+    });
+    if (packed.exitCode !== 0) throw new Error(`Could not pack immutable harness runtime: ${packed.stderr || packed.stdout}`);
+    const metadata = JSON.parse(packed.stdout) as Array<{ filename?: string }>;
+    const filename = metadata[0]?.filename;
+    if (!filename || path.basename(filename) !== filename) throw new Error('npm pack did not return a safe archive filename');
+    const prefix = path.join(staging, 'runtime');
+    const installed = await runProcess({
+      command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
+      args: ['install', '--prefix', prefix, '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', path.join(staging, filename)],
+      cwd: staging,
+      timeoutMs: 10 * 60_000,
+      maxOutputBytes: 10 * 1024 * 1024,
+    });
+    if (installed.exitCode !== 0) throw new Error(`Could not install immutable harness runtime: ${installed.stderr || installed.stdout}`);
+    if (existsSync(installedRoot)) rmSync(installedRoot, { recursive: true, force: true });
+    renameSync(prefix, installedRoot);
+    if (!existsSync(path.join(installedPackage, 'bin', 'qwen-harness.mjs'))) throw new Error('Immutable harness runtime is incomplete');
+    return installedPackage;
+  } finally {
+    if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
+  }
 }
 
 async function detectRepository(root: string): Promise<string> {

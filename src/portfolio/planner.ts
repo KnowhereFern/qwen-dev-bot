@@ -3,6 +3,7 @@ import path from 'node:path';
 import type {
   DeploymentDecision,
   ProjectConfig,
+  RepositoryAssessment,
   ReasoningEffort,
   TechnologyDecision,
   TechnologyPolicy,
@@ -25,6 +26,7 @@ export interface PortfolioStoryDraft {
   rollback: string;
   technologyDecisionIds: string[];
   deploymentDecisionIds: string[];
+  coverageIds?: string[];
 }
 
 export interface PortfolioDraft {
@@ -58,7 +60,11 @@ export class PortfolioPlanner {
     private readonly model: PortfolioPlanningModel,
   ) {}
 
-  async plan(document: RequirementsDocument, maxStories = DEFAULT_MAX_PORTFOLIO_STORIES): Promise<PortfolioDraft> {
+  async plan(
+    document: RequirementsDocument,
+    maxStories = DEFAULT_MAX_PORTFOLIO_STORIES,
+    assessment?: RepositoryAssessment,
+  ): Promise<PortfolioDraft> {
     assertMaxStories(maxStories);
     const gateIds = this.config.gates.map((gate) => gate.id);
     const rewardIds = this.config.rewards.criteria.map((criterion) => criterion.id);
@@ -75,10 +81,12 @@ export class PortfolioPlanner {
         'Return exactly: {title, objective, constraints, definitionOfDone, technologyDecisions, deploymentDecisions, stories}.',
         'Technology decisions contain: id, category, technology, rationale. Include only choices relevant to this plan.',
         'Deployment decisions contain: id, component, provider, environment, rationale. environment is local, preview, staging, or production; provider must reference a technology decision.',
-        'Each story must contain: key, title, goal, acceptanceCriteria, constraints, requiredGateIds, rewardCriterionIds, risk, dependsOn, rollback, technologyDecisionIds, deploymentDecisionIds.',
+        'Each story must contain: key, title, goal, acceptanceCriteria, constraints, requiredGateIds, rewardCriterionIds, risk, dependsOn, rollback, technologyDecisionIds, deploymentDecisionIds, coverageIds.',
+        'When repository coverage is supplied, create work only for partial, missing, or unverified requirements and map every story to at least one coverage id.',
+        'Do not create file-oriented cleanup, speculative infrastructure, or stories for capabilities proven implemented.',
         'A story may reference only decision ids that it actually needs.',
         'Approved technologies are preferred. Any other choice is an exception that will be highlighted for explicit plan approval.',
-        'All deployment decisions are build-and-test only. Never infer credentials or authority to create resources, deploy, or operate live systems.',
+        'Never infer credentials, resource creation, production authority, or a new deployment target. A decision matching the separately configured existing staging provider may receive staging authority from the deterministic controller after validation; implementation sessions remain build-and-test-only.',
         'Keys must be stable short identifiers such as S1. Dependencies use those keys and must form an acyclic graph.',
         'Each story must be independently reviewable, small enough for one pull request, and have objectively testable acceptance criteria.',
       ].join('\n'),
@@ -88,12 +96,32 @@ export class PortfolioPlanner {
         `Allowed reward ids: ${rewardIds.join(', ') || '(none)'}`,
         `Approved technology catalog: ${approvedTechnologies || '(none)'}`,
         `Delivery authority: ${this.config.technologyPolicy.authority}`,
+        `Repository assessment: ${assessment ? JSON.stringify(assessment) : '(not enabled)'}`,
         `<requirements path="${escapeAttribute(document.sourcePath)}">`,
         document.content,
         '</requirements>',
       ].join('\n'),
     });
-    return validatePortfolioDraft(response.value, gateIds, rewardIds, maxStories, this.config.technologyPolicy);
+    const draft = validatePortfolioDraft(
+      response.value,
+      gateIds,
+      rewardIds,
+      maxStories,
+      this.config.technologyPolicy,
+      assessment?.coverage.map((entry) => entry.id),
+    );
+    return {
+      ...draft,
+      deploymentDecisions: draft.deploymentDecisions.map((decision) => ({
+        ...decision,
+        authority:
+          this.config.deployment.staging.enabled &&
+          decision.environment === 'staging' &&
+          decision.provider.toLowerCase() === this.config.deployment.staging.provider.toLowerCase()
+            ? 'staging'
+            : 'build-test-only',
+      })),
+    };
   }
 }
 
@@ -130,6 +158,7 @@ export function validatePortfolioDraft(
     approved: [],
     requirePlanApprovalForExceptions: true,
   },
+  coverageIds?: string[],
 ): PortfolioDraft {
   assertMaxStories(maxStories);
   if (!isRecord(value)) throw new Error('Portfolio planner output must be an object');
@@ -158,6 +187,7 @@ export function validatePortfolioDraft(
       rewardIds,
       new Set(technologyDecisions.map((decision) => decision.id)),
       new Set(deploymentDecisions.map((decision) => decision.id)),
+      coverageIds ? new Set(coverageIds) : undefined,
     ),
   );
   const keys = new Set<string>();
@@ -189,6 +219,7 @@ function validateStory(
   rewardIds: string[],
   technologyDecisionIds: Set<string>,
   deploymentDecisionIds: Set<string>,
+  allowedCoverageIds?: Set<string>,
 ): PortfolioStoryDraft {
   if (!isRecord(value)) throw new Error(`Portfolio story ${index + 1} must be an object`);
   const key = requiredText(value.key, `stories[${index}].key`).toUpperCase();
@@ -211,6 +242,12 @@ function validateStory(
   const storyDeploymentIds = unique(
     textArray(value.deploymentDecisionIds, `${key}.deploymentDecisionIds`).map((id) => id.toUpperCase()),
   );
+  const storyCoverageIds = value.coverageIds === undefined && !allowedCoverageIds
+    ? []
+    : unique(textArray(value.coverageIds, `${key}.coverageIds`).map((id) => id.toUpperCase()));
+  if (allowedCoverageIds && storyCoverageIds.length === 0) throw new Error(`Story ${key} must map to repository coverage`);
+  const unknownCoverage = storyCoverageIds.find((id) => allowedCoverageIds && !allowedCoverageIds.has(id));
+  if (unknownCoverage) throw new Error(`Story ${key} names unknown coverage id ${unknownCoverage}`);
   const unknownTechnology = storyTechnologyIds.find((id) => !technologyDecisionIds.has(id));
   if (unknownTechnology) throw new Error(`Story ${key} names unknown technology decision ${unknownTechnology}`);
   const unknownDeployment = storyDeploymentIds.find((id) => !deploymentDecisionIds.has(id));
@@ -228,6 +265,7 @@ function validateStory(
     rollback: requiredText(value.rollback, `${key}.rollback`),
     technologyDecisionIds: storyTechnologyIds,
     deploymentDecisionIds: storyDeploymentIds,
+    coverageIds: storyCoverageIds,
   };
 }
 

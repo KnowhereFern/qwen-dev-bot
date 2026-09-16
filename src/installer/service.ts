@@ -44,7 +44,8 @@ export async function installWorkerService(
     mkdirSync(path.join(stateRoot, 'logs'), { recursive: true, mode: 0o700 });
     writeWorkerEnvironment(envFile, stateRoot, credentials, workerBaseUrl);
   }
-  const programArguments = [process.execPath, `--env-file-if-exists=${envFile}`, binPath, 'worker'];
+  const launcherPath = path.join(path.dirname(binPath), 'qwen-harness-launcher.mjs');
+  const programArguments = [process.execPath, `--env-file-if-exists=${envFile}`, existsSync(launcherPath) ? launcherPath : binPath, 'worker'];
   if (process.platform === 'darwin') {
     const file = path.join(os.homedir(), 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`);
     const legacyFile = path.join(os.homedir(), 'Library', 'LaunchAgents', `${LEGACY_LAUNCHD_LABEL}.plist`);

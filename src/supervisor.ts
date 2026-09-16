@@ -13,6 +13,7 @@ import type { QwenExecutor } from './qwen/qwen-code-executor.js';
 import { UniversalRewardEngine } from './rewards/engine.js';
 import { resolveVisualArtifacts } from './rewards/evaluators.js';
 import { GateRunner } from './rewards/gates.js';
+import { prepareProjectCheckout } from './runtime/checkout-preflight.js';
 
 export const REQUIRED_GITHUB_CHECKS = [
   'Fern Delivery Harness / CI',
@@ -48,6 +49,7 @@ export class HarnessSupervisor {
   async tick(signal?: AbortSignal): Promise<SupervisorTickResult> {
     try {
       const recovered = await this.recoverExpiredLeases();
+      this.resumeProviderWaits();
       const community = this.community
         ? await this.community.scan()
         : { checked: 0, changed: 0, created: 0, skipped: 0, failed: 0 };
@@ -72,7 +74,12 @@ export class HarnessSupervisor {
           action: latest ? `reconciled:${reconciled.length}:${latest.state}` : 'idle',
         };
       }
-      await this.executeTask(task, signal);
+      this.store.recordEvent('task.active_started', task.id, { phase: 'implementation' });
+      try {
+        await this.executeTask(task, signal);
+      } finally {
+        this.store.recordEvent('task.active_finished', task.id, { phase: 'implementation' });
+      }
       return { community, ingested, recovered, processedTaskId: task.id, action: 'executed' };
     } finally {
       const portfolioPlans = this.store.listPortfolioPlans().filter((plan) =>
@@ -119,6 +126,7 @@ export class HarnessSupervisor {
           continue;
         }
         const existing = this.store.findByIssue(issue.number);
+        const lineage = existing ? null : repairLineage(issue.body, this.store);
         const task = this.store.upsert({
           issueNumber: issue.number,
           title: issue.title,
@@ -128,6 +136,10 @@ export class HarnessSupervisor {
           state: existing?.state ?? 'normalized',
           spec: parsed,
           maxAttempts: this.config.worker.maxAttempts,
+          failureLineageId: lineage?.failureLineageId ?? null,
+          lineageFailures: lineage?.lineageFailures ?? 0,
+          identicalFailures: lineage?.identicalFailures ?? 0,
+          lastFailureFingerprint: lineage?.lastFailureFingerprint ?? null,
         });
         if (task.state === 'intake') this.store.transition(task.id, 'normalized', { spec: parsed });
         const current = this.store.get(task.id);
@@ -165,6 +177,7 @@ export class HarnessSupervisor {
       });
       this.store.recordEvent('intake.normalized', null, { sourceIssue: issue.number, normalizedIssue: created.number }, key);
       await this.github.comment(issue.number, `Normalized for autonomous execution as #${created.number}.`);
+      const lineage = selfRepair ? repairLineage(issue.body, this.store) : null;
       this.store.upsert({
         issueNumber: created.number,
         title: created.title,
@@ -174,6 +187,10 @@ export class HarnessSupervisor {
         state: 'normalized',
         spec: result.spec,
         maxAttempts: this.config.worker.maxAttempts,
+        failureLineageId: lineage?.failureLineageId ?? null,
+        lineageFailures: lineage?.lineageFailures ?? 0,
+        identicalFailures: lineage?.identicalFailures ?? 0,
+        lastFailureFingerprint: lineage?.lastFailureFingerprint ?? null,
       });
       const task = this.store.findByIssue(created.number) as TaskRecord;
       this.store.transition(task.id, 'ready');
@@ -205,6 +222,7 @@ export class HarnessSupervisor {
       };
       executionHeartbeatTimer = setInterval(heartbeat, heartbeatInterval);
       executionHeartbeatTimer.unref();
+      await prepareProjectCheckout(worktree.path, signal);
       const qwenResult = await this.qwen.execute({
         task,
         worktree: worktree.path,
@@ -220,12 +238,41 @@ export class HarnessSupervisor {
         qwenWorkflowRunId: qwenResult.workflowRunId,
       });
       if (qwenResult.needsContinuation) {
+        const continuations = (task.continuations ?? 0) + 1;
         this.checkpoint(task, {
           goalState: qwenResult.goalState,
           goalReason: qwenResult.goalReason,
           usage: qwenResult.usage,
+          continuations,
         });
-        this.store.transition(task.id, 'ready', { leaseOwner: null, leaseExpiresAt: null, lastError: null });
+        if (qwenResult.continuationKind === 'provider') {
+          const resumeAfter = Date.now() + Math.max(this.config.worker.pollIntervalMs, 30_000);
+          this.store.transition(task.id, 'waiting', {
+            continuations,
+            waitKind: 'provider',
+            resumeAfter,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            lastError: qwenResult.goalReason ?? 'Qwen provider is temporarily unavailable',
+          });
+          this.store.recordEvent('task.provider_wait', task.id, { continuations, resumeAfter, reason: qwenResult.goalReason });
+        } else if (continuations >= this.config.worker.maxContinuations) {
+          this.store.patch(task.id, { continuations });
+          this.store.recordFailure(
+            task.id,
+            `Qwen paused ${continuations} consecutive times without completing the goal; last reason: ${qwenResult.goalReason ?? 'budget or provider wait'}`,
+            this.config.worker.identicalFailureLimit,
+          );
+        } else {
+          this.store.transition(task.id, 'ready', {
+            continuations,
+            waitKind: null,
+            resumeAfter: null,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            lastError: null,
+          });
+        }
         return;
       }
 
@@ -243,6 +290,7 @@ export class HarnessSupervisor {
       );
       let scorecard: RewardScorecard;
       try {
+        await prepareProjectCheckout(verificationPath, signal);
         const gateResults = await this.gates.runAll(this.config.gates, verificationPath, changedFiles, signal);
         const failedGate = gateResults.find((gate) => gate.required && gate.applicable && !gate.ok);
         if (failedGate) {
@@ -325,6 +373,7 @@ export class HarnessSupervisor {
         reconciled.map((candidate) => candidate.id),
       );
       if (!task) break;
+      this.store.recordEvent('task.active_started', task.id, { phase: 'reconciliation', state: task.state });
       try {
         await this.reconcileWithLease(task, signal);
       } catch (error) {
@@ -347,6 +396,8 @@ export class HarnessSupervisor {
         } else {
           await this.failAttempt(task.id, error);
         }
+      } finally {
+        this.store.recordEvent('task.active_finished', task.id, { phase: 'reconciliation' });
       }
       reconciled.push(this.store.get(task.id));
     }
@@ -438,6 +489,7 @@ export class HarnessSupervisor {
     const verificationPath = await this.git.createDetachedWorktree(task.mergeSha, `postmerge-${task.issueNumber}`);
     let failure: string | null = null;
     try {
+      await prepareProjectCheckout(verificationPath, signal);
       const results = await this.gates.runAll(this.config.gates, verificationPath, [], signal);
       throwIfAborted(signal);
       const failed = results.filter((gate) => gate.required && gate.applicable && !gate.ok);
@@ -524,9 +576,21 @@ export class HarnessSupervisor {
         `Lease expired while task was ${task.state}; recovery will reconcile existing Git and GitHub state.`,
         this.config.worker.identicalFailureLimit,
       );
+      this.store.recordEvent('task.execution_recovered', task.id, { from: task.state, to: result.state });
       this.logger.warn('expired task recovered', { taskId: task.id, from: task.state, to: result.state });
     }
     return expired.length;
+  }
+
+  private resumeProviderWaits(now = Date.now()): number {
+    const waiting = this.store.list(['waiting']).filter((task) =>
+      task.waitKind === 'provider' && task.resumeAfter !== null && task.resumeAfter !== undefined && task.resumeAfter <= now,
+    );
+    for (const task of waiting) {
+      this.store.transition(task.id, 'ready', { waitKind: null, resumeAfter: null, lastError: null });
+      this.store.recordEvent('task.provider_resumed', task.id, { continuations: task.continuations ?? 0 });
+    }
+    return waiting.length;
   }
 
   private async failAttempt(taskId: string, error: unknown): Promise<void> {
@@ -572,6 +636,19 @@ export class HarnessSupervisor {
     });
   }
 
+}
+
+function repairLineage(body: string, store: PersistentTaskStore): Pick<TaskRecord, 'failureLineageId' | 'lineageFailures' | 'identicalFailures' | 'lastFailureFingerprint'> | null {
+  const originIssue = /Origin task:\s*#(\d+)/i.exec(body)?.[1];
+  if (!originIssue) return null;
+  const origin = store.findByIssue(Number(originIssue));
+  if (!origin) return null;
+  return {
+    failureLineageId: origin.failureLineageId ?? origin.id,
+    lineageFailures: origin.lineageFailures ?? 0,
+    identicalFailures: origin.identicalFailures,
+    lastFailureFingerprint: origin.lastFailureFingerprint,
+  };
 }
 
 function renderPullRequestBody(task: TaskRecord, summary: string, scorecard: RewardScorecard): string {

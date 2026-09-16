@@ -21,9 +21,24 @@ describe('project configuration invariants', () => {
     ]);
   });
 
+  it('discovers standard Python, Go, and Rust checks without project-specific code', () => {
+    const root = makeTmp('config-multistack');
+    writeFileSync(path.join(root, 'pyproject.toml'), '[project]\nname="fixture"\n');
+    writeFileSync(path.join(root, 'go.mod'), 'module example.test/fixture\n');
+    writeFileSync(path.join(root, 'Cargo.toml'), '[package]\nname="fixture"\nversion="0.1.0"\n');
+    expect(discoverGates(root).map((gate) => gate.id)).toEqual(['python-test', 'go-test', 'rust-test']);
+  });
+
   it('accepts the generated Qwen-native template configuration', () => {
     const config = defaultProjectConfig(makeTmp('config-valid'), 'fixture', 'owner/fixture');
     expect(config.worker.autoMerge).toBe(true);
+    expect(validateProjectConfig(config)).toBe(config);
+  });
+
+  it('keeps legacy v1 program authority disabled while accepting its existing task loop', () => {
+    const config = defaultProjectConfig(makeTmp('config-v1'), 'fixture', 'owner/fixture');
+    config.configVersion = 1;
+    config.program.enabled = false;
     expect(validateProjectConfig(config)).toBe(config);
   });
 
@@ -104,5 +119,14 @@ describe('project configuration invariants', () => {
     const tooManyTurns = defaultProjectConfig(makeTmp('config-workflow-turns'), 'fixture', 'owner/fixture');
     tooManyTurns.qwen.maxWorkflowSubagentTurns = 501;
     expect(() => validateProjectConfig(tooManyTurns)).toThrow(/hard ceilings/);
+  });
+
+  it('requires all four stack canaries before self-hosting can be enabled', () => {
+    const config = defaultProjectConfig(makeTmp('config-self-hosting'), 'fixture', 'owner/fixture');
+    config.selfHosting.enabled = true;
+    config.selfHosting.requiredProjectId = 'delivery-proof';
+    config.selfHosting.candidateRoot = config.project.root;
+    config.selfHosting.canaryCommands = [{ stack: 'node', command: 'node', args: ['--version'] }];
+    expect(() => validateProjectConfig(config)).toThrow(/Node, Python, Go, and Rust canary/);
   });
 });

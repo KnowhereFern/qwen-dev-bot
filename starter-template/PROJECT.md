@@ -22,13 +22,14 @@ List required data, pages/APIs, third-party services, and any existing code that
 
 ## Constraints
 
-List technology, security, privacy, compatibility, budget, or design constraints.
+List technology, security, privacy, compatibility, budget, design, deployment, and production-activation constraints. Existing decisions remain binding unless you explicitly approve a material revision.
 
 ## Definition of done
 
 - [ ] State observable behavior a user can verify.
 - [ ] State the required automated checks.
 - [ ] State any demo or deployment result required.
+- [ ] State the staging user journey and the revision or health evidence that proves it.
 
 ## Known stories or acceptance examples (optional)
 

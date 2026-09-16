@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.5] - 2026-09-16
+
+- Added configuration version 2 with opt-in repository-aware programs, explicit staging authority, evidence signals, and protected controller self-hosting while preserving version 1 behavior.
+- Added exact-commit repository assessment, evidence-backed objective coverage, dependency-wave activation, persistent program revisions, post-wave reassessment, and an objective acceptance audit.
+- Added immutable Railway staging deployment with explicit project/environment/service targeting, exact deployment polling, revision health verification, lifecycle gates, durable recovery, and guarded rollback.
+- Added provenance-preserving, deduplicated feedback intake for GitHub, CI, staging, metrics, and allowlisted sources, including approval boundaries for material signals.
+- Added isolated successor evaluation, credential-free regression and four-stack canaries, protected launcher promotion, 24-hour probation, and rollback.
+- Made installer-linked extensions, CLIs, and worker services use a versioned immutable runtime instead of the bootstrap or development checkout.
+- Added `plan-reassess`, `plan-approve-revision`, `signals`, `deploy-status`, `evidence-report`, and controller release commands with text and JSON output.
+- Bounded saved-session continuations, persisted provider waits separately from code failures, and carried identical failure history across repair tasks.
 - Generated CI now follows the target project's declared Node major version and automatically gates common aggregate `check` and Playwright-style `test:browser` scripts.
 - Enabled guarded auto-merge by default for newly installed projects, with `--no-auto-merge` as the explicit opt-out and existing project choices preserved during updates.
 - Added Token Plan Personal as a first-class technical configuration using the same dedicated key and endpoint validation as Token Plan Team.

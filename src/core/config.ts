@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { CONFIG_VERSION, type GateDefinition, type ProjectConfig } from './types.js';
+import { CONFIG_VERSION, SUPPORTED_CONFIG_VERSIONS, type GateDefinition, type ProjectConfig } from './types.js';
 import { DEFAULT_QWEN_BASE_URL, QWEN_HARNESS_MODEL, TOKEN_PLAN_QWEN_BASE_URL } from '../qwen/runtime-compat.js';
 
 export const PROJECT_CONFIG_PATH = path.join('.qwen-harness', 'project.yml');
@@ -37,6 +37,7 @@ export function defaultProjectConfig(root: string, name = path.basename(root), g
       maxConcurrentMutations: 1,
       maxReadOnlyAgents: 4,
       maxAttempts: 5,
+      maxContinuations: 8,
       identicalFailureLimit: 3,
       autoMerge: true,
     },
@@ -105,6 +106,53 @@ export function defaultProjectConfig(root: string, name = path.basename(root), g
       ],
       requirePlanApprovalForExceptions: true,
     },
+    program: {
+      enabled: false,
+      reassessAfterWave: true,
+      maintenance: true,
+      maxAssessmentFiles: 2_000,
+      maxAssessmentBytes: 750_000,
+      requireCleanSnapshot: true,
+      materialChangesRequireApproval: true,
+    },
+    evolution: {
+      enabled: true,
+      githubFeedback: true,
+      ciFailures: true,
+      stagingFailures: true,
+      productMetrics: [],
+      pollIntervalMs: 6 * 60 * 60_000,
+    },
+    deployment: {
+      staging: {
+        enabled: false,
+        provider: 'railway',
+        project: '',
+        environment: 'staging',
+        service: '',
+        healthUrl: '',
+        revisionJsonPath: 'revision',
+        timeoutMs: 20 * 60_000,
+        lifecycleGateIds: [],
+      },
+      production: { requiresApproval: true },
+    },
+    selfHosting: {
+      enabled: false,
+      autoPromote: false,
+      probationMs: 24 * 60 * 60_000,
+      deliveryObservationMs: 7 * 24 * 60 * 60_000,
+      requiredProjectId: '',
+      candidateRoot: '',
+      evaluationCommands: [
+        { command: 'npm', args: ['ci', '--ignore-scripts', '--no-audit', '--no-fund'] },
+        { command: 'npm', args: ['test'] },
+        { command: 'npm', args: ['run', 'typecheck'] },
+        { command: 'npm', args: ['run', 'release:check'] },
+        { command: 'npm', args: ['run', 'package:smoke'] },
+      ],
+      canaryCommands: [],
+    },
     protectedPaths: [
       'AUTONOMY.md',
       '.qwen-harness/',
@@ -119,8 +167,8 @@ export function defaultProjectConfig(root: string, name = path.basename(root), g
 
 export function discoverGates(root: string): GateDefinition[] {
   const pkgPath = path.join(root, 'package.json');
-  if (!existsSync(pkgPath)) return [];
-  try {
+  const gates: GateDefinition[] = [];
+  if (existsSync(pkgPath)) try {
     const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { scripts?: Record<string, string> };
     const scripts = pkg.scripts ?? {};
     const checkCoversUnitTests = typeof scripts.check === 'string' && /\bnpm\s+(?:run\s+)?test(?:\s|$|&)/.test(scripts.check);
@@ -134,7 +182,7 @@ export function discoverGates(root: string): GateDefinition[] {
       ['test:e2e', 'e2e'],
       ['test:browser', 'e2e'],
     ];
-    return candidates
+    gates.push(...candidates
       .filter(([script]) => Boolean(scripts[script]))
       .map(([script, kind]) => ({
         id: script.replaceAll(':', '-'),
@@ -143,10 +191,27 @@ export function discoverGates(root: string): GateDefinition[] {
         args: ['run', script],
         required: true,
         timeoutMs: kind === 'e2e' ? 15 * 60_000 : 5 * 60_000,
-      }));
+      })));
   } catch {
-    return [];
+    // Other stack discovery still applies when package.json is malformed.
   }
+  if (existsSync(path.join(root, 'pyproject.toml')) || existsSync(path.join(root, 'pytest.ini'))) {
+    gates.push({
+      id: 'python-test',
+      kind: 'unit',
+      command: process.platform === 'win32' ? '.venv\\Scripts\\python.exe' : '.venv/bin/python',
+      args: ['-m', 'pytest', '-q'],
+      required: true,
+      timeoutMs: 10 * 60_000,
+    });
+  }
+  if (existsSync(path.join(root, 'go.mod'))) {
+    gates.push({ id: 'go-test', kind: 'unit', command: 'go', args: ['test', './...'], required: true, timeoutMs: 10 * 60_000 });
+  }
+  if (existsSync(path.join(root, 'Cargo.toml'))) {
+    gates.push({ id: 'rust-test', kind: 'unit', command: 'cargo', args: ['test', '--all-targets'], required: true, timeoutMs: 15 * 60_000 });
+  }
+  return gates;
 }
 
 export function loadProjectConfig(rootOrFile: string): ProjectConfig {
@@ -185,6 +250,33 @@ export function loadProjectConfig(rootOrFile: string): ProjectConfig {
       ...parsed.technologyPolicy,
       approved: parsed.technologyPolicy?.approved ?? defaults.technologyPolicy.approved,
     },
+    program: {
+      ...defaults.program,
+      ...(parsed.configVersion === 1 ? { enabled: false } : {}),
+      ...parsed.program,
+    },
+    evolution: {
+      ...defaults.evolution,
+      ...(parsed.configVersion === 1 ? { enabled: false } : {}),
+      ...parsed.evolution,
+      productMetrics: parsed.evolution?.productMetrics ?? defaults.evolution.productMetrics,
+    },
+    deployment: {
+      staging: {
+        ...defaults.deployment.staging,
+        ...(parsed.configVersion === 1 ? { enabled: false } : {}),
+        ...parsed.deployment?.staging,
+        lifecycleGateIds: parsed.deployment?.staging?.lifecycleGateIds ?? defaults.deployment.staging.lifecycleGateIds,
+      },
+      production: { ...defaults.deployment.production, ...parsed.deployment?.production },
+    },
+    selfHosting: {
+      ...defaults.selfHosting,
+      ...(parsed.configVersion === 1 ? { enabled: false, autoPromote: false } : {}),
+      ...parsed.selfHosting,
+      evaluationCommands: parsed.selfHosting?.evaluationCommands ?? defaults.selfHosting.evaluationCommands,
+      canaryCommands: parsed.selfHosting?.canaryCommands ?? defaults.selfHosting.canaryCommands,
+    },
     protectedPaths: parsed.protectedPaths ?? defaults.protectedPaths,
   };
   return validateProjectConfig(merged, file);
@@ -193,8 +285,8 @@ export function loadProjectConfig(rootOrFile: string): ProjectConfig {
 export function validateProjectConfig(value: unknown, source = 'project config'): ProjectConfig {
   if (!value || typeof value !== 'object') throw new Error(`${source}: expected an object`);
   const config = value as ProjectConfig;
-  if (config.configVersion !== CONFIG_VERSION) {
-    throw new Error(`${source}: unsupported configVersion ${String(config.configVersion)}; expected ${CONFIG_VERSION}`);
+  if (!(SUPPORTED_CONFIG_VERSIONS as readonly number[]).includes(config.configVersion)) {
+    throw new Error(`${source}: unsupported configVersion ${String(config.configVersion)}; expected 1 or ${CONFIG_VERSION}`);
   }
   if (!config.project?.name || !config.project.root || !config.project.defaultBranch) {
     throw new Error(`${source}: project.name, project.root, and project.defaultBranch are required`);
@@ -278,6 +370,7 @@ export function validateProjectConfig(value: unknown, source = 'project config')
     leaseMs: config.worker.leaseMs,
     maxReadOnlyAgents: config.worker.maxReadOnlyAgents,
     maxAttempts: config.worker.maxAttempts,
+    maxContinuations: config.worker.maxContinuations,
     identicalFailureLimit: config.worker.identicalFailureLimit,
     communityPollIntervalMs: config.intake.communityPollIntervalMs,
     communityMaxProposalsPerSource: config.intake.communityMaxProposalsPerSource,
@@ -368,7 +461,118 @@ export function validateProjectConfig(value: unknown, source = 'project config')
   if (!Array.isArray(config.protectedPaths) || !config.protectedPaths.every(isSafeRelativePattern)) {
     throw new Error(`${source}: protectedPaths must contain safe relative path patterns`);
   }
+  validateProgramConfig(config, source, gateIds);
   return config;
+}
+
+function validateProgramConfig(config: ProjectConfig, source: string, gateIds: Set<string>): void {
+  if (
+    !config.program ||
+    typeof config.program.enabled !== 'boolean' ||
+    typeof config.program.reassessAfterWave !== 'boolean' ||
+    typeof config.program.maintenance !== 'boolean' ||
+    typeof config.program.requireCleanSnapshot !== 'boolean'
+  ) {
+    throw new Error(`${source}: program settings are required`);
+  }
+  if (!isPositiveInteger(config.program.maxAssessmentFiles) || !isPositiveInteger(config.program.maxAssessmentBytes)) {
+    throw new Error(`${source}: program assessment limits must be positive integers`);
+  }
+  if (config.program.materialChangesRequireApproval !== true) {
+    throw new Error(`${source}: material program changes must require approval`);
+  }
+  if (config.program.enabled && (!config.program.reassessAfterWave || !config.program.maintenance)) {
+    throw new Error(`${source}: enabled programs require post-wave reassessment and maintenance`);
+  }
+  if (
+    !config.evolution ||
+    typeof config.evolution.enabled !== 'boolean' ||
+    typeof config.evolution.githubFeedback !== 'boolean' ||
+    typeof config.evolution.ciFailures !== 'boolean' ||
+    typeof config.evolution.stagingFailures !== 'boolean' ||
+    !isPositiveInteger(config.evolution.pollIntervalMs) ||
+    !Array.isArray(config.evolution.productMetrics)
+  ) {
+    throw new Error(`${source}: invalid evolution settings`);
+  }
+  for (const metric of config.evolution.productMetrics) {
+    if (!isNonEmptyString(metric.name) || !isHttpsUrl(metric.url)) throw new Error(`${source}: product metrics require a name and HTTPS URL`);
+  }
+  const staging = config.deployment.staging;
+  if (
+    typeof staging.enabled !== 'boolean' ||
+    !['railway', 'command'].includes(staging.provider) ||
+    !isPositiveInteger(staging.timeoutMs) ||
+    !Array.isArray(staging.lifecycleGateIds) ||
+    !staging.lifecycleGateIds.every(isNonEmptyString)
+  ) {
+    throw new Error(`${source}: invalid staging deployment settings`);
+  }
+  if (staging.enabled) {
+    if (!isHttpsUrl(staging.healthUrl) || !isNonEmptyString(staging.revisionJsonPath)) {
+      throw new Error(`${source}: enabled staging requires an HTTPS healthUrl and revisionJsonPath`);
+    }
+    if (staging.provider === 'railway' && (![staging.project, staging.environment, staging.service].every(isNonEmptyString))) {
+      throw new Error(`${source}: Railway staging requires project, environment, and service`);
+    }
+    if (staging.provider === 'command' && !validCommand(staging.command)) {
+      throw new Error(`${source}: command staging requires a command and argument array`);
+    }
+  }
+  if (staging.rollback && (!validCommand(staging.rollback) || typeof staging.rollback.dataCompatible !== 'boolean')) {
+    throw new Error(`${source}: staging rollback requires a command, argument array, and dataCompatible decision`);
+  }
+  if (!staging.lifecycleGateIds.every((id) => gateIds.has(id))) {
+    throw new Error(`${source}: staging lifecycleGateIds must reference configured gates`);
+  }
+  if (config.deployment.production.requiresApproval !== true) {
+    throw new Error(`${source}: production deployment must require approval`);
+  }
+  if (
+    typeof config.selfHosting.enabled !== 'boolean' ||
+    typeof config.selfHosting.autoPromote !== 'boolean' ||
+    !isPositiveInteger(config.selfHosting.probationMs) ||
+    !isPositiveInteger(config.selfHosting.deliveryObservationMs) ||
+    !Array.isArray(config.selfHosting.evaluationCommands) ||
+    !Array.isArray(config.selfHosting.canaryCommands)
+  ) {
+    throw new Error(`${source}: self-hosting observation periods must be positive`);
+  }
+  if (config.selfHosting.enabled && (
+    config.selfHosting.probationMs < 24 * 60 * 60_000 ||
+    config.selfHosting.deliveryObservationMs < 7 * 24 * 60 * 60_000
+  )) {
+    throw new Error(`${source}: self-hosting requires at least 24 hours of probation and seven days of delivery observation`);
+  }
+  if (config.selfHosting.autoPromote && !config.selfHosting.enabled) {
+    throw new Error(`${source}: selfHosting.autoPromote requires selfHosting.enabled`);
+  }
+  if (config.selfHosting.enabled && (!isNonEmptyString(config.selfHosting.requiredProjectId) || !path.isAbsolute(config.selfHosting.candidateRoot))) {
+    throw new Error(`${source}: enabled self-hosting requires requiredProjectId and absolute candidateRoot`);
+  }
+  if (config.selfHosting.enabled) {
+    const stacks = new Set(config.selfHosting.canaryCommands.map((command) => command.stack));
+    if (
+      config.selfHosting.evaluationCommands.length === 0 ||
+      stacks.size !== 4 ||
+      !['node', 'python', 'go', 'rust'].every((stack) => stacks.has(stack as 'node' | 'python' | 'go' | 'rust'))
+    ) {
+      throw new Error(`${source}: enabled self-hosting requires Node, Python, Go, and Rust canary commands`);
+    }
+    const governancePaths = ['bin/qwen-harness-launcher.mjs', 'scripts/controller-acceptance.mjs', 'src/core/config.ts', 'src/self-hosting/releases.ts', 'src/rewards/'];
+    if (!governancePaths.every((required) => config.protectedPaths.includes(required))) {
+      throw new Error(`${source}: enabled self-hosting requires protected controller governance and evaluation paths`);
+    }
+  }
+  if (![...config.selfHosting.evaluationCommands, ...config.selfHosting.canaryCommands].every(validCommand)) {
+    throw new Error(`${source}: self-hosting commands require command and argument arrays`);
+  }
+}
+
+function validCommand(value: unknown): value is { command: string; args: string[] } {
+  if (!value || typeof value !== 'object') return false;
+  const command = value as { command?: unknown; args?: unknown };
+  return isNonEmptyString(command.command) && Array.isArray(command.args) && command.args.every((arg) => typeof arg === 'string');
 }
 
 export function serializeProjectConfig(config: ProjectConfig): string {
