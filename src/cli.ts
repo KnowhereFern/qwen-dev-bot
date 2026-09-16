@@ -23,7 +23,7 @@ import { ProjectRegistry } from './registry.js';
 import { RepositoryAssessor } from './program/repository-assessor.js';
 import { buildEvidenceReport, formatEvidenceReport } from './program/evidence-report.js';
 
-const VERSION = '1.0.0-rc.6';
+const VERSION = '1.0.0-rc.7';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? 'help';
@@ -63,7 +63,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           enableProgram: toggleFlagValue(args, '--program', '--no-program'),
           installQwen: hasFlag(args, '--install-qwen') || undefined,
           installService: hasFlag(args, '--install-service') ? true : hasFlag(args, '--no-service') ? false : undefined,
-          linkExtension: hasFlag(args, '--no-link-extension') ? false : undefined,
+          linkExtension: toggleFlagValue(args, '--link-extension', '--no-link-extension'),
           installMultimodal: hasFlag(args, '--with-mm') || undefined,
           installBrowserAutomation: hasFlag(args, '--with-browser') || undefined,
           bootstrapDependencies: hasFlag(args, '--skip-dependencies') ? false : undefined,
@@ -99,7 +99,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           enableProgram: toggleFlagValue(args, '--program', '--no-program') ?? current.program.enabled,
           installQwen: hasFlag(args, '--install-qwen'),
           installService: hasFlag(args, '--install-service') ? true : hasFlag(args, '--no-service') ? false : undefined,
-          linkExtension: hasFlag(args, '--no-link-extension') ? false : undefined,
+          linkExtension: toggleFlagValue(args, '--link-extension', '--no-link-extension'),
           installMultimodal: hasFlag(args, '--with-mm'),
           installBrowserAutomation: hasFlag(args, '--with-browser'),
           bootstrapDependencies: !hasFlag(args, '--skip-dependencies'),
@@ -581,7 +581,7 @@ Init options:
   --dry-run --yes --name NAME --repo OWNER/NAME --trusted-author LOGIN --billing-plan PLAN
   --base-url URL --api-key-env NAME
   --auto-merge --no-auto-merge --community --program --no-program --configure-github --install-qwen --with-mm --with-browser --install-cli --persist-api-key
-  --install-service --no-service --no-link-extension --skip-dependencies
+  --install-service --no-service --link-extension --no-link-extension --skip-dependencies
 
 Reward options:
   --task TASK_ID --issue NUMBER --json

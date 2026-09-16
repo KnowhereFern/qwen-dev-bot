@@ -993,7 +993,7 @@ async function ensureQwenExtensionLink(command: string, cwd: string, runtimePack
   if (relinked.exitCode !== 0) throw new Error(`Qwen extension relink failed: ${relinked.stderr || relinked.stdout}`);
   const verified = await list();
   if (verified.exitCode !== 0 || !pointsAtRuntime(verified.stdout)) {
-    throw new Error('Qwen extension link does not point to the immutable harness runtime. Re-run setup or pass --no-link-extension.');
+    throw new Error('Qwen extension link does not point to the immutable harness runtime. Re-run setup with --link-extension or pass --no-link-extension.');
   }
 }
 
