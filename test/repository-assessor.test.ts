@@ -9,7 +9,10 @@ import { makeTmp } from './helpers.js';
 
 class AssessmentModel implements PortfolioPlanningModel {
   calls = 0;
-  constructor(private readonly badEvidence = false) {}
+  constructor(
+    private readonly badEvidence = false,
+    private readonly blankRisk = false,
+  ) {}
 
   async completeJson<T>(): Promise<{ value: T }> {
     this.calls += 1;
@@ -20,7 +23,7 @@ class AssessmentModel implements PortfolioPlanningModel {
           capability: 'Health route', status: 'partial', rationale: 'Source exists but runtime is unverified',
           evidence: [{ kind: 'file', locator: this.badEvidence ? 'invented.ts' : 'server.ts', summary: 'Health source' }],
         }],
-        risks: [],
+        risks: this.blankRisk ? [''] : [],
       } as T };
     }
     return { value: { coverage: [{
@@ -64,6 +67,19 @@ describe('RepositoryAssessor', () => {
     config.program.enabled = true;
     await expect(new RepositoryAssessor(config, new AssessmentModel(true)).assess({ sourcePath: 'PROJECT.md', content: 'Expose health.' }))
       .rejects.toThrow(/unknown file invented\.ts/);
+  });
+
+  it('discards blank optional risk notes without weakening evidence validation', async () => {
+    const root = gitRepo();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.enabled = true;
+
+    const assessment = await new RepositoryAssessor(config, new AssessmentModel(false, true)).assess({
+      sourcePath: 'PROJECT.md',
+      content: 'Expose health.',
+    });
+
+    expect(assessment.analyses.every((analysis) => analysis.risks.length === 0)).toBe(true);
   });
 
   it('reads an explicitly selected commit even when the operator checkout has moved or is dirty', async () => {

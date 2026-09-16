@@ -205,7 +205,10 @@ function validateAnalysis(value: unknown, area: RepositoryAnalysis['area'], cont
         evidence: validateEvidence(finding.evidence, context, `${area}.findings[${index}].evidence`),
       };
     }),
-    risks: value.risks.map((risk, index) => requiredText(risk, `${area}.risks[${index}]`)).slice(0, 50),
+    risks: value.risks
+      .filter((risk) => typeof risk !== 'string' || Boolean(risk.trim()))
+      .map((risk, index) => requiredText(risk, `${area}.risks[${index}]`))
+      .slice(0, 50),
   };
 }
 
