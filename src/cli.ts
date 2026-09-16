@@ -23,7 +23,7 @@ import { ProjectRegistry } from './registry.js';
 import { RepositoryAssessor } from './program/repository-assessor.js';
 import { buildEvidenceReport, formatEvidenceReport } from './program/evidence-report.js';
 
-const VERSION = '1.0.0-rc.17';
+const VERSION = '1.0.0-rc.18';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? 'help';
@@ -278,6 +278,45 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         });
         const coordinator = new PortfolioCoordinator(config, store, github);
         const plan = await coordinator.approve(planId);
+        const view = coordinator.status(plan);
+        console.log(json ? JSON.stringify(view, null, 2) : formatPortfolioPlan(view));
+        return 0;
+      } finally {
+        store.close();
+      }
+    }
+    case 'plan-redraft': {
+      const config = loadProjectConfig(root);
+      const planId = valueOf(args, '--plan');
+      const requirementsPath = valueOf(args, '--requirements');
+      if (!planId || !requirementsPath) throw new Error('plan-redraft requires --plan PLAN_ID --requirements FILE');
+      const maxStories = integerValue(args, '--max-stories') ?? DEFAULT_MAX_PORTFOLIO_STORIES;
+      const credential = resolveQwenCredential(config);
+      if (credential) assertQwenCredentialCompatibility(config, credential);
+      const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      try {
+        const document = readRequirementsDocument(config.project.root, requirementsPath);
+        const github = new OctokitControlPlane({
+          repo: config.project.githubRepo,
+          token: await resolveGitHubToken(root),
+        });
+        const qwenApi = new QwenApiClient({
+          model: config.qwen.model,
+          baseUrl: config.qwen.baseUrl,
+          credentialEnvKey: config.qwen.credentialEnvKey,
+          apiKey: credential?.apiKey,
+        });
+        const assessment = await new RepositoryAssessor(config, qwenApi).assess(document);
+        store.saveRepositoryAssessment(assessment);
+        const draft = await new PortfolioPlanner(config, qwenApi).plan(document, maxStories, assessment);
+        const coordinator = new PortfolioCoordinator(config, store, github);
+        const plan = await coordinator.replaceUnapprovedDraft({
+          planId,
+          ...document,
+          draft,
+          assessment,
+          summary: 'Replaced an unapproved draft after plan-quality review',
+        });
         const view = coordinator.status(plan);
         console.log(json ? JSON.stringify(view, null, 2) : formatPortfolioPlan(view));
         return 0;
@@ -564,6 +603,7 @@ Commands:
   reward               Show the latest stored universal reward scorecard
   community [--force]  Scan allowlisted sources and create review-only issues
   plan                 Turn a requirements file into a review-only delivery graph
+  plan-redraft         Replace an unapproved draft while retaining its superseded history
   plan-approve         Approve one plan and create executable normalized tasks
   plan-status          Refresh the master issue and show story/task progress
   plan-reassess        Reassess the approved objective against the current repository
@@ -588,6 +628,7 @@ Reward options:
 
 Plan options:
   plan PROJECT --requirements FILE [--max-stories N] [--approve] [--json]
+  plan-redraft PROJECT --plan PLAN_ID --requirements FILE [--max-stories N] [--json]
   plan-approve PROJECT --plan PLAN_ID [--json]
   plan-status PROJECT [--plan PLAN_ID] [--json]
   plan-reassess PROJECT --plan PLAN_ID [--json]

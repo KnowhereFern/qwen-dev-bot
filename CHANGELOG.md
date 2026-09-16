@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.18] - 2026-09-16
+
+- Distinguish implementation, verification, operation, documentation, and external coverage actions; reject plans that answer implementation gaps with verification-only work.
+- Add safe pre-approval redrafting that supersedes the narrow proposal while retaining its issue and revision history.
+
 ## [1.0.0-rc.17] - 2026-09-16
 
 - Add strict provider-backed JSON Schemas for repository analysis, objective coverage, and delivery programs while retaining all local validation.

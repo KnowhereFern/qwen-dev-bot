@@ -99,6 +99,79 @@ export class PortfolioCoordinator {
     return { plan: await this.publishDraft(plan), created: true };
   }
 
+  async replaceUnapprovedDraft(input: {
+    planId: string;
+    sourcePath: string;
+    content: string;
+    draft: PortfolioDraft;
+    assessment: RepositoryAssessment;
+    summary: string;
+  }): Promise<PortfolioPlan> {
+    const current = this.requirePlan(input.planId);
+    if (!['draft', 'awaiting_initial_approval'].includes(current.status) || current.approvedAt !== null) {
+      throw new Error(`Portfolio plan ${current.id} can only be redrafted before initial approval`);
+    }
+    const contentHash = sha256(input.content);
+    if (contentHash !== current.contentHash || input.sourcePath !== current.sourcePath) {
+      throw new Error('Plan redraft must preserve the originally proposed objective and requirements file');
+    }
+    const now = Date.now();
+    const nextRevision = (current.revision ?? 1) + 1;
+    const preserved = current.stories.map((story) => ({ ...story, supersededAt: story.supersededAt ?? now }));
+    const priorKeys = new Set(preserved.map((story) => story.key));
+    const keyMap = new Map(input.draft.stories.map((story) => [story.key, uniqueRevisionKey(nextRevision, story.key, priorKeys)]));
+    const revisedDrafts = input.draft.stories.map((story) => ({
+      ...story,
+      key: keyMap.get(story.key) as string,
+      dependsOn: story.dependsOn.map((key) => keyMap.get(key) ?? key),
+    }));
+    const newStories = assignWaves(revisedDrafts).map((story): PortfolioStory => ({
+      ...story,
+      revision: nextRevision,
+      supersededAt: null,
+      sourceIssueNumber: null,
+      sourceIssueUrl: null,
+      normalizedIssueNumber: null,
+      normalizedIssueUrl: null,
+    }));
+    const revision: ProgramRevision = {
+      number: nextRevision,
+      assessmentId: input.assessment.id,
+      repositorySha: input.assessment.commitSha,
+      reason: 'manual',
+      material: false,
+      summary: input.summary,
+      createdAt: now,
+      approvedAt: null,
+    };
+    let plan = this.save({
+      ...current,
+      title: input.draft.title,
+      objective: input.draft.objective,
+      constraints: [...input.draft.constraints],
+      definitionOfDone: [...input.draft.definitionOfDone],
+      technologyDecisions: structuredClone(input.draft.technologyDecisions),
+      deploymentDecisions: structuredClone(input.draft.deploymentDecisions),
+      stories: [...preserved, ...newStories],
+      status: 'awaiting_initial_approval',
+      assessmentId: input.assessment.id,
+      repositorySha: input.assessment.commitSha,
+      coverage: structuredClone(input.assessment.coverage),
+      revision: nextRevision,
+      currentWave: 1,
+      revisions: [...(current.revisions ?? []), revision],
+      updatedAt: now,
+    });
+    plan = await this.publishDraft(plan);
+    this.store.recordEvent('portfolio.redrafted', null, {
+      planId: plan.id,
+      revision: nextRevision,
+      assessmentId: input.assessment.id,
+      storyCount: newStories.length,
+    }, `portfolio:redraft:${plan.id}:${nextRevision}`);
+    return plan;
+  }
+
   async approve(planId: string): Promise<PortfolioPlan> {
     let plan = this.requirePlan(planId);
     if (['done', 'delivered', 'maintaining', 'active'].includes(plan.status)) return plan;
@@ -336,6 +409,7 @@ export class PortfolioCoordinator {
       return {
         key: story.key,
         title: story.title,
+        workType: story.workType ?? null,
         dependencies: [...story.dependsOn],
         sourceIssueNumber: story.sourceIssueNumber,
         normalizedIssueNumber: story.normalizedIssueNumber,
@@ -471,6 +545,7 @@ export interface PortfolioPlanView {
   stories: Array<{
     key: string;
     title: string;
+    workType: PortfolioStory['workType'] | null;
     dependencies: string[];
     sourceIssueNumber: number | null;
     normalizedIssueNumber: number | null;
@@ -495,7 +570,7 @@ export function formatPortfolioPlan(view: PortfolioPlanView): string {
     '',
     ...view.stories.map(
       (story) =>
-        `${story.key.padEnd(12)} wave=${story.wave} rev=${story.revision} ${story.superseded ? 'superseded' : story.state.padEnd(20)} source=${story.sourceIssueNumber ? `#${story.sourceIssueNumber}` : '-'} ` +
+        `${story.key.padEnd(12)} wave=${story.wave} rev=${story.revision} type=${story.workType ?? 'legacy'} ${story.superseded ? 'superseded' : story.state.padEnd(20)} source=${story.sourceIssueNumber ? `#${story.sourceIssueNumber}` : '-'} ` +
         `task=${story.normalizedIssueNumber ? `#${story.normalizedIssueNumber}` : '-'}${story.dependencies.length ? ` deps=[${story.dependencies.join(',')}]` : ''}  ${story.title}`,
     ),
   ].join('\n');
@@ -549,7 +624,7 @@ function renderEpic(plan: PortfolioPlan, tasks: TaskRecord[]): string {
     '',
     '## Objective coverage',
     ...((plan.coverage ?? []).length
-      ? (plan.coverage ?? []).map((entry) => `- **${entry.status}** \`${entry.id}\` ${entry.requirement} — ${entry.rationale}`)
+      ? (plan.coverage ?? []).map((entry) => `- **${entry.status} / ${entry.requiredAction ?? 'legacy'}** \`${entry.id}\` ${entry.requirement} — ${entry.rationale}`)
       : ['- Repository-aware coverage is not enabled for this legacy plan.']),
     '',
     '## Definition of done',
@@ -615,6 +690,7 @@ function renderStory(plan: PortfolioPlan, story: PortfolioStory): string {
     `Required gates: ${story.requiredGateIds.join(', ') || '(none)'}`,
     `Reward criteria: ${story.rewardCriterionIds.join(', ') || '(none)'}`,
     `Risk: **${story.risk}**`,
+    `Work type: **${story.workType ?? 'legacy'}**`,
     `Rollback: ${story.rollback}`,
     `Objective coverage: ${story.coverageIds?.join(', ') || '(legacy plan)'}`,
     `Program wave: ${story.wave ?? 1}; revision: ${story.revision ?? 1}`,

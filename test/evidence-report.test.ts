@@ -20,7 +20,7 @@ describe('program evidence report', () => {
         risk: 'low', dependsOn: [], rollback: 'Revert', technologyDecisionIds: [], deploymentDecisionIds: [], sourceIssueNumber: 2,
         sourceIssueUrl: 'https://github.test/issues/2', normalizedIssueNumber: 10, normalizedIssueUrl: 'https://github.test/issues/10',
       }],
-      coverage: [{ id: 'REQ1', requirement: 'Build', status: 'implemented', rationale: 'Verified', evidence: [] }],
+      coverage: [{ id: 'REQ1', requirement: 'Build', status: 'implemented', requiredAction: 'none', rationale: 'Verified', evidence: [] }],
       createdAt: 1_000, updatedAt: 2_000, approvedAt: 1_100, deliveredAt: 2_000,
     };
 

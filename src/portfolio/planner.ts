@@ -2,6 +2,8 @@ import { lstatSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type {
   DeploymentDecision,
+  ObjectiveCoverage,
+  ProgramWorkType,
   ProjectConfig,
   RepositoryAssessment,
   ReasoningEffort,
@@ -23,6 +25,7 @@ export interface PortfolioStoryDraft {
   requiredGateIds: string[];
   rewardCriterionIds: string[];
   risk: 'low' | 'medium' | 'high';
+  workType: ProgramWorkType;
   dependsOn: string[];
   rollback: string;
   technologyDecisionIds: string[];
@@ -84,8 +87,10 @@ export class PortfolioPlanner {
         'Return exactly: {title, objective, constraints, definitionOfDone, technologyDecisions, deploymentDecisions, stories}.',
         'Technology decisions contain: id, category, technology, rationale. Include only choices relevant to this plan.',
         'Deployment decisions contain: id, component, provider, environment, rationale. environment is local, preview, staging, or production; provider must equal a declared technology value (for example Railway), not a decision id.',
-        'Each story must contain: key, title, goal, acceptanceCriteria, constraints, requiredGateIds, rewardCriterionIds, risk, dependsOn, rollback, technologyDecisionIds, deploymentDecisionIds, coverageIds.',
-        'When repository coverage is supplied, create work only for partial, missing, or unverified requirements and map every story to at least one coverage id.',
+        'Each story must contain: key, title, goal, acceptanceCriteria, constraints, requiredGateIds, rewardCriterionIds, risk, workType, dependsOn, rollback, technologyDecisionIds, deploymentDecisionIds, coverageIds.',
+        'workType is implement, verify, operate, or document and must match each mapped coverage item requiredAction; external coverage is handled by document work that records the blocker.',
+        'When repository coverage is supplied, create work only for non-implemented requirements and map every story to at least one coverage id.',
+        'Every coverage item requiring implement must have an implementation story that delivers the missing behavior; verification-only work is insufficient.',
         'Do not create file-oriented cleanup, speculative infrastructure, or stories for capabilities proven implemented.',
         'A story may reference only decision ids that it actually needs.',
         'Approved technologies are preferred. Any other choice is an exception that will be highlighted for explicit plan approval.',
@@ -111,7 +116,7 @@ export class PortfolioPlanner {
       rewardIds,
       maxStories,
       this.config.technologyPolicy,
-      assessment?.coverage.map((entry) => entry.id),
+      assessment?.coverage,
     );
     return {
       ...draft,
@@ -179,7 +184,7 @@ function portfolioDraftSchema(maxStories: number): StructuredOutputSchema {
             additionalProperties: false,
             required: [
               'key', 'title', 'goal', 'acceptanceCriteria', 'constraints', 'requiredGateIds', 'rewardCriterionIds',
-              'risk', 'dependsOn', 'rollback', 'technologyDecisionIds', 'deploymentDecisionIds', 'coverageIds',
+              'risk', 'workType', 'dependsOn', 'rollback', 'technologyDecisionIds', 'deploymentDecisionIds', 'coverageIds',
             ],
             properties: {
               key: text,
@@ -190,6 +195,7 @@ function portfolioDraftSchema(maxStories: number): StructuredOutputSchema {
               requiredGateIds: textArray,
               rewardCriterionIds: textArray,
               risk: { type: 'string', enum: ['low', 'medium', 'high'] },
+              workType: { type: 'string', enum: ['implement', 'verify', 'operate', 'document'] },
               dependsOn: textArray,
               rollback: text,
               technologyDecisionIds: textArray,
@@ -236,7 +242,7 @@ export function validatePortfolioDraft(
     approved: [],
     requirePlanApprovalForExceptions: true,
   },
-  coverageIds?: string[],
+  coverage?: ObjectiveCoverage[],
 ): PortfolioDraft {
   assertMaxStories(maxStories);
   if (!isRecord(value)) throw new Error('Portfolio planner output must be an object');
@@ -265,7 +271,7 @@ export function validatePortfolioDraft(
       rewardIds,
       new Set(technologyDecisions.map((decision) => decision.id)),
       new Set(deploymentDecisions.map((decision) => decision.id)),
-      coverageIds ? new Set(coverageIds) : undefined,
+      coverage ? new Set(coverage.map((entry) => entry.id)) : undefined,
     ),
   );
   const keys = new Set<string>();
@@ -279,6 +285,8 @@ export function validatePortfolioDraft(
       if (dependency === story.key) throw new Error(`Story ${story.key} cannot depend on itself`);
     }
   }
+  const orderedStories = topologicalStories(stories);
+  if (coverage) assertCoverageActions(orderedStories, coverage);
   return {
     title,
     objective,
@@ -286,7 +294,7 @@ export function validatePortfolioDraft(
     definitionOfDone: unique(definitionOfDone),
     technologyDecisions,
     deploymentDecisions,
-    stories: topologicalStories(stories),
+    stories: orderedStories,
   };
 }
 
@@ -314,6 +322,10 @@ function validateStory(
   if (risk !== 'low' && risk !== 'medium' && risk !== 'high') {
     throw new Error(`Story ${key} has invalid risk`);
   }
+  const workType = typeof value.workType === 'string' ? value.workType.trim().toLowerCase() : value.workType;
+  if (!['implement', 'verify', 'operate', 'document'].includes(String(workType))) {
+    throw new Error(`Story ${key} has invalid work type`);
+  }
   const storyTechnologyIds = unique(
     textArray(value.technologyDecisionIds, `${key}.technologyDecisionIds`).map((id) => id.toUpperCase()),
   );
@@ -339,12 +351,25 @@ function validateStory(
     requiredGateIds,
     rewardCriterionIds,
     risk,
+    workType: workType as ProgramWorkType,
     dependsOn: unique(textArray(value.dependsOn, `${key}.dependsOn`).map((dependency) => dependency.toUpperCase())),
     rollback: requiredText(value.rollback, `${key}.rollback`),
     technologyDecisionIds: storyTechnologyIds,
     deploymentDecisionIds: storyDeploymentIds,
     coverageIds: storyCoverageIds,
   };
+}
+
+function assertCoverageActions(stories: PortfolioStoryDraft[], coverage: ObjectiveCoverage[]): void {
+  for (const entry of coverage) {
+    if (entry.requiredAction === 'none') continue;
+    const mapped = stories.filter((story) => story.coverageIds?.includes(entry.id));
+    if (mapped.length === 0) throw new Error(`Coverage ${entry.id} has no proposed work`);
+    const expected: ProgramWorkType = entry.requiredAction === 'external' ? 'document' : entry.requiredAction;
+    if (!mapped.some((story) => story.workType === expected)) {
+      throw new Error(`Coverage ${entry.id} requires ${entry.requiredAction} work, not ${mapped.map((story) => story.workType).join(', ')}`);
+    }
+  }
 }
 
 function validateTechnologyDecisions(value: unknown, policy: TechnologyPolicy): TechnologyDecision[] {
