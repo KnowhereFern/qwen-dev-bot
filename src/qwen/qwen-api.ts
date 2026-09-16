@@ -1,6 +1,8 @@
 import type { ReasoningEffort } from '../core/types.js';
 import { DEFAULT_QWEN_BASE_URL, QWEN_HARNESS_MODEL } from './runtime-compat.js';
 
+export const DEFAULT_QWEN_API_TIMEOUT_MS = 5 * 60_000;
+
 export interface QwenApiOptions {
   apiKey?: string;
   credentialEnvKey?: string;
@@ -46,7 +48,7 @@ export class QwenApiClient {
     this.model = options.model ?? QWEN_HARNESS_MODEL;
     if (this.model !== QWEN_HARNESS_MODEL) throw new Error(`Delivery harness model must be ${QWEN_HARNESS_MODEL}`);
     this.fetchImpl = options.fetchImpl ?? fetch;
-    this.timeoutMs = options.timeoutMs ?? 120_000;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_QWEN_API_TIMEOUT_MS;
     this.maxAttempts = options.maxAttempts ?? 3;
     if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs <= 0) throw new Error('Qwen API timeoutMs must be positive');
     if (!Number.isSafeInteger(this.maxAttempts) || this.maxAttempts <= 0) throw new Error('Qwen API maxAttempts must be positive');

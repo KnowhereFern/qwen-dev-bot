@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { QwenApiClient } from '../src/qwen/qwen-api.js';
+import { DEFAULT_QWEN_API_TIMEOUT_MS, QwenApiClient } from '../src/qwen/qwen-api.js';
 
 describe('Qwen API boundary', () => {
+  it('allows bounded long-reasoning requests to run for five minutes by default', () => {
+    expect(DEFAULT_QWEN_API_TIMEOUT_MS).toBe(5 * 60_000);
+  });
+
   it('does not treat an unrelated OpenAI credential as a Qwen credential', () => {
     const priorDashscope = process.env.DASHSCOPE_API_KEY;
     const priorOpenAi = process.env.OPENAI_API_KEY;

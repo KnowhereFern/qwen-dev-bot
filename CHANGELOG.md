@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.11] - 2026-09-16
+
+- Increased the bounded direct-model request window for real repository planning, reduced the default evidence payload, and continued past binary assets so later source files remain assessable.
+
 ## [1.0.0-rc.10] - 2026-09-16
 
 - Recorded private-repository branch-protection plan limits without blocking the independently gated supervisor merge path or claiming that remote protection was configured.

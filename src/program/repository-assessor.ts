@@ -145,7 +145,8 @@ export async function collectRepositorySnapshot(config: ProjectConfig, signal?: 
   const excerpts: Array<{ path: string; content: string }> = [];
   let remaining = config.program.maxAssessmentBytes;
   for (const relative of prioritized) {
-    if (remaining <= 0 || !isTextFile(relative)) break;
+    if (remaining <= 0) break;
+    if (!isTextFile(relative)) continue;
     let content: string;
     try {
       if (expectedCommitSha) {

@@ -111,7 +111,7 @@ export function defaultProjectConfig(root: string, name = path.basename(root), g
       reassessAfterWave: true,
       maintenance: true,
       maxAssessmentFiles: 2_000,
-      maxAssessmentBytes: 750_000,
+      maxAssessmentBytes: 250_000,
       requireCleanSnapshot: true,
       materialChangesRequireApproval: true,
     },
