@@ -51,6 +51,7 @@ describe('ProgramController', () => {
     expect(updated).toMatchObject({ status: 'maintaining', repositorySha: sha });
     expect(updated?.coverage?.[0]).toMatchObject({ id: 'REQ1', status: 'implemented' });
     expect(updated?.deliveredAt).toBeTypeOf('number');
+    expect(github.checkedNames).toEqual(['Fern Delivery Harness / CI']);
     store.close();
   });
 });
@@ -69,6 +70,7 @@ class ImplementedAssessmentModel implements PortfolioPlanningModel {
 
 class EmptyGitHub implements GitHubControl {
   readonly repoSlug = 'owner/fixture';
+  checkedNames: string[] = [];
   async currentUser(): Promise<string> { return 'owner'; }
   async listOpenIssues(): Promise<RemoteIssue[]> { return []; }
   async getIssue(): Promise<RemoteIssue> { throw new Error('not used'); }
@@ -80,7 +82,10 @@ class EmptyGitHub implements GitHubControl {
   async findPullRequestByHead(): Promise<RemotePullRequest | null> { return null; }
   async createPullRequest(): Promise<RemotePullRequest> { throw new Error('not used'); }
   async getPullRequest(): Promise<RemotePullRequest> { throw new Error('not used'); }
-  async checksForRef(): Promise<CheckSummary> { return { complete: true, successful: true, pending: [], failed: [] }; }
+  async checksForRef(_sha: string, requiredNames: string[]): Promise<CheckSummary> {
+    this.checkedNames = requiredNames;
+    return { complete: true, successful: true, pending: [], failed: [] };
+  }
   async publishCheck(): Promise<void> {}
   async mergePullRequest(): Promise<{ merged: boolean; sha: string | null; message: string }> { throw new Error('not used'); }
 }
