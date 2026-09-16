@@ -123,13 +123,16 @@ export function discoverGates(root: string): GateDefinition[] {
   try {
     const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { scripts?: Record<string, string> };
     const scripts = pkg.scripts ?? {};
+    const checkCoversUnitTests = typeof scripts.check === 'string' && /\bnpm\s+(?:run\s+)?test(?:\s|$|&)/.test(scripts.check);
     const candidates: Array<[string, GateDefinition['kind']]> = [
+      ['check', 'custom'],
       ['build', 'build'],
       ['typecheck', 'typecheck'],
       ['lint', 'lint'],
-      ['test', 'unit'],
+      ...(checkCoversUnitTests ? [] : [['test', 'unit'] as [string, GateDefinition['kind']]]),
       ['test:integration', 'integration'],
       ['test:e2e', 'e2e'],
+      ['test:browser', 'e2e'],
     ];
     return candidates
       .filter(([script]) => Boolean(scripts[script]))
