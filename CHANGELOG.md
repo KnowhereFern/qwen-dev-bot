@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.16] - 2026-09-16
+
+- Request provider-backed JSON Object output for direct Qwen planning calls while retaining local schema and evidence validation.
+
 ## [1.0.0-rc.15] - 2026-09-16
 
 - Normalize case and surrounding whitespace for the fixed low, medium, and high story-risk vocabulary while rejecting unknown categories.
