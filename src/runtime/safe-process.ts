@@ -55,6 +55,11 @@ export async function runProcess(options: ProcessOptions): Promise<ProcessReceip
       stderr = append(stderr, chunk);
       options.onStderr?.(chunk.toString('utf8'));
     });
+    child.stdin.on('error', (error: NodeJS.ErrnoException) => {
+      // A short-lived command can close stdin before the supplied confirmation
+      // input is flushed. Its process exit remains the authoritative result.
+      if (error.code !== 'EPIPE') stderr = append(stderr, Buffer.from(error.message));
+    });
 
     const stop = (): void => {
       if (child.exitCode !== null || child.signalCode !== null) return;

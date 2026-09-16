@@ -14,6 +14,18 @@ describe('safe process runner', () => {
     expect(receipt.stdout.trim()).toBe('$(echo injected);`whoami`');
   });
 
+  it('does not surface a broken pipe when a command exits before reading input', async () => {
+    const receipt = await runProcess({
+      command: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      cwd: makeTmp('process-early-exit'),
+      input: 'y'.repeat(1024 * 1024),
+      timeoutMs: 5_000,
+    });
+    expect(receipt.exitCode).toBe(0);
+    expect(receipt.stderr).toBe('');
+  });
+
   it('bounds hung process trees', async () => {
     const receipt = await runProcess({
       command: process.execPath,
