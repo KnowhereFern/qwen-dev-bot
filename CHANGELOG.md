@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.35] - 2026-09-17
+
+- Prepare controller-owned staging before operations acceptance without circular waits or premature task completion.
+- Require completed writer work and exact-commit CI before preparation; retain later required checks and independent review.
+- Safely refresh clean read-only branches after new merges, with durable restart recovery and no overwritten candidate changes.
+- Count only the current proposal in status totals while preserving superseded history.
+
 ## [1.0.0-rc.34] - 2026-09-17
 
 - Let approved verification and operations work finish without fabricated repository changes after exact-commit required checks and independent review pass.

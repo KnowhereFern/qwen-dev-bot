@@ -24,7 +24,7 @@ import { RepositoryAssessor } from './program/repository-assessor.js';
 import { buildEvidenceReport, formatEvidenceReport } from './program/evidence-report.js';
 import { runInteractiveTerminal } from './terminal/interactive.js';
 
-const VERSION = '1.0.0-rc.34';
+const VERSION = '1.0.0-rc.35';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? (process.stdin.isTTY && process.stdout.isTTY ? 'interactive' : 'help');

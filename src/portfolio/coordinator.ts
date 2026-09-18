@@ -472,7 +472,7 @@ export class PortfolioCoordinator {
       coverage: structuredClone(plan.coverage ?? []),
       latestDeploymentId: plan.latestDeploymentId ?? null,
       stories,
-      counts: countStates(stories.map((story) => story.state)),
+      counts: countStates(stories.filter((story) => !story.superseded).map((story) => story.state)),
     };
   }
 

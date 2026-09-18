@@ -200,12 +200,41 @@ export class HarnessSupervisor {
     try {
       const branch = task.branch ?? branchFor(task);
       const worktree = await this.git.createOrResume({ ...task, branch });
+      if (this.isReadOnlyProgramTask(task) && task.prNumber === null &&
+          (!task.commitSha || task.commitSha === worktree.baseSha) &&
+          (await this.git.changedFiles(worktree.path)).length === 0) {
+        const currentSha = await this.git.baseSha();
+        const head = await this.git.headSha(worktree.path);
+        const interrupted = this.store.listEvents('task.read_only_base_advance_requested').filter((event) => event.taskId === task.id).at(-1);
+        if (currentSha !== worktree.baseSha && [worktree.baseSha, currentSha, interrupted?.payload.commitSha].includes(head)) {
+          this.store.recordEvent('task.read_only_base_advance_requested', task.id, { previousSha: worktree.baseSha, commitSha: currentSha }, `read-only-base-request:${task.id}:${currentSha}`);
+          await this.git.advanceReadOnlyBase(worktree.path, head, currentSha);
+          this.store.recordEvent('task.read_only_base_advanced', task.id, { previousSha: worktree.baseSha, commitSha: currentSha }, `read-only-base-advanced:${task.id}:${currentSha}`);
+          worktree.baseSha = currentSha;
+          task = this.store.patch(task.id, { baseSha: currentSha, commitSha: null, rewardRunId: null });
+        }
+      }
       task = this.store.transition(task.id, 'active', {
         branch,
         baseSha: worktree.baseSha,
         worktreePath: worktree.path,
       });
       this.checkpoint(task, { reusedWorktree: worktree.reused });
+      if (this.isReadOnlyProgramTask(task) && this.config.deployment.staging.enabled &&
+          this.store.listPortfolioPlans().some((plan) => plan.stories.some((story) =>
+            story.normalizedIssueNumber === task.issueNumber && story.workType === 'operate')) &&
+          await this.git.headSha(worktree.path) === task.baseSha && (await this.git.changedFiles(worktree.path)).length === 0) {
+        const link = this.store.listPortfolioPlans().find((plan) => plan.stories.some((story) => story.normalizedIssueNumber === task.issueNumber));
+        const deployment = this.store.listDeployments(link?.id)[0];
+        if (deployment?.status !== 'succeeded' || deployment.commitSha !== task.baseSha || deployment.observedRevision !== task.baseSha) {
+          this.store.transition(task.id, 'waiting', {
+            commitSha: task.baseSha, waitKind: 'provider', resumeAfter: Date.now() + Math.max(this.config.worker.pollIntervalMs, 30_000),
+            leaseOwner: null, leaseExpiresAt: null, lastError: 'Waiting for controller-owned staging preparation before operations acceptance',
+          });
+          this.store.recordEvent('task.staging_preparation_requested', task.id, { commitSha: task.baseSha });
+          return;
+        }
+      }
 
       let lastHeartbeat = 0;
       const heartbeatInterval = Math.max(1_000, Math.min(30_000, Math.floor(this.config.worker.leaseMs / 3)));

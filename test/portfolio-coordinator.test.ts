@@ -176,6 +176,8 @@ describe('PortfolioCoordinator', () => {
     expect(redrafted.stories.find((story) => story.revision === 2)?.key).toMatch(/^R2_/);
     expect(redrafted.stories.filter((story) => story.revision === 2).every((story) => story.sourceIssueNumber !== null)).toBe(true);
     expect(redrafted.stories.every((story) => story.normalizedIssueNumber === null)).toBe(true);
+    expect(coordinator.status(redrafted).counts).toEqual({ 'awaiting-approval': 2 });
+    expect(coordinator.status(redrafted).stories).toHaveLength(4);
     const changed = await coordinator.replaceUnapprovedDraft({
       planId: redrafted.id, sourcePath: 'PROJECT.md', content: 'Complete the full delivery journey',
       draft: replacement, assessment, summary: 'User revised the proposed objective', reviseObjective: true,

@@ -2,7 +2,7 @@
 
 A software product designed and built by Fern. It uses Qwen Code and `qwen3.8-max` as its execution engine to turn approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.34`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
+**Release status:** `v1.0.0-rc.35`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
 
 See [live test readiness](docs/live-test-readiness.md) for the current machine and end-to-end proof status.
 
@@ -210,6 +210,8 @@ fern-harness plan-status /path/to/project --plan PLAN_ID
 Approval freezes the objective, acceptance criteria, technology choices, deployment targets, and authority. Only the current dependency wave becomes executable. After its exact merge commit passes staging and lifecycle verification, the harness reassesses the entire objective and may revise only unstarted work within those boundaries. Material changes pause at `awaiting_material_approval`; task completion alone never marks the objective delivered.
 
 Approved `verify` and `operate` stories do not need a fabricated code change or PR when the existing behavior is already correct. Unchanged work still passes every configured required local check and independent review, validates the unchanged remote issue contract, and checks required GitHub CI on the exact current default-branch commit. Unchanged operations work also requires the latest controller-owned staging deployment to have verified that revision when staging is enabled. Pending provider/CI proof waits without consuming code retries; stale evidence or failed checks cannot complete the task. Its durable verification receipt lets interrupted issue closure resume safely. Implementation and documentation stories still require a real repository change.
+
+When an unchanged operations task needs staging preparation, it requests the controller before attempting its acceptance work. Once all other work in that wave is complete and required exact-commit GitHub CI passes, the controller deploys and verifies staging while leaving the task waiting. Its acceptance and independent review still run afterward. If the merged revision advances while read-only work waits, only a clean owned branch with no candidate changes can fast-forward; an intent receipt makes that refresh restart-safe. Changed worktrees and implementation candidates are never overwritten.
 
 Use `plan ... --approve` only when you intentionally want planning and approval in one command. Re-running the same requirements snapshot is idempotent. Editing the file creates a new draft; accepted work is never silently rewritten.
 
