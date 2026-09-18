@@ -24,7 +24,7 @@ import { RepositoryAssessor } from './program/repository-assessor.js';
 import { buildEvidenceReport, formatEvidenceReport } from './program/evidence-report.js';
 import { runInteractiveTerminal } from './terminal/interactive.js';
 
-const VERSION = '1.0.0-rc.31';
+const VERSION = '1.0.0-rc.32';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? (process.stdin.isTTY && process.stdout.isTTY ? 'interactive' : 'help');
@@ -296,6 +296,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const requirementsPath = valueOf(args, '--requirements');
       if (!planId || !requirementsPath) throw new Error('plan-redraft requires --plan PLAN_ID --requirements FILE');
       const feedbackPath = valueOf(args, '--feedback');
+      const assessmentId = valueOf(args, '--assessment');
+      if (assessmentId && !feedbackPath) throw new Error('plan-redraft --assessment requires --feedback FILE');
       const reviseObjective = hasFlag(args, '--revise-objective');
       const expected = approvalExpectation(args);
       const maxStories = integerValue(args, '--max-stories') ?? DEFAULT_MAX_PORTFOLIO_STORIES;
@@ -317,7 +319,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           credentialEnvKey: config.qwen.credentialEnvKey,
           apiKey: credential?.apiKey,
         });
-        const assessment = await new RepositoryAssessor(config, qwenApi).assess(document, undefined, [], undefined, feedback?.content);
+        const assessor = new RepositoryAssessor(config, qwenApi);
+        const previousAssessment = assessmentId ? store.getRepositoryAssessment(assessmentId) : null;
+        if (assessmentId && !previousAssessment) throw new Error(`Repository assessment ${assessmentId} not found`);
+        const assessment = previousAssessment
+          ? await assessor.refineAssessment(document, previousAssessment, feedback!.content)
+          : await assessor.assess(document, undefined, [], undefined, feedback?.content);
         store.saveRepositoryAssessment(assessment);
         const draft = await new PortfolioPlanner(config, qwenApi).plan(document, maxStories, assessment, feedback?.content);
         const plan = await coordinator.replaceUnapprovedDraft({
@@ -557,7 +564,7 @@ function formatControllerReleases(releases: ControllerRelease[]): string {
 }
 
 function firstPositional(args: string[]): string | undefined {
-  const valueOptions = new Set(['--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash']);
+  const valueOptions = new Set(['--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment']);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] as string;
     if (valueOptions.has(arg)) {
@@ -657,7 +664,7 @@ Reward options:
 Plan options:
   interactive [PROJECT] (also the default when launched without arguments in a terminal)
   plan PROJECT --requirements FILE [--max-stories N] [--approve] [--json]
-  plan-redraft PROJECT --plan PLAN_ID --requirements FILE [--feedback FILE] [--max-stories N] [--revise-objective --revision N --hash HASH] [--json]
+  plan-redraft PROJECT --plan PLAN_ID --requirements FILE [--feedback FILE] [--assessment ID] [--max-stories N] [--revise-objective --revision N --hash HASH] [--json]
   plan-approve PROJECT --plan PLAN_ID [--revision N --hash HASH] [--json]
   plan-status PROJECT [--plan PLAN_ID] [--json]
   plan-reassess PROJECT --plan PLAN_ID [--json]

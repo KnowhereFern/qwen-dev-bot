@@ -321,6 +321,8 @@ export interface RepositoryAssessment {
   analyses: RepositoryAnalysis[];
   coverage: ObjectiveCoverage[];
   createdAt: number;
+  objectiveContentHash?: string;
+  reviewedAssessmentId?: string;
 }
 
 export interface ProgramRevision {

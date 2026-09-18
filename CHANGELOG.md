@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.32] - 2026-09-17
+
+- Add focused read-only assessment correction using saved evidence only when project, clean commit, inventory and committed objective still match.
+- Keep assessment lineage and objective hashes, and retain existing exact-evidence and implementation-action safeguards.
+
 ## [1.0.0-rc.31] - 2026-09-17
 
 - Pass redraft review evidence to repository assessment as well as planning, keeping it outside execution authority.

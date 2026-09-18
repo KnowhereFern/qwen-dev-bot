@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
@@ -32,7 +32,7 @@ class AssessmentModel implements PortfolioPlanningModel {
     }
     return { value: { coverage: [{
       id: 'HEALTH', requirement: 'Expose health', status: 'unverified', requiredAction: 'verify', rationale: 'Runtime is unverified',
-      evidence: [{ kind: 'file', locator: 'server.ts', summary: 'Health source' }],
+      evidence: [{ kind: 'file', locator: this.badEvidence ? 'invented.ts' : 'server.ts', summary: 'Health source' }],
     }] } as T };
   }
 }
@@ -222,6 +222,74 @@ describe('RepositoryAssessor', () => {
     });
 
     expect(assessment.coverage[0]).toMatchObject({ status: 'partial', requiredAction: 'implement' });
+  });
+
+  it('reviews saved same-commit evidence with one focused call and retains assessment lineage', async () => {
+    const root = gitRepo();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    const document = { sourcePath: 'PROJECT.md', content: readFileSync(path.join(root, 'PROJECT.md'), 'utf8') };
+    const model = new AssessmentModel();
+    const assessor = new RepositoryAssessor(config, model);
+    const previous = await assessor.assess(document);
+    const reviewed = await assessor.refineAssessment(document, previous, 'Check classification against the evidence.');
+
+    expect(model.calls).toBe(6);
+    expect(reviewed.id).not.toBe(previous.id);
+    expect(reviewed).toMatchObject({
+      reviewedAssessmentId: previous.id, objectiveContentHash: previous.objectiveContentHash, commitSha: previous.commitSha,
+    });
+    expect(reviewed.analyses).toEqual(previous.analyses);
+    expect(model.prompts[5]).toContain('focused read-only classification review');
+  });
+
+  it('rejects changed objectives, cross-project evidence and moved or dirty snapshots before review requests', async () => {
+    const root = gitRepo();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    const document = { sourcePath: 'PROJECT.md', content: readFileSync(path.join(root, 'PROJECT.md'), 'utf8') };
+    const model = new AssessmentModel();
+    const assessor = new RepositoryAssessor(config, model);
+    const previous = await assessor.assess(document);
+
+    await expect(assessor.refineAssessment({ ...document, content: 'A different objective.' }, previous, 'Review'))
+      .rejects.toThrow(/unchanged committed objective/);
+    await expect(assessor.refineAssessment(document, { ...previous, projectId: 'other' }, 'Review'))
+      .rejects.toThrow(/this project/);
+    await expect(assessor.refineAssessment(document, { ...previous, files: ['server.ts'] }, 'Review'))
+      .rejects.toThrow(/file inventory/);
+    writeFileSync(path.join(root, 'server.ts'), 'export const changed = true;\n');
+    await expect(assessor.refineAssessment(document, previous, 'Review')).rejects.toThrow(/clean/);
+    execFileSync('git', ['add', 'server.ts'], { cwd: root });
+    execFileSync('git', ['commit', '-qm', 'move snapshot'], { cwd: root });
+    await expect(assessor.refineAssessment(document, previous, 'Review')).rejects.toThrow(/same clean repository commit/);
+    expect(model.calls).toBe(5);
+  });
+
+  it('rejects invented evidence in a focused review', async () => {
+    const root = gitRepo();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    const document = { sourcePath: 'PROJECT.md', content: readFileSync(path.join(root, 'PROJECT.md'), 'utf8') };
+    const previous = await new RepositoryAssessor(config, new AssessmentModel()).assess(document);
+    const reviewer = new AssessmentModel(true);
+    reviewer.calls = 4;
+
+    await expect(new RepositoryAssessor(config, reviewer).refineAssessment(document, previous, 'Review'))
+      .rejects.toThrow(/unknown file invented\.ts/);
+  });
+
+  it('keeps derived implementation and exact-commit proof safeguards after a focused review', async () => {
+    const root = gitRepo();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    const document = { sourcePath: 'PROJECT.md', content: readFileSync(path.join(root, 'PROJECT.md'), 'utf8') };
+    const previous = await new RepositoryAssessor(config, new AssessmentModel()).assess(document);
+    const contradictory = new ContradictoryPartialActionModel();
+    contradictory.calls = 4;
+    const reviewed = await new RepositoryAssessor(config, contradictory).refineAssessment(document, previous, 'Review');
+    expect(reviewed.coverage[0]).toMatchObject({ status: 'partial', requiredAction: 'implement' });
+
+    const unsupported = new ImplementedCoverageModel([{ kind: 'file', locator: 'server.ts', summary: 'Source only' }]);
+    unsupported.calls = 4;
+    const unsupportedReview = await new RepositoryAssessor(config, unsupported).refineAssessment(document, previous, 'Review');
+    expect(unsupportedReview.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
   });
 });
 

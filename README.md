@@ -2,7 +2,7 @@
 
 A software product designed and built by Fern. It uses Qwen Code and `qwen3.8-max` as its execution engine to turn approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.31`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
+**Release status:** `v1.0.0-rc.32`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
 
 See [live test readiness](docs/live-test-readiness.md) for the current machine and end-to-end proof status.
 
@@ -172,6 +172,8 @@ Approval publishes executable work for the current wave; an already-running work
 Before initial approval, an operator may explicitly revise the proposed objective using `plan-redraft --revise-objective --revision N --hash HASH` together with the existing plan, requirements and optional feedback flags. Ordinary redrafts still require unchanged requirements. The objective-revision option requires the exact prior revision/hash, retains old objective content and superseded stories, and remains review-only; approved objectives cannot use it. Draft revisions are recorded as planning interventions in exported evidence. The [Festival SOS validation track](docs/validation/festival-sos.md) separates product journey acceptance from controller and self-evolution proof.
 
 Initial change requests use `plan-redraft` without approving the result. Its optional review feedback reaches both repository assessment and program planning as evidence, never execution authority. Approved objectives cannot be redrafted through this shortcut; material revisions remain behind explicit approval. Ctrl+C or EOF exits the menu cleanly. During a command, existing command recovery rules apply: reopen the console and inspect status before retrying an interrupted operation.
+
+For a focused classification correction, `plan-redraft --assessment ID --feedback FILE` may review saved evidence instead of repeating all four assessments. It requires the same project, clean commit, file inventory and committed objective content; stale or changed inputs require a fresh assessment. The reviewed assessment records its predecessor, retains the evidence reviews and still passes exact-evidence/action validation. It does not approve or execute work.
 
 This is the initial terminal operator interface. Broader interaction design, a dedicated notification/approval inbox, and a dashboard remain for a later review; the console does not add approvals through GitHub comments or checkboxes.
 
