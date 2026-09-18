@@ -2,6 +2,6 @@
   "name": "qwen-dev-harness",
   "displayName": "Autonomous Software Delivery Harness",
   "description": "Fern-designed delivery agents, reward evaluation guidance, and operator commands powered by Qwen3.8-Max.",
-  "version": "1.0.0-rc.24",
+  "version": "1.0.0-rc.35",
   "contextFileName": "DELIVERY-HARNESS.md"
 }

@@ -4,7 +4,7 @@ import type { PortfolioPlan, ProgramRevision, ProjectConfig } from '../core/type
 import { StagingDeploymentController } from '../deployment/controller.js';
 import { EvolutionSignalCollector } from '../evolution/signals.js';
 import { REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from '../github/control-plane.js';
-import { PortfolioCoordinator } from '../portfolio/coordinator.js';
+import { matchesPortfolioTaskContract, PortfolioCoordinator } from '../portfolio/coordinator.js';
 import { PortfolioPlanner, readRequirementsDocument } from '../portfolio/planner.js';
 import { runProcess } from '../runtime/safe-process.js';
 import { RepositoryAssessor } from './repository-assessor.js';
@@ -52,6 +52,10 @@ export class ProgramController {
     }
 
     if (plan.status === 'assessing') return this.finishWave(plan, signal);
+    if (plan.status === 'active') {
+      const verification = await this.verifyWaitingOperations(plan, signal);
+      if (verification) return verification;
+    }
     if (plan.status === 'delivered') {
       if (!this.config.program.maintenance) return { action: 'delivered', planId: plan.id };
       await this.coordinator.updateProgramState(plan.id, 'maintaining', { maintenanceStartedAt: plan.maintenanceStartedAt ?? Date.now() });
@@ -189,6 +193,38 @@ export class ProgramController {
     const updated = this.store.getPortfolioPlan(plan.id) as PortfolioPlan;
     const result = await this.reassess(updated, 'wave-complete', signal, false, commitSha);
     return result.action === 'reassessed' ? { ...result, action: 'deployed' } : result;
+  }
+
+  private async verifyWaitingOperations(plan: PortfolioPlan, signal?: AbortSignal): Promise<ProgramTickResult | null> {
+    if (!this.config.deployment.staging.enabled || plan.approvedAt === null) return null;
+    const wave = plan.stories.filter((story) => !story.supersededAt && (story.wave ?? 1) === (plan.currentWave ?? 1));
+    const pending = wave.filter((story) => this.store.findByIssue(story.normalizedIssueNumber ?? -1)?.state !== 'done');
+    if (!pending.length || pending.some((story) => story.workType !== 'operate')) return null;
+    const commitSha = await this.remoteHead(signal);
+    const waiting = [...this.store.listEvents('task.verification_wait'), ...this.store.listEvents('task.staging_preparation_requested')];
+    for (const story of pending) {
+      const task = this.store.findByIssue(story.normalizedIssueNumber ?? -1);
+      if (!task || task.state !== 'waiting' || task.waitKind !== 'provider' || task.prNumber !== null ||
+          !task.spec || !matchesPortfolioTaskContract(plan, story, task.spec) ||
+          task.commitSha !== commitSha || task.baseSha !== commitSha || !waiting.some((event) =>
+            event.taskId === task.id && event.payload.commitSha === commitSha)) return null;
+    }
+    const checks = await this.github.checksForRef(commitSha, [...REQUIRED_POST_MERGE_GITHUB_CHECKS]);
+    if (!checks.complete || !checks.successful || checks.failed.length || await this.remoteHead(signal) !== commitSha) return null;
+    const deployment = this.store.listDeployments(plan.id).find((record) => record.wave === (plan.currentWave ?? 1) && record.commitSha === commitSha);
+    if (deployment?.status === 'failed' || deployment?.status === 'rolled_back') {
+      await this.ensureStagingRepair(plan, deployment.error ?? 'Staging verification failed', commitSha);
+      return { action: 'deployment-failed', planId: plan.id, detail: deployment.id };
+    }
+    const verified = deployment?.status === 'succeeded' ? deployment
+      : await this.deployer.deploy({ planId: plan.id, wave: plan.currentWave ?? 1, commitSha, signal });
+    await this.coordinator.updateProgramState(plan.id, 'active', { latestDeploymentId: verified.id });
+    if (verified.status !== 'succeeded') {
+      await this.ensureStagingRepair(plan, verified.error ?? 'Staging verification failed', commitSha);
+      return { action: 'deployment-failed', planId: plan.id, detail: verified.id };
+    }
+    // Preserve task contracts and their waiting state. Only the supervisor can complete their acceptance checks.
+    return { action: 'deployed', planId: plan.id, detail: verified.id };
   }
 
   private async ensureStagingRepair(plan: PortfolioPlan, error: string, commitSha: string): Promise<void> {

@@ -1,6 +1,6 @@
 {
   "name": "qwen-harness-starter",
-  "version": "1.0.0-rc.24",
+  "version": "1.0.0-rc.35",
   "private": true,
   "description": "Minimal one-click starter for Fern's autonomous software delivery harness, powered by Qwen Code.",
   "license": "MIT",

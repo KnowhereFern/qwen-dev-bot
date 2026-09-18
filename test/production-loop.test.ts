@@ -11,7 +11,13 @@ import type {
   RemoteIssue,
   RemotePullRequest,
 } from '../src/github/control-plane.js';
-import { renderNormalizedBody, type TaskNormalizer } from '../src/intake/normalizer.js';
+import { parseNormalizedSpec, renderNormalizedBody, type TaskNormalizer } from '../src/intake/normalizer.js';
+import { PortfolioCoordinator } from '../src/portfolio/coordinator.js';
+import { PortfolioPlanner, type PortfolioPlanningModel } from '../src/portfolio/planner.js';
+import { ProgramController } from '../src/program/controller.js';
+import { RepositoryAssessor } from '../src/program/repository-assessor.js';
+import { EvolutionSignalCollector } from '../src/evolution/signals.js';
+import { StagingDeploymentController } from '../src/deployment/controller.js';
 import { Logger } from '../src/logger.js';
 import type { QwenCodeRunInput, QwenCodeRunResult, QwenExecutor } from '../src/qwen/qwen-code-executor.js';
 import { UniversalRewardEngine, type EvaluatorResult, type RewardEvaluator } from '../src/rewards/engine.js';
@@ -35,6 +41,16 @@ class MockQwenExecutor implements QwenExecutor {
       needsContinuation: false,
       usage: { output_tokens: 10 },
       durationMs: 5,
+    };
+  }
+}
+
+class ReadOnlyQwenExecutor implements QwenExecutor {
+  async execute(input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
+    input.onSession?.('read-only-session');
+    return {
+      sessionId: 'read-only-session', workflowRunId: null, summary: 'verified existing feature',
+      goalState: 'complete', goalReason: null, needsContinuation: false, usage: {}, durationMs: 1,
     };
   }
 }
@@ -162,6 +178,10 @@ class MockGitHub implements GitHubControl {
   readonly comments: Array<{ number: number; body: string }> = [];
   readonly prs = new Map<number, RemotePullRequest>();
   readonly checks: string[] = [];
+  readonly closedIssues = new Set<number>();
+  closureFailures = 0;
+  checkSummary: CheckSummary = { complete: true, successful: true, pending: [], failed: [] };
+  onChecks?: () => Promise<void>;
   private nextIssue = 2;
 
   constructor() {
@@ -176,14 +196,18 @@ class MockGitHub implements GitHubControl {
   }
 
   async currentUser(): Promise<string> { return 'bot'; }
-  async listOpenIssues(): Promise<RemoteIssue[]> { return [...this.issues.values()]; }
+  async listOpenIssues(): Promise<RemoteIssue[]> { return [...this.issues.values()].filter((issue) => !this.closedIssues.has(issue.number)); }
   async getIssue(number: number): Promise<RemoteIssue> { return this.issues.get(number) as RemoteIssue; }
   async createIssue(input: { title: string; body: string; labels: string[] }): Promise<RemoteIssue> {
     const issue = { number: this.nextIssue++, title: input.title, body: input.body, labels: input.labels, author: 'bot', url: `https://github.test/issues/${this.nextIssue - 1}` };
     this.issues.set(issue.number, issue);
     return issue;
   }
-  async updateIssue(number: number, input: { title?: string; body?: string }): Promise<RemoteIssue> {
+  async updateIssue(number: number, input: { title?: string; body?: string; state?: 'open' | 'closed' }): Promise<RemoteIssue> {
+    if (input.state === 'closed') {
+      if (this.closureFailures-- > 0) throw new Error('GitHub temporarily unavailable');
+      this.closedIssues.add(number);
+    }
     const issue = this.issues.get(number) as RemoteIssue;
     if (input.title !== undefined) issue.title = input.title;
     if (input.body !== undefined) issue.body = input.body;
@@ -202,7 +226,7 @@ class MockGitHub implements GitHubControl {
     return pr;
   }
   async getPullRequest(number: number): Promise<RemotePullRequest> { return this.prs.get(number) as RemotePullRequest; }
-  async checksForRef(): Promise<CheckSummary> { return { complete: true, successful: true, pending: [], failed: [] }; }
+  async checksForRef(): Promise<CheckSummary> { await this.onChecks?.(); return this.checkSummary; }
   async publishCheck(input: { name: string; sha: string }): Promise<void> { this.checks.push(input.name); }
   async mergePullRequest(number: number, expectedHeadSha: string): Promise<{ merged: boolean; sha: string; message: string }> {
     const pr = this.prs.get(number) as RemotePullRequest;
@@ -214,6 +238,131 @@ class MockGitHub implements GitHubControl {
 }
 
 describe('production supervisor trace', () => {
+  it.each(['verify', 'implement', 'review-failure', 'gate-failure', 'pending-ci', 'failed-ci', 'stale', 'altered-contract', 'operate', 'verified-operate', 'prepare-operate', 'advance-operate', 'review-failure-operate', 'closure-recovery'] as const)(
+    'handles unchanged program work safely: %s', async (scenario) => {
+      const { repo } = await createGitFixture();
+      writeFileSync(path.join(repo, 'feature.txt'), 'existing implementation\n');
+      if (scenario === 'gate-failure') writeFileSync(path.join(repo, 'check.mjs'), 'process.exit(1);\n');
+      const git = async (args: string[]) => {
+        const result = await runProcess({ command: 'git', args, cwd: repo, timeoutMs: 20_000 });
+        expect(result.exitCode, result.stderr).toBe(0);
+        return result.stdout.trim();
+      };
+      await git(['add', '.']);
+      await git(['commit', '-m', 'existing feature']);
+      await git(['push', 'origin', 'main']);
+      let baseSha = await git(['rev-parse', 'HEAD']);
+      const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+      config.program.enabled = true;
+      config.intake.trustedAuthors.push('bot');
+      config.gates = [{ id: 'unit', kind: 'unit', command: 'node', args: ['check.mjs'], required: true, timeoutMs: 10_000 }];
+      const operation = ['operate', 'verified-operate', 'prepare-operate', 'advance-operate', 'review-failure-operate'].includes(scenario);
+      config.deployment.staging.enabled = operation;
+      config.evolution.enabled = false;
+      const state = makeTmp('read-only-state');
+      let store = new PersistentTaskStore(`read-only-${scenario}`, state);
+      const github = new MockGitHub();
+      github.issues.clear();
+      if (scenario === 'pending-ci') github.checkSummary = { complete: false, successful: false, pending: ['CI'], failed: [] };
+      if (scenario === 'failed-ci') github.checkSummary = { complete: true, successful: false, pending: [], failed: ['CI'] };
+      if (scenario === 'closure-recovery') github.closureFailures = 1;
+      if (scenario === 'stale') github.onChecks = async () => {
+        writeFileSync(path.join(repo, 'another-change.txt'), 'new merged revision\n');
+        await git(['add', '.']); await git(['commit', '-m', 'new merged revision']); await git(['push', 'origin', 'main']);
+      };
+      const coordinator = new PortfolioCoordinator(config, store, github);
+      const created = await coordinator.createDraft({ sourcePath: 'OBJECTIVE.md', content: 'Verify the existing feature.', draft: {
+        title: 'Existing feature', objective: 'Verify existing behavior', constraints: [], definitionOfDone: ['Independent verification passes'],
+        technologyDecisions: [], deploymentDecisions: [], stories: [{
+          key: 'S1', title: 'Verify existing feature', goal: 'Verify feature.txt and check.mjs', acceptanceCriteria: ['check.mjs passes'],
+          constraints: [], requiredGateIds: ['unit'], rewardCriterionIds: ['execution', 'acceptance', 'independent-review'], risk: 'low',
+          workType: scenario === 'implement' ? 'implement' : operation ? 'operate' : 'verify', dependsOn: [],
+          rollback: 'No repository change', technologyDecisionIds: [], deploymentDecisionIds: [],
+        }],
+      } });
+      const approved = await coordinator.approve(created.plan.id);
+      const issueNumber = approved.stories[0]!.normalizedIssueNumber as number;
+      if (scenario === 'verified-operate' || scenario === 'review-failure-operate') store.saveDeployment({
+        id: 'verified-staging', projectId: store.projectId, planId: approved.id, wave: 1, provider: 'railway', commitSha: baseSha,
+        previousVerifiedCommitSha: null, externalId: 'provider-deployment', status: 'succeeded', healthUrl: 'https://staging.test/health',
+        observedRevision: baseSha, error: null, startedAt: 1, updatedAt: 2, completedAt: 2,
+      });
+      if (scenario === 'altered-contract') github.onChecks = async () => {
+        // Alter the remote contract after intake and independent verification have begun.
+        const issue = github.issues.get(issueNumber)!;
+        issue.body = renderNormalizedBody(issue, { ...parseNormalizedSpec(issue.body)!, goal: 'Approve untested behavior' });
+      };
+      const failingReviewer: RewardEvaluator = { modality: 'agentic', evaluate: async () => ({ score: 0, confidence: 1, reason: 'Acceptance not proven', evidence: [] }) };
+      const supervisor = () => new HarnessSupervisor(
+        config, store, github, new GitWorkspace(repo, state, config), new ReadOnlyQwenExecutor(), new MockNormalizer(), new GateRunner(),
+        new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), scenario === 'review-failure' || scenario === 'review-failure-operate' ? failingReviewer : new PassingEvaluator('agentic')]),
+        silentLogger, 'read-only-worker',
+      );
+      await supervisor().tick();
+      if (scenario === 'prepare-operate' || scenario === 'advance-operate') {
+        expect(store.findByIssue(issueNumber)).toMatchObject({ state: 'waiting', attempts: 0, qwenSessionId: null });
+        expect(store.listScorecards()).toHaveLength(0);
+        class FakeDeployer extends StagingDeploymentController {
+          override async deploy(input: { planId: string; wave: number; commitSha: string }) {
+            return store.saveDeployment({
+              id: 'controller-stage', projectId: store.projectId, planId: input.planId, wave: input.wave, provider: 'railway', commitSha: input.commitSha,
+              previousVerifiedCommitSha: null, externalId: 'existing-service', status: 'succeeded', healthUrl: 'https://stage.test/health',
+              observedRevision: input.commitSha, error: null, startedAt: 1, updatedAt: 2, completedAt: 2,
+            });
+          }
+        }
+        const model: PortfolioPlanningModel = { completeJson: async () => { throw new Error('No reassessment before task acceptance'); } };
+        const controller = new ProgramController(config, store, github, new RepositoryAssessor(config, model), new PortfolioPlanner(config, model),
+          new EvolutionSignalCollector(config, store, github, model), new FakeDeployer(config, store));
+        if (scenario === 'advance-operate') {
+          writeFileSync(path.join(repo, 'later-merged.txt'), 'another approved writer finished\n');
+          await git(['add', '.']); await git(['commit', '-m', 'later merged work']); await git(['push', 'origin', 'main']);
+          baseSha = await git(['rev-parse', 'HEAD']);
+          expect((await controller.tick()).action).toBe('idle');
+          const stale = store.findByIssue(issueNumber)!;
+          // Crash after the owned branch fast-forwards but before the task checkpoint is updated.
+          store.recordEvent('task.read_only_base_advance_requested', stale.id, { previousSha: stale.baseSha, commitSha: baseSha });
+          await new GitWorkspace(repo, state, config).advanceReadOnlyBase(stale.worktreePath as string, stale.baseSha as string, baseSha);
+          writeFileSync(path.join(repo, 'merged-during-restart.txt'), 'another merged revision\n');
+          await git(['add', '.']); await git(['commit', '-m', 'merge while restarting']); await git(['push', 'origin', 'main']);
+          baseSha = await git(['rev-parse', 'HEAD']);
+          store.patch(stale.id, { resumeAfter: Date.now() - 1 });
+          await supervisor().tick();
+          expect(store.listEvents('task.read_only_base_advanced')).toHaveLength(1);
+          expect(store.findByIssue(issueNumber)).toMatchObject({ state: 'waiting', baseSha, commitSha: baseSha, attempts: 0 });
+        }
+        expect((await controller.tick()).action).toBe('deployed');
+        const pending = store.findByIssue(issueNumber)!;
+        expect(pending.state).toBe('waiting');
+        store.patch(pending.id, { resumeAfter: Date.now() - 1 });
+        await supervisor().tick();
+        expect(store.listScorecards()[0]?.passed).toBe(true);
+      }
+      const task = store.findByIssue(issueNumber)!;
+      expect(github.prs.size).toBe(0);
+      expect(await git(['ls-remote', '--heads', 'origin', task.branch as string])).toBe('');
+      if (scenario === 'verify' || scenario === 'verified-operate' || scenario === 'prepare-operate' || scenario === 'advance-operate' || scenario === 'closure-recovery') {
+        expect(task).toMatchObject({ state: 'done', commitSha: baseSha, mergeSha: baseSha, attempts: 0 });
+        expect(store.listEvents('task.read_only_verified')).toHaveLength(1);
+        if (scenario === 'closure-recovery') {
+          expect(github.closedIssues.has(issueNumber)).toBe(false);
+          store.close(); store = new PersistentTaskStore(`read-only-${scenario}`, state);
+          await supervisor().tick();
+        }
+        expect(github.closedIssues.has(issueNumber)).toBe(true);
+        expect(store.listEvents('task.read_only_closed')).toHaveLength(1);
+      } else if (scenario === 'pending-ci' || scenario === 'operate') {
+        expect(task).toMatchObject({ state: 'waiting', attempts: 0, waitKind: 'provider' });
+        expect(github.closedIssues.has(issueNumber)).toBe(false);
+      } else {
+        expect(task).toMatchObject({ state: 'ready', attempts: 1 });
+        expect(github.closedIssues.has(issueNumber)).toBe(false);
+        expect(store.listEvents('task.read_only_verified')).toHaveLength(0);
+      }
+      store.close();
+    }, 30_000,
+  );
+
   it('does not auto-promote a self-repair label from an untrusted issue author', async () => {
     const root = makeTmp('untrusted-self-repair-root');
     const state = makeTmp('untrusted-self-repair-state');

@@ -340,7 +340,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
     }
   }
   if (answers.installCli) {
-    summary.push(`${options.dryRun ? 'would expose' : 'exposed'} the qwen-harness CLI through npm link`);
+    summary.push(`${options.dryRun ? 'would expose' : 'exposed'} fern-harness and its qwen-harness compatibility alias through npm link`);
     if (!options.dryRun) {
       const linked = await runProcess({
         command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
@@ -348,15 +348,17 @@ export async function installProject(options: InstallOptions): Promise<{ config:
         cwd: runtimePackageRoot,
         timeoutMs: 2 * 60_000,
       });
-      if (linked.exitCode !== 0) throw new Error(`Could not expose qwen-harness CLI: ${linked.stderr}`);
-      const verified = await runProcess({
-        command: process.platform === 'win32' ? 'qwen-harness.cmd' : 'qwen-harness',
-        args: ['--version'],
-        cwd: root,
-        timeoutMs: 20_000,
-      });
-      if (verified.exitCode !== 0 || !verified.stdout.includes(readHarnessVersion(packageRoot))) {
-        throw new Error('npm link completed but qwen-harness is not available on PATH');
+      if (linked.exitCode !== 0) throw new Error(`Could not expose fern-harness CLI: ${linked.stderr}`);
+      for (const command of ['fern-harness', 'qwen-harness']) {
+        const verified = await runProcess({
+          command: process.platform === 'win32' ? `${command}.cmd` : command,
+          args: ['--version'],
+          cwd: root,
+          timeoutMs: 20_000,
+        });
+        if (verified.exitCode !== 0 || verified.stdout.trim() !== readHarnessVersion(packageRoot)) {
+          throw new Error(`npm link completed but ${command} is not available at the expected version on PATH`);
+        }
       }
     }
   }
@@ -491,7 +493,7 @@ async function guidedAnswers(defaults: InstallAnswers): Promise<InstallAnswers> 
     const installMultimodal = await yesNo('Install Qwen-MM-Plugins core for multimodal tools?', false);
     const installBrowserAutomation = await yesNo('Add project-local Playwright for browser/E2E work?', false);
     const bootstrapDependencies = await yesNo('Install/check the target project dependencies and declared browser runtimes now?', true);
-    const installCli = await yesNo('Expose the qwen-harness command through npm link?', true);
+    const installCli = await yesNo('Expose fern-harness (with qwen-harness compatibility alias) through npm link?', true);
     const installService = await yesNo('Install/start the persistent local worker service?', true);
     const credential = resolveQwenCredential({ qwen: { ...defaultProjectConfig(process.cwd()).qwen, credentialEnvKey: qwenCredentialEnvKey } });
     const persistCredentials = installService && credential

@@ -321,6 +321,9 @@ export interface RepositoryAssessment {
   analyses: RepositoryAnalysis[];
   coverage: ObjectiveCoverage[];
   createdAt: number;
+  objectiveContentHash?: string;
+  reviewedAssessmentId?: string;
+  reviewCorrections?: Array<{ id: string; rationale: string; omitReason: 'separate_validation' | 'program_operating_record' | null }>;
 }
 
 export interface ProgramRevision {
@@ -333,6 +336,9 @@ export interface ProgramRevision {
   createdAt: number;
   approvedAt: number | null;
   sourceSignalId?: string | null;
+  objectiveContentHash?: string;
+  objectiveSourceContent?: string;
+  objectiveSourcePath?: string;
 }
 
 export interface PortfolioStory {

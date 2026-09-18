@@ -118,6 +118,18 @@ export class GitWorkspace {
     return [...files];
   }
 
+  async headSha(worktree: string): Promise<string> {
+    return (await this.git(['rev-parse', 'HEAD'], worktree)).stdout.trim();
+  }
+
+  async advanceReadOnlyBase(worktree: string, previousSha: string, currentSha: string): Promise<void> {
+    this.assertOwnedPath(worktree);
+    if (await this.headSha(worktree) !== previousSha || (await this.changedFiles(worktree)).length > 0) {
+      throw new Error('Refusing to advance read-only evidence over a changed worktree');
+    }
+    await this.git(['merge', '--ff-only', currentSha], worktree);
+  }
+
   async filesChangedBetween(worktree: string, baseSha: string, headSha: string): Promise<string[]> {
     const receipt = await this.git(
       ['diff', '--name-status', '-z', '--find-renames', `${baseSha}..${headSha}`],
