@@ -323,6 +323,7 @@ export interface RepositoryAssessment {
   createdAt: number;
   objectiveContentHash?: string;
   reviewedAssessmentId?: string;
+  reviewCorrections?: Array<{ id: string; rationale: string; omitReason: 'separate_validation' | 'program_operating_record' | null }>;
 }
 
 export interface ProgramRevision {

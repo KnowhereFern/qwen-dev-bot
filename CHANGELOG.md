@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.33] - 2026-09-17
+
+- Keep focused review responses to changed classifications instead of regenerating the full assessment; preserve untouched requirements and evidence.
+- Reject unknown/duplicate corrections and unsupported omissions without weakening exact-commit or required-action safeguards.
+
 ## [1.0.0-rc.32] - 2026-09-17
 
 - Add focused read-only assessment correction using saved evidence only when project, clean commit, inventory and committed objective still match.

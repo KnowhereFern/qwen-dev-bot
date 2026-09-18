@@ -30,23 +30,23 @@ class AssessmentModel implements PortfolioPlanningModel {
         risks: this.blankRisk ? [null, '', '   '] : [],
       } as T };
     }
-    return { value: { coverage: [{
+    return coverageResponse<T>(input, {
       id: 'HEALTH', requirement: 'Expose health', status: 'unverified', requiredAction: 'verify', rationale: 'Runtime is unverified',
       evidence: [{ kind: 'file', locator: this.badEvidence ? 'invented.ts' : 'server.ts', summary: 'Health source' }],
-    }] } as T };
+    });
   }
 }
 
 class ContradictoryPartialActionModel implements PortfolioPlanningModel {
   calls = 0;
-  async completeJson<T>(): Promise<{ value: T }> {
+  async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]): Promise<{ value: T }> {
     this.calls += 1;
     return this.calls <= 4
       ? { value: { summary: 'Incomplete capability', findings: [], risks: [] } as T }
-      : { value: { coverage: [{
+      : coverageResponse<T>(input, {
           id: 'HEALTH', requirement: 'Expose health', status: 'partial', requiredAction: 'verify',
           rationale: 'Only part of the required behavior exists.', evidence: [],
-        }] } as T };
+        });
   }
 }
 
@@ -65,14 +65,14 @@ class UnsupportedEvidenceModel implements PortfolioPlanningModel {
 class ImplementedCoverageModel implements PortfolioPlanningModel {
   calls = 0;
   constructor(private readonly evidence: Array<{ kind: 'file' | 'test'; locator: string; summary: string }>) {}
-  async completeJson<T>(): Promise<{ value: T }> {
+  async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]): Promise<{ value: T }> {
     this.calls += 1;
     return this.calls <= 4
       ? { value: { summary: 'Capability appears complete', findings: [], risks: [] } as T }
-      : { value: { coverage: [{
+      : coverageResponse<T>(input, {
           id: 'HEALTH', requirement: 'Expose health', status: 'implemented', requiredAction: 'none',
           rationale: 'The implementation and test exist.', evidence: this.evidence,
-        }] } as T };
+        });
   }
 }
 
@@ -264,16 +264,17 @@ describe('RepositoryAssessor', () => {
     expect(model.calls).toBe(5);
   });
 
-  it('rejects invented evidence in a focused review', async () => {
+  it('rejects invented correction ids in a focused review', async () => {
     const root = gitRepo();
     const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
     const document = { sourcePath: 'PROJECT.md', content: readFileSync(path.join(root, 'PROJECT.md'), 'utf8') };
     const previous = await new RepositoryAssessor(config, new AssessmentModel()).assess(document);
-    const reviewer = new AssessmentModel(true);
-    reviewer.calls = 4;
+    const reviewer: PortfolioPlanningModel = { async completeJson<T>() { return { value: { corrections: [{
+      id: 'INVENTED', status: 'unverified', requiredAction: 'verify', rationale: 'Invented', omitReason: null,
+    }] } as T }; } };
 
     await expect(new RepositoryAssessor(config, reviewer).refineAssessment(document, previous, 'Review'))
-      .rejects.toThrow(/unknown file invented\.ts/);
+      .rejects.toThrow(/Unknown or duplicate assessment correction INVENTED/);
   });
 
   it('keeps derived implementation and exact-commit proof safeguards after a focused review', async () => {
@@ -291,7 +292,47 @@ describe('RepositoryAssessor', () => {
     const unsupportedReview = await new RepositoryAssessor(config, unsupported).refineAssessment(document, previous, 'Review');
     expect(unsupportedReview.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
   });
+
+  it('preserves untouched requirements and evidence while recording explicitly omitted track entries', async () => {
+    const root = gitRepo();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    const document = { sourcePath: 'PROJECT.md', content: readFileSync(path.join(root, 'PROJECT.md'), 'utf8') };
+    const previous = await new RepositoryAssessor(config, new AssessmentModel()).assess(document);
+    previous.coverage.push({ id: 'TRACK', requirement: 'Separate controller proof', status: 'unverified', requiredAction: 'operate', rationale: 'Separate track', evidence: [] });
+    const reviewer: PortfolioPlanningModel = { async completeJson<T>() { return { value: { corrections: [{
+      id: 'TRACK', status: null, requiredAction: null, rationale: 'Controller proof remains on its separate track.', omitReason: 'separate_validation',
+    }] } as T }; } };
+
+    const reviewed = await new RepositoryAssessor(config, reviewer).refineAssessment(document, previous, 'Keep controller proof separate.');
+
+    expect(reviewed.coverage).toEqual([previous.coverage[0]]);
+    expect(previous.coverage).toHaveLength(2);
+    expect(reviewed.reviewCorrections).toEqual([{ id: 'TRACK', rationale: 'Controller proof remains on its separate track.', omitReason: 'separate_validation' }]);
+  });
+
+  it('rejects duplicate corrections and unsupported omission categories', async () => {
+    const root = gitRepo();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    const document = { sourcePath: 'PROJECT.md', content: readFileSync(path.join(root, 'PROJECT.md'), 'utf8') };
+    const previous = await new RepositoryAssessor(config, new AssessmentModel()).assess(document);
+    const correction = { id: 'HEALTH', status: 'unverified', requiredAction: 'verify', rationale: 'Still unverified', omitReason: null };
+    const duplicate: PortfolioPlanningModel = { async completeJson<T>() { return { value: { corrections: [correction, correction] } as T }; } };
+    await expect(new RepositoryAssessor(config, duplicate).refineAssessment(document, previous, 'Review'))
+      .rejects.toThrow(/duplicate assessment correction HEALTH/);
+    const invalid: PortfolioPlanningModel = { async completeJson<T>() { return { value: { corrections: [{
+      ...correction, status: null, requiredAction: null, omitReason: 'skip_required_behavior',
+    }] } as T }; } };
+    await expect(new RepositoryAssessor(config, invalid).refineAssessment(document, previous, 'Review'))
+      .rejects.toThrow(/Invalid assessment omission HEALTH/);
+  });
 });
+
+function coverageResponse<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0], entry: Record<string, unknown>): { value: T } {
+  const value = input.jsonSchema?.name === 'assessment_corrections'
+    ? { corrections: [{ id: entry.id, status: entry.status, requiredAction: entry.requiredAction, rationale: entry.rationale, omitReason: null }] }
+    : { coverage: [entry] };
+  return { value: value as T };
+}
 
 function gitRepo(): string {
   const root = makeTmp('repository-assessor');
