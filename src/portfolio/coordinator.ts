@@ -99,6 +99,29 @@ export class PortfolioCoordinator {
     return { plan: await this.publishDraft(plan), created: true };
   }
 
+  assertCanRedraft(input: {
+    planId: string;
+    sourcePath: string;
+    content: string;
+    reviseObjective?: boolean;
+    expected?: { revision: number; contentHash: string };
+  }): PortfolioPlan {
+    const current = this.requirePlan(input.planId);
+    if (!['draft', 'awaiting_initial_approval'].includes(current.status) || current.approvedAt !== null) {
+      throw new Error(`Portfolio plan ${current.id} can only be redrafted before initial approval`);
+    }
+    if (input.reviseObjective && !input.expected) {
+      throw new Error('Objective revision requires the current --revision and --hash review guards');
+    }
+    if (input.expected && ((current.revision ?? 1) !== input.expected.revision || current.contentHash !== input.expected.contentHash)) {
+      throw new Error('The program changed since review. Review the current draft before redrafting.');
+    }
+    if (input.sourcePath !== current.sourcePath || (sha256(input.content) !== current.contentHash && !input.reviseObjective)) {
+      throw new Error('Plan redraft must preserve the originally proposed objective and requirements file; use --revise-objective explicitly before initial approval');
+    }
+    return current;
+  }
+
   async replaceUnapprovedDraft(input: {
     planId: string;
     sourcePath: string;
@@ -106,15 +129,12 @@ export class PortfolioCoordinator {
     draft: PortfolioDraft;
     assessment: RepositoryAssessment;
     summary: string;
+    reviseObjective?: boolean;
+    expected?: { revision: number; contentHash: string };
   }): Promise<PortfolioPlan> {
-    const current = this.requirePlan(input.planId);
-    if (!['draft', 'awaiting_initial_approval'].includes(current.status) || current.approvedAt !== null) {
-      throw new Error(`Portfolio plan ${current.id} can only be redrafted before initial approval`);
-    }
+    const current = this.assertCanRedraft(input);
     const contentHash = sha256(input.content);
-    if (contentHash !== current.contentHash || input.sourcePath !== current.sourcePath) {
-      throw new Error('Plan redraft must preserve the originally proposed objective and requirements file');
-    }
+    const objectiveChanged = contentHash !== current.contentHash;
     const now = Date.now();
     const nextRevision = (current.revision ?? 1) + 1;
     const preserved = current.stories.map((story) => ({ ...story, supersededAt: story.supersededAt ?? now }));
@@ -139,13 +159,18 @@ export class PortfolioCoordinator {
       assessmentId: input.assessment.id,
       repositorySha: input.assessment.commitSha,
       reason: 'manual',
-      material: false,
+      material: objectiveChanged,
       summary: input.summary,
       createdAt: now,
       approvedAt: null,
+      objectiveContentHash: contentHash,
+      objectiveSourceContent: input.content,
+      objectiveSourcePath: input.sourcePath,
     };
     let plan = this.save({
       ...current,
+      contentHash,
+      sourceContent: input.content,
       title: input.draft.title,
       objective: input.draft.objective,
       constraints: [...input.draft.constraints],
@@ -159,7 +184,12 @@ export class PortfolioCoordinator {
       coverage: structuredClone(input.assessment.coverage),
       revision: nextRevision,
       currentWave: 1,
-      revisions: [...(current.revisions ?? []), revision],
+      revisions: [...(current.revisions ?? []).map((prior) => ({
+        ...prior,
+        objectiveContentHash: prior.objectiveContentHash ?? current.contentHash,
+        objectiveSourceContent: prior.objectiveSourceContent ?? current.sourceContent,
+        objectiveSourcePath: prior.objectiveSourcePath ?? current.sourcePath,
+      })), revision],
       updatedAt: now,
     });
     plan = await this.publishDraft(plan);
@@ -168,12 +198,19 @@ export class PortfolioCoordinator {
       revision: nextRevision,
       assessmentId: input.assessment.id,
       storyCount: newStories.length,
+      objectiveChanged,
+      previousContentHash: current.contentHash,
+      contentHash,
+      phase: 'planning',
     }, `portfolio:redraft:${plan.id}:${nextRevision}`);
     return plan;
   }
 
-  async approve(planId: string): Promise<PortfolioPlan> {
+  async approve(planId: string, expected?: { revision: number; contentHash: string }): Promise<PortfolioPlan> {
     let plan = this.requirePlan(planId);
+    if (expected && ((plan.revision ?? 1) !== expected.revision || plan.contentHash !== expected.contentHash)) {
+      throw new Error('The program changed since review. Review the current revision before approving.');
+    }
     if (['done', 'delivered', 'maintaining', 'active'].includes(plan.status)) return plan;
     if (plan.status === 'blocked') {
       throw new Error(`Portfolio plan ${plan.id} is blocked; resolve its failed tasks before approving another revision`);
@@ -608,7 +645,7 @@ export function matchesPortfolioTaskContract(
 
 function renderEpic(plan: PortfolioPlan, tasks: TaskRecord[]): string {
   const statusNote = ['draft', 'awaiting_initial_approval'].includes(plan.status)
-    ? 'Review-only draft. No story is executable until `qwen-harness plan-approve` is run explicitly.'
+    ? 'Review-only draft. No story is executable until `fern-harness plan-approve` is run explicitly.'
     : `Plan status: **${plan.status}**.`;
   return [
     statusNote,

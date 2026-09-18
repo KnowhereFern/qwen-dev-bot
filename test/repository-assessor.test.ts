@@ -9,13 +9,15 @@ import { makeTmp } from './helpers.js';
 
 class AssessmentModel implements PortfolioPlanningModel {
   calls = 0;
+  prompts: string[] = [];
   constructor(
     private readonly badEvidence = false,
     private readonly blankRisk = false,
   ) {}
 
-  async completeJson<T>(): Promise<{ value: T }> {
+  async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]): Promise<{ value: T }> {
     this.calls += 1;
+    this.prompts.push(input.system);
     if (this.calls <= 4) {
       return { value: {
         summary: 'Evidence reviewed',
@@ -86,6 +88,9 @@ describe('RepositoryAssessor', () => {
     expect(assessment.analyses.map((analysis) => analysis.area)).toEqual(['product', 'architecture', 'verification', 'operations']);
     expect(assessment.coverage[0]).toMatchObject({ id: 'HEALTH', status: 'unverified', requiredAction: 'verify' });
     expect(assessment.coverage[0]?.evidence[0]?.commitSha).toBe(assessment.commitSha);
+    expect(model.prompts[0]).toContain('not proof of missing product code');
+    expect(model.prompts[4]).toContain('do not add that track as target-product coverage');
+    expect(model.prompts[4]).toContain('use requiredAction=document');
   });
 
   it('rejects model evidence for a file that does not exist in the snapshot', async () => {

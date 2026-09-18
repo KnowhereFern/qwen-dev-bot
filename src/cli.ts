@@ -22,11 +22,12 @@ import { assertQwenCredentialCompatibility, resolveQwenCredential } from './qwen
 import { ProjectRegistry } from './registry.js';
 import { RepositoryAssessor } from './program/repository-assessor.js';
 import { buildEvidenceReport, formatEvidenceReport } from './program/evidence-report.js';
+import { runInteractiveTerminal } from './terminal/interactive.js';
 
-const VERSION = '1.0.0-rc.24';
+const VERSION = '1.0.0-rc.30';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
-  const command = argv[0] ?? 'help';
+  const command = argv[0] ?? (process.stdin.isTTY && process.stdout.isTTY ? 'interactive' : 'help');
   const args = argv.slice(1);
   if ((hasFlag(args, '--help') || hasFlag(args, '-h')) && !['help', '--help', '-h'].includes(command)) {
     console.log(help());
@@ -46,6 +47,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     case '-v':
       console.log(VERSION);
       return 0;
+    case 'interactive':
+    case 'ui':
+      if (json) throw new Error('Interactive mode does not support --json. Use status or plan-status --json instead.');
+      return runInteractiveTerminal({ root: firstPositional(args) });
     case 'init': {
       const result = await installProject({
         root,
@@ -75,9 +80,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       if (json) console.log(JSON.stringify({ projectId: result.receipt.projectId, summary: result.summary }, null, 2));
       else {
         console.log(result.summary.map((line) => `- ${line}`).join('\n'));
-        console.log('\nNext: run `qwen-harness doctor`. The harness reuses the credential already stored in Qwen user settings when available.');
+        console.log('\nNext: run `fern-harness doctor`. The harness reuses the credential already stored in Qwen user settings when available.');
         if (existsSync(path.join(root, 'PROJECT.md'))) {
-          console.log('After `qwen-harness verify`, run `qwen-harness plan . --requirements PROJECT.md` to create the review-only delivery graph.');
+          console.log('After `fern-harness verify`, run `fern-harness plan . --requirements PROJECT.md` to create the review-only delivery graph.');
         }
       }
       return 0;
@@ -259,7 +264,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         const view = coordinator.status(plan);
         console.log(json ? JSON.stringify({ created: created.created, plan: view }, null, 2) : formatPortfolioPlan(view));
         if (!hasFlag(args, '--approve') && !json) {
-          console.log(`\nReview the epic and stories, then run: qwen-harness plan-approve ${root} --plan ${plan.id}`);
+          console.log(`\nReview the epic and stories, then run: fern-harness plan-approve ${root} --plan ${plan.id}`);
         }
         return 0;
       } finally {
@@ -277,7 +282,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           token: await resolveGitHubToken(root),
         });
         const coordinator = new PortfolioCoordinator(config, store, github);
-        const plan = await coordinator.approve(planId);
+        const plan = await coordinator.approve(planId, approvalExpectation(args));
         const view = coordinator.status(plan);
         console.log(json ? JSON.stringify(view, null, 2) : formatPortfolioPlan(view));
         return 0;
@@ -291,6 +296,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const requirementsPath = valueOf(args, '--requirements');
       if (!planId || !requirementsPath) throw new Error('plan-redraft requires --plan PLAN_ID --requirements FILE');
       const feedbackPath = valueOf(args, '--feedback');
+      const reviseObjective = hasFlag(args, '--revise-objective');
+      const expected = approvalExpectation(args);
       const maxStories = integerValue(args, '--max-stories') ?? DEFAULT_MAX_PORTFOLIO_STORIES;
       const credential = resolveQwenCredential(config);
       if (credential) assertQwenCredentialCompatibility(config, credential);
@@ -302,6 +309,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           repo: config.project.githubRepo,
           token: await resolveGitHubToken(root),
         });
+        const coordinator = new PortfolioCoordinator(config, store, github);
+        coordinator.assertCanRedraft({ planId, ...document, reviseObjective, expected });
         const qwenApi = new QwenApiClient({
           model: config.qwen.model,
           baseUrl: config.qwen.baseUrl,
@@ -311,10 +320,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         const assessment = await new RepositoryAssessor(config, qwenApi).assess(document);
         store.saveRepositoryAssessment(assessment);
         const draft = await new PortfolioPlanner(config, qwenApi).plan(document, maxStories, assessment, feedback?.content);
-        const coordinator = new PortfolioCoordinator(config, store, github);
         const plan = await coordinator.replaceUnapprovedDraft({
           planId,
           ...document,
+          reviseObjective,
+          expected,
           draft,
           assessment,
           summary: feedback ? `Replaced an unapproved draft using review evidence from ${feedback.sourcePath}` : 'Replaced an unapproved draft after plan-quality review',
@@ -334,7 +344,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       try {
         const github = new OctokitControlPlane({ repo: config.project.githubRepo, token: await resolveGitHubToken(root) });
         const coordinator = new PortfolioCoordinator(config, store, github);
-        const plan = await coordinator.approve(planId);
+        const plan = await coordinator.approve(planId, approvalExpectation(args));
         const view = coordinator.status(plan);
         console.log(json ? JSON.stringify(view, null, 2) : formatPortfolioPlan(view));
         return 0;
@@ -376,7 +386,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
             ? JSON.stringify(views, null, 2)
             : views.length
               ? views.map(formatPortfolioPlan).join('\n\n')
-              : 'No portfolio plans found. Run `qwen-harness plan PROJECT --requirements FILE` first.',
+              : 'No portfolio plans found. Run `fern-harness plan PROJECT --requirements FILE` first.',
         );
         return 0;
       } finally {
@@ -386,13 +396,19 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     case 'run':
     case 'reconcile': {
       const config = loadProjectConfig(root);
+      const controller = new AbortController();
+      const interrupt = () => controller.abort();
+      process.once('SIGINT', interrupt);
+      process.once('SIGTERM', interrupt);
       const harness = await createProductionHarness(config);
       try {
-        const result = await harness.supervisor.tick();
-        const program = await harness.program.tick();
+        const result = await harness.supervisor.tick(controller.signal);
+        const program = await harness.program.tick(controller.signal);
         console.log(json ? JSON.stringify({ supervisor: result, program }, null, 2) : `${result.action}${result.processedTaskId ? ` ${result.processedTaskId}` : ''}; program=${program.action}${program.planId ? ` ${program.planId}` : ''}`);
       } finally {
         harness.close();
+        process.removeListener('SIGINT', interrupt);
+        process.removeListener('SIGTERM', interrupt);
       }
       return 0;
     }
@@ -541,7 +557,7 @@ function formatControllerReleases(releases: ControllerRelease[]): string {
 }
 
 function firstPositional(args: string[]): string | undefined {
-  const valueOptions = new Set(['--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release']);
+  const valueOptions = new Set(['--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash']);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] as string;
     if (valueOptions.has(arg)) {
@@ -586,17 +602,27 @@ function billingPlanValue(args: string[]): QwenBillingPlan | undefined {
   return value as QwenBillingPlan;
 }
 
-function help(): string {
-  return `qwen-harness ${VERSION}
+function approvalExpectation(args: string[]): { revision: number; contentHash: string } | undefined {
+  const revision = integerValue(args, '--revision');
+  const contentHash = valueOf(args, '--hash');
+  if (revision === undefined && contentHash === undefined) return undefined;
+  if (revision === undefined || revision < 1 || !contentHash) throw new Error('Approval requires both --revision N and --hash HASH');
+  return { revision, contentHash };
+}
 
-Usage: qwen-harness <command> [project] [options]
+function help(): string {
+  return `fern-harness ${VERSION}
+
+Usage: fern-harness <command> [project] [options]
+Compatibility alias: qwen-harness (same commands, project state, and permissions)
 
 Commands:
+  interactive | ui     Interactive project, program approval, and execution console
   init                 Guided, idempotent project setup
   update               Refresh installer-owned assets and migrations
   doctor [--live]      Readiness matrix; --live performs a Qwen API call
   verify               Alias for live doctor
-  register             Register a project with qwen-harnessd
+  register             Register a project with the persistent worker
   unregister           Remove a project registration
   run | reconcile      Run one bounded project supervisor tick
   worker [--once]      Run the persistent multi-project worker
@@ -629,12 +655,13 @@ Reward options:
   --task TASK_ID --issue NUMBER --json
 
 Plan options:
+  interactive [PROJECT] (also the default when launched without arguments in a terminal)
   plan PROJECT --requirements FILE [--max-stories N] [--approve] [--json]
-  plan-redraft PROJECT --plan PLAN_ID --requirements FILE [--feedback FILE] [--max-stories N] [--json]
-  plan-approve PROJECT --plan PLAN_ID [--json]
+  plan-redraft PROJECT --plan PLAN_ID --requirements FILE [--feedback FILE] [--max-stories N] [--revise-objective --revision N --hash HASH] [--json]
+  plan-approve PROJECT --plan PLAN_ID [--revision N --hash HASH] [--json]
   plan-status PROJECT [--plan PLAN_ID] [--json]
   plan-reassess PROJECT --plan PLAN_ID [--json]
-  plan-approve-revision PROJECT --plan PLAN_ID [--json]
+  plan-approve-revision PROJECT --plan PLAN_ID [--revision N --hash HASH] [--json]
   signals PROJECT [--scan] [--accept ID | --reject ID] [--json]
   deploy-status PROJECT [--plan PLAN_ID] [--json]
   evidence-report PROJECT --plan PLAN_ID [--json]

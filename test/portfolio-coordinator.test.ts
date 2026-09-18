@@ -98,12 +98,17 @@ describe('PortfolioCoordinator', () => {
     expect([...github.issues.values()][0]?.labels).toEqual(['harness:plan']);
     expect([...github.issues.values()].slice(1).every((issue) => issue.labels.includes('harness:planned'))).toBe(true);
 
+    await expect(coordinator.approve(first.plan.id, { revision: 2, contentHash: first.plan.contentHash })).rejects.toThrow('program changed since review');
+    await expect(coordinator.approve(first.plan.id, { revision: 1, contentHash: 'stale-objective-hash' })).rejects.toThrow('program changed since review');
+    expect(github.issues).toHaveLength(3);
+    expect(store.getPortfolioPlan(first.plan.id)?.approvedAt).toBeNull();
+
     const duplicate = await coordinator.createDraft({ sourcePath: 'REQUIREMENTS.md', content: 'same requirements', draft: draft() });
     expect(duplicate.created).toBe(false);
     expect(duplicate.plan.id).toBe(first.plan.id);
     expect(github.issues).toHaveLength(3);
 
-    const approved = await coordinator.approve(first.plan.id);
+    const approved = await coordinator.approve(first.plan.id, { revision: 1, contentHash: first.plan.contentHash });
     expect(approved.status).toBe('active');
     expect(github.issues).toHaveLength(5);
     const firstSpec = parseNormalizedSpec((github.issues.get(4) as RemoteIssue).body);
@@ -171,7 +176,42 @@ describe('PortfolioCoordinator', () => {
     expect(redrafted.stories.find((story) => story.revision === 2)?.key).toMatch(/^R2_/);
     expect(redrafted.stories.filter((story) => story.revision === 2).every((story) => story.sourceIssueNumber !== null)).toBe(true);
     expect(redrafted.stories.every((story) => story.normalizedIssueNumber === null)).toBe(true);
+    const changed = await coordinator.replaceUnapprovedDraft({
+      planId: redrafted.id, sourcePath: 'PROJECT.md', content: 'Complete the full delivery journey',
+      draft: replacement, assessment, summary: 'User revised the proposed objective', reviseObjective: true,
+      expected: { revision: 2, contentHash: redrafted.contentHash },
+    });
+    expect(changed.revision).toBe(3);
+    expect(changed.sourceContent).toBe('Complete the full delivery journey');
+    expect(changed.contentHash).not.toBe(redrafted.contentHash);
+    expect(changed.revisions?.[0]?.objectiveSourceContent).toBe('program objective');
+    expect(changed.revisions?.[1]?.objectiveContentHash).toBe(redrafted.contentHash);
+    expect(changed.revisions?.at(-1)?.material).toBe(true);
+    expect(changed.approvedAt).toBeNull();
+    expect(changed.status).toBe('awaiting_initial_approval');
+    expect(changed.stories.every((story) => story.normalizedIssueNumber === null)).toBe(true);
+    expect(store.getPortfolioPlan(changed.id)?.sourceContent).toBe(changed.sourceContent);
     store.close();
+  });
+
+  it('rejects implicit, stale, relocated or already-approved objective changes before planning', async () => {
+    const config = defaultProjectConfig(makeTmp('objective-guards'), 'project', 'owner/project');
+    config.program.enabled = true;
+    const store = new PersistentTaskStore('objective-guards', makeTmp('objective-guards-state'));
+    try {
+      const coordinator = new PortfolioCoordinator(config, store, new PortfolioGitHub());
+      const { plan } = await coordinator.createDraft({ sourcePath: 'OBJECTIVE.md', content: 'Original', draft: draft() });
+      const input = { planId: plan.id, sourcePath: plan.sourcePath, content: 'Revised objective' };
+      const expected = { revision: 1, contentHash: plan.contentHash };
+      expect(() => coordinator.assertCanRedraft(input)).toThrow('preserve the originally proposed objective');
+      expect(() => coordinator.assertCanRedraft({ ...input, reviseObjective: true })).toThrow('review guards');
+      expect(() => coordinator.assertCanRedraft({ ...input, reviseObjective: true, expected: { ...expected, revision: 2 } })).toThrow('changed since review');
+      expect(() => coordinator.assertCanRedraft({ ...input, reviseObjective: true, expected: { ...expected, contentHash: 'stale' } })).toThrow('changed since review');
+      expect(() => coordinator.assertCanRedraft({ ...input, sourcePath: 'OTHER.md', reviseObjective: true, expected })).toThrow('requirements file');
+      store.savePortfolioPlan({ ...plan, status: 'active', approvedAt: 1 });
+      expect(() => coordinator.assertCanRedraft({ ...input, reviseObjective: true, expected })).toThrow('before initial approval');
+      expect(store.list()).toHaveLength(0);
+    } finally { store.close(); }
   });
 
   it('activates only the current dependency wave in repository-aware program mode', async () => {

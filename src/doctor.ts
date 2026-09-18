@@ -154,12 +154,13 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
     checks.push(check('qwen-extension', harnessExtensionPresent ? 'pass' : 'warn', harnessExtensionPresent ? 'Harness extension installed' : 'Harness extension is not linked; run setup/update'));
   }
 
-  const harnessCli = await commandCheck(process.platform === 'win32' ? 'qwen-harness.cmd' : 'qwen-harness', ['--version'], root);
+  const primaryCli = await commandCheck(process.platform === 'win32' ? 'fern-harness.cmd' : 'fern-harness', ['--version'], root);
+  const harnessCli = primaryCli.ok ? primaryCli : await commandCheck(process.platform === 'win32' ? 'qwen-harness.cmd' : 'qwen-harness', ['--version'], root);
   checks.push(
     check(
       'harness-cli',
       harnessCli.ok ? 'pass' : 'warn',
-      harnessCli.ok ? `qwen-harness ${harnessCli.output}` : 'qwen-harness is not on PATH; use this checkout\'s npm run harness command or rerun setup with --install-cli',
+      harnessCli.ok ? `${primaryCli.ok ? 'fern-harness' : 'qwen-harness compatibility alias'} ${harnessCli.output}` : 'fern-harness is not on PATH; use this checkout\'s npm run harness command or rerun setup with --install-cli',
     ),
   );
 

@@ -2,7 +2,7 @@
 
 A software product designed and built by Fern. It uses Qwen Code and `qwen3.8-max` as its execution engine to turn approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.24`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
+**Release status:** `v1.0.0-rc.30`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
 
 See [live test readiness](docs/live-test-readiness.md) for the current machine and end-to-end proof status.
 
@@ -145,6 +145,36 @@ node bin/qwen-harness.mjs verify /absolute/path/to/your-project
 
 `verify` includes a small live Qwen3.8-Max JSON call. Commit the generated tracked files only after reviewing them.
 
+## Interactive terminal
+
+`fern-harness` is the primary command. `qwen-harness` remains an alias to the same executable, with the same project state and permissions. Existing `.qwen-harness/` directories, worker services, and saved sessions are unchanged.
+
+After setup with `--install-cli`, open the operator console in any terminal:
+
+```sh
+fern-harness interactive /path/to/project
+# Or select a registered project without remembering its path or plan ID:
+fern-harness
+# From this source checkout, without installing the short command:
+npm run harness -- interactive /path/to/project
+```
+
+Eight task-focused menu groups cover program review/approval; objective planning/redrafting; live progress/task details; readiness; deployment/feedback/log/evidence/controller history; project setup/switching; execution initiation/recovery; and model connection. Unconfigured folders stay in the console and can use setup directly. Setup supports an existing GitHub account/repository, optional Qwen Code installation, locked dependencies, and the harness CLI/extension, without starting a worker or approving a program. Staging still requires explicit configuration for an existing target; the menu never provisions production or purchases accounts/services.
+
+Model connection supports Standard API, Token Plan Personal/Team, or a custom HTTPS-compatible endpoint while preserving the configured model. Hidden key entry saves only to the user's Qwen `.env` with owner-only permissions, not project files, logs, or command arguments. Existing process/worker credentials retain precedence. Viewing connection status never tests the provider; live verification requires explicit confirmation. Successful verification is labeled for this session only and is invalidated by connection/key changes.
+
+The home screen leads with a plain-language delivery status and a suggested next action. A plan's steps are independently testable outcomes; stages group dependency-ready steps. Plan version identifies the proposal you are reviewing. Proposed steps are not scheduled tasks until approval. AI key availability, live connection verification, shared background-worker liveness, and recorded staging proof are shown separately: none substitutes for another. Menu numbers remain stable; wide terminals use two columns, narrow terminals wrap without truncating paths, and short windows compress whitespace without hiding options. Restrained color highlights headings and next actions, respects the terminal's palette, and is disabled by `NO_COLOR` or `TERM=dumb`.
+
+Command activity animates with real elapsed time, streamed output, and completion/failure feedback—never invented percentage progress. Live progress refreshes changed durable task/program/deployment evidence and separately reads shared worker service liveness every three seconds; it does not drive the delivery loop. Disable animation with `QWEN_HARNESS_REDUCED_MOTION=1`, `NO_COLOR`, or `TERM=dumb`. Superseded proposals remain in history but do not count as current steps. Opening the console, viewing a plan, pressing Enter, or exiting never approves or starts work. Automated non-terminal invocations without arguments still show help; existing command and JSON interfaces remain available.
+
+Approval publishes executable work for the current wave; an already-running worker can claim it immediately. Starting the shared worker is a separate, explicitly confirmed menu action covering all enabled registered projects. The background service keeps running after you close the console, subject to the host staying awake and connected. Persisted task status is not a worker-health check.
+
+Before initial approval, an operator may explicitly revise the proposed objective using `plan-redraft --revise-objective --revision N --hash HASH` together with the existing plan, requirements and optional feedback flags. Ordinary redrafts still require unchanged requirements. The objective-revision option requires the exact prior revision/hash, retains old objective content and superseded stories, and remains review-only; approved objectives cannot use it. Draft revisions are recorded as planning interventions in exported evidence. The [Festival SOS validation track](docs/validation/festival-sos.md) separates product journey acceptance from controller and self-evolution proof.
+
+Initial changes requests use `plan-redraft` without approving the result. Approved objectives cannot be redrafted through this shortcut; material revisions remain behind explicit approval. Ctrl+C or EOF exits the menu cleanly. During a command, existing command recovery rules apply: reopen the console and inspect status before retrying an interrupted operation.
+
+This is the initial terminal operator interface. Broader interaction design, a dedicated notification/approval inbox, and a dashboard remain for a later review; the console does not add approvals through GitHub comments or checkboxes.
+
 ## Dependency preflight
 
 The setup wizard runs the installed target's `.qwen-harness/scripts/bootstrap.mjs` by default. It uses the committed npm, pnpm, Yarn, Bun, uv, or requirements lock/input files; Python `requirements.txt` installs into a project-local `.venv`; and declared Playwright/Cypress runtimes are installed and verified.
@@ -155,7 +185,7 @@ Run the no-install checks any time:
 npm run preflight -- /absolute/path/to/your-project
 # or, from the target repository:
 node .qwen-harness/scripts/bootstrap.mjs --check
-qwen-harness doctor
+fern-harness doctor
 ```
 
 The readiness matrix checks Node, Git, GitHub auth/repository/protection, the active Qwen binary and required headless flags, harness CLI/extension/assets, credential source, package manager and dependency tree, every configured gate executable, Playwright/Cypress browser binaries when declared, sandboxing, optional Qwen-MM/uvx, and—under `verify`—a real Qwen3.8-Max call. A missing required dependency is a `FAIL`, not a warning that autonomous execution ignores.
@@ -167,12 +197,12 @@ Create a GitHub issue and apply `harness:accept`. The raw issue is never execute
 For a larger project, give the planner one project-local requirements file (committing it is recommended). With program mode enabled, the harness first inspects a clean repository snapshot at an exact commit. It records architecture, features, tests, dependencies, deployment configuration, and operational evidence; maps each requirement to `implemented`, `partial`, `missing`, `unverified`, or `externally_blocked`; then proposes a bounded acyclic delivery program. Nothing can execute until you approve it:
 
 ```sh
-qwen-harness plan /path/to/project --requirements PROJECT.md
+fern-harness plan /path/to/project --requirements PROJECT.md
 # Review the generated epic and stories on GitHub.
 # If it maps an implementation gap only to verification, redraft it before approval.
-qwen-harness plan-redraft /path/to/project --plan PLAN_ID --requirements PROJECT.md
-qwen-harness plan-approve /path/to/project --plan PLAN_ID
-qwen-harness plan-status /path/to/project --plan PLAN_ID
+fern-harness plan-redraft /path/to/project --plan PLAN_ID --requirements PROJECT.md
+fern-harness plan-approve /path/to/project --plan PLAN_ID
+fern-harness plan-status /path/to/project --plan PLAN_ID
 ```
 
 Approval freezes the objective, acceptance criteria, technology choices, deployment targets, and authority. Only the current dependency wave becomes executable. After its exact merge commit passes staging and lifecycle verification, the harness reassesses the entire objective and may revise only unstarted work within those boundaries. Material changes pause at `awaiting_material_approval`; task completion alone never marks the objective delivered.
@@ -184,28 +214,28 @@ The minimum useful requirements file needs only: a product objective, intended u
 Useful commands:
 
 ```sh
-qwen-harness doctor /path/to/project [--live]
-qwen-harness run /path/to/project
-qwen-harness worker [--once]
-qwen-harness status /path/to/project [--json]
-qwen-harness logs /path/to/project [--lines 100]
-qwen-harness reward /path/to/project [--task TASK_ID | --issue N]
-qwen-harness community /path/to/project [--force]
-qwen-harness plan /path/to/project --requirements FILE [--max-stories N] [--approve]
-qwen-harness plan-redraft /path/to/project --plan PLAN_ID --requirements FILE [--feedback FILE] [--max-stories N]
-qwen-harness plan-approve /path/to/project --plan PLAN_ID
-qwen-harness plan-status /path/to/project [--plan PLAN_ID]
-qwen-harness plan-reassess /path/to/project --plan PLAN_ID
-qwen-harness plan-approve-revision /path/to/project --plan PLAN_ID
-qwen-harness signals /path/to/project [--scan] [--accept ID | --reject ID]
-qwen-harness deploy-status /path/to/project [--plan PLAN_ID]
-qwen-harness evidence-report /path/to/project --plan PLAN_ID [--json]
-qwen-harness controller-status /path/to/project
-qwen-harness controller-evaluate /path/to/project --sha COMMIT_SHA
-qwen-harness controller-promote /path/to/project --release RELEASE_ID
-qwen-harness controller-rollback /path/to/project --release RELEASE_ID
-qwen-harness update /path/to/project
-qwen-harness uninstall /path/to/project --yes [--remove-service]
+fern-harness doctor /path/to/project [--live]
+fern-harness run /path/to/project
+fern-harness worker [--once]
+fern-harness status /path/to/project [--json]
+fern-harness logs /path/to/project [--lines 100]
+fern-harness reward /path/to/project [--task TASK_ID | --issue N]
+fern-harness community /path/to/project [--force]
+fern-harness plan /path/to/project --requirements FILE [--max-stories N] [--approve]
+fern-harness plan-redraft /path/to/project --plan PLAN_ID --requirements FILE [--feedback FILE] [--max-stories N]
+fern-harness plan-approve /path/to/project --plan PLAN_ID
+fern-harness plan-status /path/to/project [--plan PLAN_ID]
+fern-harness plan-reassess /path/to/project --plan PLAN_ID
+fern-harness plan-approve-revision /path/to/project --plan PLAN_ID
+fern-harness signals /path/to/project [--scan] [--accept ID | --reject ID]
+fern-harness deploy-status /path/to/project [--plan PLAN_ID]
+fern-harness evidence-report /path/to/project --plan PLAN_ID [--json]
+fern-harness controller-status /path/to/project
+fern-harness controller-evaluate /path/to/project --sha COMMIT_SHA
+fern-harness controller-promote /path/to/project --release RELEASE_ID
+fern-harness controller-rollback /path/to/project --release RELEASE_ID
+fern-harness update /path/to/project
+fern-harness uninstall /path/to/project --yes [--remove-service]
 ```
 
 The Qwen extension also contributes `/harness:doctor`, `/harness:status`, and `/harness:implement`, the `harness-reward` skill, and six specialized subagents.
@@ -261,7 +291,7 @@ npm run release:check
 npm run package:smoke
 ```
 
-The production-path integration test uses a real temporary Git repository and bare remote with mocked GitHub/Qwen boundaries. It proves normalization through merge and post-merge verification without credentials. Live GitHub and Qwen readiness remains the responsibility of `qwen-harness verify` in the installed target project.
+The production-path integration test uses a real temporary Git repository and bare remote with mocked GitHub/Qwen boundaries. It proves normalization through merge and post-merge verification without credentials. Live GitHub and Qwen readiness remains the responsibility of `fern-harness verify` in the installed target project.
 
 ## Release model
 

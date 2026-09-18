@@ -4,6 +4,40 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.30] - 2026-09-17
+
+- Keep explicitly separate controller proof out of target-product work and classify unavailable access separately from actual code gaps.
+- Require complete journey milestones and resumable blocker operating records without adding duplicate product controllers or weakening sandbox evidence.
+
+## [1.0.0-rc.29] - 2026-09-17
+
+- Allow explicitly guarded objective changes only before initial approval; preserve objective snapshots, superseded proposal history and planning intervention evidence.
+- Reject changed, stale or already-approved redrafts before provider planning requests, and re-check before persisting their result.
+- Separate Festival SOS product journey acceptance from controller recovery, observation and self-evolution validation.
+
+## [1.0.0-rc.28] - 2026-09-16
+
+- Simplify the terminal home screen with plain-language plan status, proposed step/stage counts, separate connection/worker/staging evidence, and a clear next action.
+- Add restrained, optional color and responsive grouped menus; preserve every option and wrap long paths in narrow terminals.
+- Explain live task states without raw state-machine codes and retain revision-specific approval, execution confirmations, and safe output handling.
+
+## [1.0.0-rc.27] - 2026-09-16
+
+- Make fern-harness the primary terminal command and keep qwen-harness as an alias to the same executable and project state.
+- Update operator guidance and verify both command names in installation and package smoke checks; retain existing directories, services, and saved sessions.
+
+## [1.0.0-rc.26] - 2026-09-16
+
+- Complete the terminal's setup and model-connection paths, including existing GitHub sign-in, provider configuration, hidden user-only credentials, and explicitly confirmed live verification.
+- Add honest elapsed-time activity animation, safe command output, grouped evidence views, and read-only live progress with separate worker service liveness.
+- Keep unconfigured folders in the console, preserve the intended model and approval boundaries, and prevent filenames from becoming approval flags.
+
+## [1.0.0-rc.25] - 2026-09-16
+
+- Add an interactive terminal for project selection, current-program review, revision-specific approval, pre-approval redrafting, readiness, task/deployment/feedback status, and logs.
+- Keep worker startup separate from approval and require explicit confirmation before starting the shared background service.
+- Exclude superseded proposals from the terminal's current backlog and reject approvals for a revision or objective hash that changed after review.
+
 ## [1.0.0-rc.24] - 2026-09-16
 
 - Audit exact merge CI separately from candidate-only governance/reward checks.

@@ -333,6 +333,9 @@ export interface ProgramRevision {
   createdAt: number;
   approvedAt: number | null;
   sourceSignalId?: string | null;
+  objectiveContentHash?: string;
+  objectiveSourceContent?: string;
+  objectiveSourcePath?: string;
 }
 
 export interface PortfolioStory {

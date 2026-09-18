@@ -76,6 +76,7 @@ export function buildEvidenceReport(store: PersistentTaskStore, plan: PortfolioP
   const interventions = events.filter((event) =>
     [
       'program.approved',
+      'portfolio.redrafted',
       'program.external_commit_observed',
       'program.revised',
       'program.objective_accepted',
