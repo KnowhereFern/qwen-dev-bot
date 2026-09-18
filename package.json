@@ -1,6 +1,6 @@
 {
   "name": "qwen-dev-bot",
-  "version": "1.0.0-rc.33",
+  "version": "1.0.0-rc.34",
   "description": "Fern-designed autonomous software delivery harness powered by Qwen3.8-Max, with durable orchestration, runtime rewards, GitHub delivery, and guided setup.",
   "type": "module",
   "private": true,

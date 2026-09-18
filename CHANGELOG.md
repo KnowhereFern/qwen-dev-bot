@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.34] - 2026-09-17
+
+- Let approved verification and operations work finish without fabricated repository changes after exact-commit required checks and independent review pass.
+- Reject stale or changed contracts; require controller-owned staging evidence for unchanged operations work, and recover interrupted issue closure without another PR.
+
 ## [1.0.0-rc.33] - 2026-09-17
 
 - Keep focused review responses to changed classifications instead of regenerating the full assessment; preserve untouched requirements and evidence.

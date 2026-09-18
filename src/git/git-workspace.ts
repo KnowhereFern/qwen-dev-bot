@@ -118,6 +118,10 @@ export class GitWorkspace {
     return [...files];
   }
 
+  async headSha(worktree: string): Promise<string> {
+    return (await this.git(['rev-parse', 'HEAD'], worktree)).stdout.trim();
+  }
+
   async filesChangedBetween(worktree: string, baseSha: string, headSha: string): Promise<string[]> {
     const receipt = await this.git(
       ['diff', '--name-status', '-z', '--find-renames', `${baseSha}..${headSha}`],

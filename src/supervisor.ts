@@ -4,7 +4,7 @@ import type { CommunityCollector, CommunityScanResult } from './community/collec
 import type { ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
-import { REQUIRED_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
+import { REQUIRED_GITHUB_CHECKS, REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
 import { GitWorkspace, branchFor } from './git/git-workspace.js';
 import { parseNormalizedSpec, type TaskNormalizer } from './intake/normalizer.js';
 import { Logger } from './logger.js';
@@ -44,6 +44,7 @@ export class HarnessSupervisor {
     try {
       const recovered = await this.recoverExpiredLeases();
       this.resumeProviderWaits();
+      await this.reconcileReadOnlyClosures();
       const community = this.community
         ? await this.community.scan()
         : { checked: 0, changed: 0, created: 0, skipped: 0, failed: 0 };
@@ -273,7 +274,11 @@ export class HarnessSupervisor {
       task = this.store.transition(task.id, 'verifying');
       const changedBeforeCommit = await this.git.changedFiles(worktree.path);
       this.git.assertNoProtectedChanges(changedBeforeCommit);
-      const commitSha = await this.git.commitCandidate(worktree.path, task, qwenResult.summary);
+      const readOnly = changedBeforeCommit.length === 0 &&
+        await this.git.headSha(worktree.path) === task.baseSha && this.isReadOnlyProgramTask(task);
+      const commitSha = readOnly
+        ? task.baseSha as string
+        : await this.git.commitCandidate(worktree.path, task, qwenResult.summary);
       task = this.store.patch(task.id, { commitSha });
       const changedFiles = await this.git.filesChangedBetween(worktree.path, task.baseSha as string, commitSha);
       this.git.assertNoProtectedChanges(changedFiles);
@@ -310,6 +315,10 @@ export class HarnessSupervisor {
         throw new Error(`Reward verification failed: ${scorecard.blockingReasons.join('; ')}`);
       }
       throwIfAborted(signal);
+      if (readOnly) {
+        await this.finishReadOnlyTask(task, scorecard, signal);
+        return;
+      }
       await this.git.pushCandidate(worktree.path, task.branch as string, commitSha);
       await this.publishRewardCheck(scorecard);
 
@@ -336,6 +345,84 @@ export class HarnessSupervisor {
       else await this.failAttempt(task.id, error);
     } finally {
       if (executionHeartbeatTimer) clearInterval(executionHeartbeatTimer);
+    }
+  }
+
+  private isReadOnlyProgramTask(task: TaskRecord): boolean {
+    if (!this.config.program.enabled || !task.spec) return false;
+    return this.store.listPortfolioPlans().some((plan) =>
+      plan.approvedAt !== null && ['active', 'blocked'].includes(plan.status) &&
+      plan.stories.some((story) =>
+        !story.supersededAt && story.normalizedIssueNumber === task.issueNumber &&
+        (story.wave ?? 1) <= (plan.currentWave ?? 1) &&
+        ['verify', 'operate'].includes(story.workType ?? '') &&
+        matchesPortfolioTaskContract(plan, story, task.spec as NonNullable<TaskRecord['spec']>),
+      ),
+    );
+  }
+
+  private async finishReadOnlyTask(task: TaskRecord, scorecard: RewardScorecard, signal?: AbortSignal): Promise<void> {
+    if (!this.isReadOnlyProgramTask(task)) throw new Error('Read-only program contract changed during verification');
+    const link = this.store.listPortfolioPlans().flatMap((plan) => plan.stories
+      .filter((story) => !story.supersededAt && story.normalizedIssueNumber === task.issueNumber)
+      .map((story) => ({ plan, story })))[0];
+    const checks = await this.github.checksForRef(scorecard.commitSha, [...REQUIRED_POST_MERGE_GITHUB_CHECKS]);
+    if (checks.failed.length) throw new Error(`GitHub checks failed: ${checks.failed.join(', ')}`);
+    const issue = await this.github.getIssue(task.issueNumber);
+    const remoteSpec = parseNormalizedSpec(issue.body);
+    if (!link || !remoteSpec || !this.config.intake.trustedAuthors.includes(issue.author) ||
+        !issue.labels.includes(this.config.intake.normalizedLabel) ||
+        !matchesPortfolioTaskContract(link.plan, link.story, remoteSpec)) {
+      throw new Error('Read-only issue contract changed during verification');
+    }
+    const needsDeployment = link?.story.workType === 'operate' && this.config.deployment.staging.enabled;
+    const deployment = this.store.listDeployments(link.plan.id)[0];
+    const verifiedDeployment = !needsDeployment || (deployment?.status === 'succeeded' &&
+      deployment.commitSha === scorecard.commitSha && deployment.observedRevision === scorecard.commitSha);
+    if (!checks.complete || !checks.successful || !verifiedDeployment) {
+      const reason = !verifiedDeployment ? 'Waiting for controller-owned staging verification of this exact commit'
+        : `Waiting for required GitHub checks: ${checks.pending.join(', ') || 'not successful'}`;
+      this.store.transition(task.id, 'waiting', {
+        waitKind: 'provider', resumeAfter: Date.now() + Math.max(this.config.worker.pollIntervalMs, 30_000),
+        leaseOwner: null, leaseExpiresAt: null, lastError: reason,
+      });
+      this.store.recordEvent('task.verification_wait', task.id, { commitSha: scorecard.commitSha, reason });
+      return;
+    }
+    // Required checks and independent review describe the current merged commit, not an obsolete snapshot.
+    await this.git.verifyRemoteHead(this.config.project.defaultBranch, scorecard.commitSha);
+    if (await this.git.headSha(task.worktreePath as string) !== scorecard.commitSha ||
+        (await this.git.changedFiles(task.worktreePath as string)).length > 0) {
+      throw new Error('Read-only task worktree changed during verification');
+    }
+    throwIfAborted(signal);
+    this.store.recordEvent('task.read_only_verified', task.id, {
+      commitSha: scorecard.commitSha, scorecardId: scorecard.id, issueNumber: task.issueNumber,
+    }, `read-only-verified:${task.id}:${scorecard.commitSha}`);
+    this.store.transition(task.id, 'done', {
+      mergeSha: scorecard.commitSha, leaseOwner: null, leaseExpiresAt: null, lastError: null,
+    });
+    await this.reconcileReadOnlyClosures();
+    try {
+      await this.git.removeOwnedWorktree(task.worktreePath as string);
+    } catch (error) {
+      this.logger.warn('worktree cleanup deferred', { taskId: task.id, error: String(error) });
+    }
+  }
+
+  private async reconcileReadOnlyClosures(): Promise<void> {
+    for (const event of this.store.listEvents('task.read_only_verified')) {
+      if (!event.taskId) continue;
+      const task = this.store.get(event.taskId);
+      const key = `read-only-closed:${task.id}`;
+      if (task.state !== 'done' || this.store.hasIdempotencyKey(key)) continue;
+      try {
+        // Absolute PATCH is idempotent; the durable receipt survives interruption or provider failure.
+        await this.github.updateIssue(task.issueNumber, { state: 'closed' });
+        this.store.recordEvent('task.read_only_closed', task.id, { issueNumber: task.issueNumber }, key);
+      } catch (error) {
+        this.logger.warn('verified task issue closure deferred', { taskId: task.id, error: String(error) });
+      }
     }
   }
 
