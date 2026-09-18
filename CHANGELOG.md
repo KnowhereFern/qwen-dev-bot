@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.31] - 2026-09-17
+
+- Pass redraft review evidence to repository assessment as well as planning, keeping it outside execution authority.
+- Separate unavailable integration access and blocker operating records from missing product behavior without weakening derived implementation requirements.
+
 ## [1.0.0-rc.30] - 2026-09-17
 
 - Keep explicitly separate controller proof out of target-product work and classify unavailable access separately from actual code gaps.
