@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.37] - 2026-10-04
+
+- Give spacious terminal windows a small Fern mark, framed project summary, and clearer visual hierarchy.
+- Add brief keyboard-selection feedback and redraw only changed rows to avoid full-screen flashes.
+- Preserve compact layouts, no-color operation, and reduced-motion preferences; cancel animation timers on exit.
+
 ## [1.0.0-rc.36] - 2026-10-04
 
 - Replace the dense terminal home screen with a keyboard-driven dashboard and focused action list.

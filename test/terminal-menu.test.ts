@@ -5,18 +5,49 @@ import { deliveryChoices, renderMenu, selectTerminalMenu } from '../src/terminal
 import { terminalCellWidth } from '../src/terminal/presentation.js';
 
 const menu = { title: 'Choose an action', choices: deliveryChoices };
-function terminal() {
+function terminal(color = false, reducedMotion = false) {
   const input = Object.assign(new PassThrough(), { isRaw: false, setRawMode: vi.fn(function (this: { isRaw: boolean }, raw: boolean) { this.isRaw = raw; }) });
   const output = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
   let screen = '';
   output.on('data', (chunk) => { screen += chunk.toString(); });
   const controller = new AbortController();
   const interrupt = vi.fn(() => controller.abort());
-  const select = () => selectTerminalMenu(menu, { input: input as unknown as ReadStream, output: output as unknown as WriteStream, signal: controller.signal, color: false, interrupt });
+  const select = () => selectTerminalMenu(menu, { input: input as unknown as ReadStream, output: output as unknown as WriteStream, signal: controller.signal, color, reducedMotion, interrupt });
   return { input, output, controller, interrupt, select, screen: () => screen };
 }
 
 describe('keyboard menu', () => {
+  it('uses a minimal brand mark and complete frame on spacious terminals', () => {
+    const rendered = renderMenu(menu, 0, { columns: 100, rows: 40, color: false });
+    expect(rendered).toContain('F E R N');
+    expect(rendered).toContain('╭');
+    expect(rendered).toContain('╯');
+    expect(rendered.split('\n').every((line) => terminalCellWidth(line) <= 96)).toBe(true);
+  });
+  it('animates only changed rows and cancels motion on exit', async () => {
+    vi.useFakeTimers();
+    try {
+      const t = terminal(true); const result = t.select();
+      const before = t.screen().length;
+      t.input.emit('keypress', '', { name: 'down' });
+      expect(t.screen().slice(before)).not.toContain('\x1b[2J');
+      expect(t.screen().slice(before)).toContain('\x1b[1;30;46m');
+      expect(vi.getTimerCount()).toBe(1);
+      t.controller.abort();
+      await result;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+  it('keeps reduced-motion selection immediate and timer-free', async () => {
+    vi.useFakeTimers();
+    try {
+      const t = terminal(true, true); const result = t.select();
+      t.input.emit('keypress', '', { name: 'down' });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(t.screen()).not.toContain('\x1b[1;30;46m');
+      t.controller.abort(); await result;
+    } finally { vi.useRealTimers(); }
+  });
   it.each([5, 8, 12, 24, 40])('keeps selection and controls visible in %i rows', (rows) => {
     const rendered = renderMenu(menu, 8, { columns: 80, rows, color: false });
     expect(rendered.split('\n').length).toBeLessThanOrEqual(rows - 1);

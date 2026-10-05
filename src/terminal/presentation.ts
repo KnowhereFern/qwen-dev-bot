@@ -130,7 +130,7 @@ export function createTerminalIO(): TerminalIO {
     ...(process.env.TERM === 'dumb' ? {} : {
       select: (menu: import('./menu.js').TerminalMenu) => selectTerminalMenu(menu, {
         input: process.stdin, output: process.stdout, signal: session.signal,
-        color: !process.env.NO_COLOR, interrupt,
+        color: !process.env.NO_COLOR, interrupt, reducedMotion: process.env.QWEN_HARNESS_REDUCED_MOTION === '1',
       }),
     }),
     screen(lines) {

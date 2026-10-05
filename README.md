@@ -2,7 +2,7 @@
 
 A software product designed and built by Fern. It uses Qwen Code and `qwen3.8-max` as its execution engine to turn approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.36`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
+**Release status:** `v1.0.0-rc.37`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
 
 See [live test readiness](docs/live-test-readiness.md) for the current machine and end-to-end proof status.
 
@@ -166,6 +166,8 @@ Model connection supports Standard API, Token Plan Personal/Team, or a custom HT
 The home screen shows delivery status, the current plan, model connection, worker status, and staging evidence. Use **↑/↓ and Enter**, or a shortcut number, to choose an action. The suggested next action starts selected. **Esc** goes back (or exits from home); Ctrl-C exits safely. Menus adapt to terminal size and scroll the selection into view. Command results stay in scrollback and wait for Enter before returning to the dashboard. `NO_COLOR` disables color; `TERM=dumb` uses numbered text prompts.
 
 A plan's steps are independently testable outcomes; stages group dependency-ready steps. Proposed steps are not scheduled tasks until approval. Key availability, live connection verification, worker liveness, and staging proof remain separate. Opening the console never approves or starts delivery. Approval and execution still require explicit typed confirmation; credential entry stays hidden.
+
+Spacious terminals show a small Fern mark and a framed project summary. Teal identifies navigation, amber highlights decisions, and body text follows your terminal theme. Selection changes briefly highlight the new row without repainting the whole screen. Set `QWEN_HARNESS_REDUCED_MOTION=1` to disable the selection animation and activity spinner; `NO_COLOR=1` also disables colored motion. Short or narrow windows automatically use the compact layout.
 
 Command activity animates with real elapsed time, streamed output, and completion/failure feedback—never invented percentage progress. Live progress refreshes changed durable task/program/deployment evidence and separately reads shared worker service liveness every three seconds; it does not drive the delivery loop. Disable animation with `QWEN_HARNESS_REDUCED_MOTION=1`, `NO_COLOR`, or `TERM=dumb`. Superseded proposals remain in history but do not count as current steps. Opening the console, viewing a plan, pressing Enter, or exiting never approves or starts work. Automated non-terminal invocations without arguments still show help; existing command and JSON interfaces remain available.
 
