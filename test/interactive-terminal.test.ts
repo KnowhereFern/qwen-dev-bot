@@ -51,6 +51,23 @@ async function session(current: TerminalSnapshot, answers: Array<string | null>,
 }
 
 describe('interactive terminal', () => {
+  it('native navigation keeps results visible and does not bypass approval confirmation', async () => {
+    const current = fixture();
+    const selections = ['1', '1', '0'];
+    const answers = ['1', 'wrong confirmation', ''];
+    const execute = vi.fn(async () => 0);
+    const question = vi.fn(async () => answers.shift() ?? null);
+    const print = vi.fn();
+    await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current,
+      credential: () => null, workerStatus: async () => 'inactive', execute,
+      io: { select: async () => selections.shift() ?? null, question, print, close() {} },
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(question).toHaveBeenCalledWith('Type approve revision 5 to approve (Enter cancels): ');
+    expect(question).toHaveBeenCalledWith('\nPress Enter to return to the dashboard: ');
+    expect(print).toHaveBeenCalledWith('Cancelled; no approval was recorded.');
+  });
+
   it('opens and exits without approval, Qwen requests, or worker side effects', async () => {
     const result = await session(fixture(), ['0']);
     expect(result.calls).toEqual([]);

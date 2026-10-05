@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.36] - 2026-10-04
+
+- Replace the dense terminal home screen with a keyboard-driven dashboard and focused action list.
+- Add arrow-key navigation, direct shortcuts, resize-aware menus, and safe cancellation across project, plan, setup, progress, evidence, and execution menus.
+- Keep command results visible until dismissed; retain typed approval and execution confirmations, hidden credential input, and a plain-terminal fallback.
+
 ## [1.0.0-rc.35] - 2026-09-17
 
 - Prepare controller-owned staging before operations acceptance without circular waits or premature task completion.

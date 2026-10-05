@@ -3,10 +3,12 @@ import { Writable } from 'node:stream';
 import { terminalText } from './interactive.js';
 import type { TerminalIO } from './interactive.js';
 import type { TerminalScreenLine } from './home.js';
+import { selectTerminalMenu } from './menu.js';
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 const graphemes = (text: string) => Array.from(segmenter.segment(text), (item) => item.segment);
 const cellWidth = (text: string) => /\p{Extended_Pictographic}|[\u1100-\u115f\u2329-\u232a\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff01-\uff60\uffe0-\uffe6]/u.test(text) ? 2 : /^\p{Mark}+$/u.test(text) ? 0 : 1;
+export const terminalCellWidth = (text: string): number => graphemes(terminalText(text)).reduce((total, item) => total + cellWidth(item), 0);
 
 /** Wrap sanitized content without clipping paths, splitting graphemes, or trusting evidence as ANSI. */
 export function wrapTerminalLine(value: string, columns: number): string[] {
@@ -68,7 +70,7 @@ export function startTerminalActivity(label: string, options: {
   const render = () => {
     if (stopped || paused) return;
     const line = `${frames[index++ % frames.length]} ${terminalText(label)} · ${Math.floor((now() - started) / 1_000)}s`;
-    options.write(`\r\x1b[2K${line.slice(0, Math.max(10, (options.columns?.() ?? 80) - 1))}`);
+    options.write(`\r\x1b[2K${wrapTerminalLine(line, Math.max(10, (options.columns?.() ?? 80) - 1))[0]}`);
   };
   if (options.animated) render();
   else options.write(`Working: ${terminalText(label)}\n`);
@@ -125,6 +127,12 @@ export function createTerminalIO(): TerminalIO {
     signal: session.signal,
     question: (prompt) => ask(prompt),
     secret: (prompt) => ask(prompt, true),
+    ...(process.env.TERM === 'dumb' ? {} : {
+      select: (menu: import('./menu.js').TerminalMenu) => selectTerminalMenu(menu, {
+        input: process.stdin, output: process.stdout, signal: session.signal,
+        color: !process.env.NO_COLOR, interrupt,
+      }),
+    }),
     screen(lines) {
       activity?.pause();
       process.stdout.write(renderTerminalScreen(lines, {

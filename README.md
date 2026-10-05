@@ -2,7 +2,7 @@
 
 A software product designed and built by Fern. It uses Qwen Code and `qwen3.8-max` as its execution engine to turn approved GitHub feedback into isolated code changes, exact-commit verification, pull requests, and post-merge self-repair.
 
-**Release status:** `v1.0.0-rc.35`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
+**Release status:** `v1.0.0-rc.36`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
 
 See [live test readiness](docs/live-test-readiness.md) for the current machine and end-to-end proof status.
 
@@ -163,7 +163,9 @@ Eight task-focused menu groups cover program review/approval; objective planning
 
 Model connection supports Standard API, Token Plan Personal/Team, or a custom HTTPS-compatible endpoint while preserving the configured model. Hidden key entry saves only to the user's Qwen `.env` with owner-only permissions, not project files, logs, or command arguments. Existing process/worker credentials retain precedence. Viewing connection status never tests the provider; live verification requires explicit confirmation. Successful verification is labeled for this session only and is invalidated by connection/key changes.
 
-The home screen leads with a plain-language delivery status and a suggested next action. A plan's steps are independently testable outcomes; stages group dependency-ready steps. Plan version identifies the proposal you are reviewing. Proposed steps are not scheduled tasks until approval. AI key availability, live connection verification, shared background-worker liveness, and recorded staging proof are shown separately: none substitutes for another. Menu numbers remain stable; wide terminals use two columns, narrow terminals wrap without truncating paths, and short windows compress whitespace without hiding options. Restrained color highlights headings and next actions, respects the terminal's palette, and is disabled by `NO_COLOR` or `TERM=dumb`.
+The home screen shows delivery status, the current plan, model connection, worker status, and staging evidence. Use **↑/↓ and Enter**, or a shortcut number, to choose an action. The suggested next action starts selected. **Esc** goes back (or exits from home); Ctrl-C exits safely. Menus adapt to terminal size and scroll the selection into view. Command results stay in scrollback and wait for Enter before returning to the dashboard. `NO_COLOR` disables color; `TERM=dumb` uses numbered text prompts.
+
+A plan's steps are independently testable outcomes; stages group dependency-ready steps. Proposed steps are not scheduled tasks until approval. Key availability, live connection verification, worker liveness, and staging proof remain separate. Opening the console never approves or starts delivery. Approval and execution still require explicit typed confirmation; credential entry stays hidden.
 
 Command activity animates with real elapsed time, streamed output, and completion/failure feedback—never invented percentage progress. Live progress refreshes changed durable task/program/deployment evidence and separately reads shared worker service liveness every three seconds; it does not drive the delivery loop. Disable animation with `QWEN_HARNESS_REDUCED_MOTION=1`, `NO_COLOR`, or `TERM=dumb`. Superseded proposals remain in history but do not count as current steps. Opening the console, viewing a plan, pressing Enter, or exiting never approves or starts work. Automated non-terminal invocations without arguments still show help; existing command and JSON interfaces remain available.
 

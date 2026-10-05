@@ -19,6 +19,8 @@ import { fileURLToPath } from 'node:url';
 import { runProcess } from '../runtime/safe-process.js';
 import { homeScreen, planSize, planStatusLabel } from './home.js';
 import type { TerminalScreenLine } from './home.js';
+import { deliveryChoices } from './menu.js';
+import type { TerminalMenu } from './menu.js';
 
 export interface TerminalIO {
   question(prompt: string): Promise<string | null>;
@@ -28,6 +30,7 @@ export interface TerminalIO {
   activity?(label: string): (success: boolean) => void;
   signal?: AbortSignal;
   screen?(lines: TerminalScreenLine[]): void;
+  select?(menu: TerminalMenu): Promise<string | null>;
 }
 
 export interface TerminalSnapshot {
@@ -145,6 +148,17 @@ export async function runInteractiveTerminal(options: {
 
   async function selectProject(): Promise<string | undefined> {
     const items = projects();
+    if (io.select) {
+      const selected = await io.select({ title: 'Choose your project', choices: [
+        ...items.map((item, index) => ({ value: String(index + 1), label: item.name, description: item.root })),
+        { value: 'n', label: 'Open another folder', description: 'Use an existing project or start with an empty folder.' },
+        { value: '0', label: 'Exit' },
+      ] });
+      if (!selected || selected === '0') return undefined;
+      if (selected !== 'n') return items[Number(selected) - 1]?.root;
+      const folder = (await io.question('Project folder (Enter cancels): '))?.trim();
+      return folder ? path.resolve(folder) : undefined;
+    }
     io.print('\nSELECT PROJECT');
     items.forEach((item, index) => io.print(`${index + 1}. ${item.name} — ${item.root}`));
     io.print('Enter a project number or folder path; 0 exits.');
@@ -161,12 +175,28 @@ export async function runInteractiveTerminal(options: {
   async function selectPlan(plans: PortfolioPlan[]): Promise<PortfolioPlan | undefined> {
     const items = [...plans].sort((a, b) => b.updatedAt - a.updatedAt);
     if (!items.length) { io.print('No delivery plan yet. Choose 2 to create one from your objective.'); return undefined; }
+    if (io.select) {
+      const answer = await io.select({ title: 'Choose a delivery plan', choices: [
+        ...items.map((plan, index) => ({ value: String(index + 1), label: `${plan.title} · v${plan.revision ?? 1}`, description: `${planStatusLabel(plan.status)} · ${planSize(plan)}` })),
+        { value: '0', label: 'Back' },
+      ] });
+      return answer && answer !== '0' ? items[Number(answer) - 1] : undefined;
+    }
     items.forEach((plan, index) => io.print(`${index + 1}. ${plan.title} — plan version ${plan.revision ?? 1}, ${planStatusLabel(plan.status)}, ${planSize(plan)}`));
     const answer = (await io.question('Plan number (Enter returns): '))?.trim();
     if (!answer) return undefined;
     const selected = /^\d+$/.test(answer) ? items[Number(answer) - 1] : undefined;
     if (!selected) io.print('Invalid program number.');
     return selected;
+  }
+
+  async function choose(title: string, labels: string[], prompt: string): Promise<string | undefined> {
+    if (io.select) return (await io.select({ title, choices: [
+      ...labels.map((label, index) => ({ value: String(index + 1), label })),
+      { value: '0', label: 'Back to dashboard' },
+    ] })) ?? undefined;
+    io.print(labels.map((label, index) => `${index + 1}. ${label}`).join('\n') + '\n0. Return');
+    return (await io.question(prompt))?.trim();
   }
 
   async function redraft(plan?: PortfolioPlan): Promise<void> {
@@ -196,8 +226,7 @@ export async function runInteractiveTerminal(options: {
   }
 
   async function setupProject(current?: TerminalSnapshot): Promise<void> {
-    io.print('\nPROJECT SETUP\n1. Set up this project\n2. Refresh harness assets (no worker startup)\n3. Existing GitHub account sign-in\n4. Switch project\n0. Return');
-    const action = (await io.question('Setup: '))?.trim();
+    const action = await choose('Project setup', ['Set up this project', 'Refresh harness assets (no worker startup)', 'Sign in to an existing GitHub account', 'Switch project'], 'Setup: ');
     if (action === '4') { root = undefined; return; }
     if (action === '3') {
       io.print('Sign in to an existing GitHub account using GitHub CLI. No account or repository is created by this console.');
@@ -241,7 +270,7 @@ export async function runInteractiveTerminal(options: {
     const config = current.config;
     const resolved = credential(config);
     io.print(`\nMODEL CONNECTION\nModel: ${config.qwen.model} (preserved)\nProvider route: ${config.qwen.billingPlan}\nEndpoint: ${config.qwen.baseUrl}\nCredential: ${config.qwen.credentialEnvKey} — ${resolved ? `found in ${resolved.source}; ${liveVerified(config) ? 'live verified this session' : 'not live-verified'}` : 'missing'}\n1. Configure provider/endpoint\n2. Add/replace credential (hidden input; user-only storage)\n3. Verify live model connection\n0. Return`);
-    const action = (await io.question('Connection: '))?.trim();
+    const action = io.select ? await choose('Model connection', ['Configure provider / endpoint', 'Add or replace credential (hidden input)', 'Verify live model connection'], 'Connection: ') : (await io.question('Connection: '))?.trim();
     if (action === '1') {
       io.print('1. Standard API\n2. Token Plan Personal\n3. Token Plan Team\n4. Custom compatible endpoint');
       const route = (await io.question('Provider route (Enter cancels): '))?.trim();
@@ -313,9 +342,16 @@ export async function runInteractiveTerminal(options: {
         connection: current && liveVerified(current.config) ? 'verified' : connection ? 'found' : 'missing',
         worker: current ? await workerStatus().catch(() => 'unknown' as const) : 'unknown',
       });
-      if (io.screen) io.screen(lines);
-      else io.print(lines.map((line) => line.text).join('\n'));
-      const action = (await io.question('Choose a number (0 exits): '))?.trim();
+      let action: string | undefined;
+      if (io.select) {
+        const next = lines.find((line) => line.text.includes('Next:'))?.text.match(/Next: (\d)/)?.[1];
+        const header = [lines[0], lines[1], lines[2], ...lines.filter((line) => /^  (Plan|AI|Service|Staging) {2}/.test(line.text))];
+        action = (await io.select({ title: 'What would you like to do?', choices: deliveryChoices, header, initial: next })) ?? undefined;
+      } else {
+        if (io.screen) io.screen(lines);
+        else io.print(lines.map((line) => line.text).join('\n'));
+        action = (await io.question('Choose a number (0 exits): '))?.trim();
+      }
       if (action === undefined || action === '0') return 0;
       try {
         if (!current && !['6', '8'].includes(action)) { io.print('Set up this project first: choose 6.'); continue; }
@@ -351,16 +387,14 @@ export async function runInteractiveTerminal(options: {
             break;
           }
           case '3': {
-            io.print('1. Live read-only progress\n2. Task details\n0. Return');
-            const progress = (await io.question('Progress: '))?.trim();
+            const progress = await choose('Progress', ['Live read-only progress', 'Task details'], 'Progress: ');
             if (progress === '1') await watchProgress();
             if (progress === '2') await execute(['status', root]);
             break;
           }
           case '4': await execute(['doctor', root]); break;
           case '5': {
-            io.print('1. Deployment status\n2. Feedback signals\n3. Recent logs\n4. Objective evidence report\n5. Controller version history\n0. Return');
-            const evidence = (await io.question('Evidence: '))?.trim();
+            const evidence = await choose('Evidence & history', ['Deployment status', 'Feedback signals', 'Recent logs', 'Objective evidence report', 'Controller version history'], 'Evidence: ');
             if (evidence === '1') await execute(['deploy-status', root]);
             if (evidence === '2') await execute(['signals', root]);
             if (evidence === '3') await execute(['logs', root, '--lines', '50']);
@@ -370,8 +404,7 @@ export async function runInteractiveTerminal(options: {
           }
           case '6': await setupProject(current); break;
           case '7': {
-            io.print('1. Install/start shared background worker (resumes persisted work)\n2. One bounded project recovery/execution cycle\n3. Worker service status\n0. Return');
-            const execution = (await io.question('Execution: '))?.trim();
+            const execution = await choose('Start / resume delivery', ['Start shared background worker', 'Run one bounded project cycle', 'Worker service status'], 'Execution: ');
             if (execution === '3') { io.print(`Worker: ${await workerStatus()} (service liveness only)`); break; }
             if (!['1', '2'].includes(execution ?? '')) break;
             if ((current!.config.program.enabled || current!.plans.length) && !current!.plans.some((plan) => plan.approvedAt !== null) && !current!.tasks.length) {
@@ -393,6 +426,7 @@ export async function runInteractiveTerminal(options: {
           default: io.print('Choose a listed menu number.');
         }
       } catch (error) { io.print(`Error: ${terminalText(error instanceof Error ? error.message : String(error))}\nThe console remains available. Review status before retrying.`); }
+      if (io.select && !io.signal?.aborted && await io.question('\nPress Enter to return to the dashboard: ') === null) return 0;
     }
   } finally { io.close(); }
 }
