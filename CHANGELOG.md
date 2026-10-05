@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.38] - 2026-10-05
+
+- Carry the Fern presentation through prompts, confirmations, errors, command results and live progress.
+- Replace the full-plan text dump with a sectioned review workspace and scrollable, read-only plan reader; preserve every acceptance criterion, contract and approval guard.
+- Add keyboard scrolling, section jumps, small-window layouts, and bounded recent-result viewing.
+- Exercise nested menu paths, cancellation, failure presentation and live-refresh cleanup with simulated side effects.
+
 ## [1.0.0-rc.37] - 2026-10-04
 
 - Give spacious terminal windows a small Fern mark, framed project summary, and clearer visual hierarchy.

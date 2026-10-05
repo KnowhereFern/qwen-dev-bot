@@ -3,6 +3,7 @@ import type { ReadStream, WriteStream } from 'node:tty';
 import { describe, expect, it, vi } from 'vitest';
 import { deliveryChoices, renderMenu, selectTerminalMenu } from '../src/terminal/menu.js';
 import { terminalCellWidth } from '../src/terminal/presentation.js';
+import { renderContent, renderDocument, renderPrompt } from '../src/terminal/document.js';
 
 const menu = { title: 'Choose an action', choices: deliveryChoices };
 function terminal(color = false, reducedMotion = false) {
@@ -12,11 +13,71 @@ function terminal(color = false, reducedMotion = false) {
   output.on('data', (chunk) => { screen += chunk.toString(); });
   const controller = new AbortController();
   const interrupt = vi.fn(() => controller.abort());
-  const select = () => selectTerminalMenu(menu, { input: input as unknown as ReadStream, output: output as unknown as WriteStream, signal: controller.signal, color, reducedMotion, interrupt });
+  const select = (view = menu as import('../src/terminal/menu.js').TerminalMenu) => selectTerminalMenu(view, { input: input as unknown as ReadStream, output: output as unknown as WriteStream, signal: controller.signal, color, reducedMotion, interrupt });
   return { input, output, controller, interrupt, select, screen: () => screen };
 }
 
 describe('keyboard menu', () => {
+  it.each([5, 6, 8])('fits the document reader into %i terminal rows', (rows) => {
+    const view = renderDocument('Plan', 'One\nTwo\nThree\nFour\nFive', 0, { columns: 40, rows, color: false });
+    expect(view.screen.split('\n').length).toBeLessThanOrEqual(rows - 1);
+    expect(view.screen).toContain('Esc back');
+  });
+  it.each([30, 60, 100])('keeps every document line reachable at width %i', (columns) => {
+    const source = Array.from({ length: 100 }, (_, index) => `Evidence ${index}: ${'long text '.repeat(8)}`).join('\n');
+    const first = renderDocument('Complete plan', source, 0, { columns, rows: 24, color: false });
+    const last = renderDocument('Complete plan', source, 99999, { columns, rows: 24, color: false });
+    expect(first.screen).toContain('Evidence 0:');
+    expect(last.screen).toContain('Evidence 99:');
+    expect(last.screen.split('\n').length).toBeLessThanOrEqual(23);
+    expect(last.screen.split('\n').every((line) => terminalCellWidth(line) <= columns - 1)).toBe(true);
+  });
+  it('styles prompts and errors without trusting ANSI from content', () => {
+    const prompt = renderPrompt('Type approve revision 5 to approve (Enter cancels): ', 40, true);
+    expect(prompt).toContain('Confirm your decision');
+    expect(prompt).toContain('\x1b[1;33m');
+    expect(renderContent('Error: \x1b[2Jnot available', 40, true).join('\n')).not.toContain('\x1b[2J');
+    expect(renderPrompt('Secret key:', 40, false, true)).toContain('Private input');
+  });
+  it('scrolls documents without treating keys as executable selections', async () => {
+    const t = terminal();
+    const result = t.select({ ...menu, document: Array.from({ length: 100 }, (_, i) => `Row ${i}`).join('\n') });
+    t.input.emit('keypress', '', { name: 'end' });
+    expect(t.screen()).toContain('Row 99');
+    t.input.emit('keypress', '', { name: 'home' });
+    t.input.emit('keypress', '1', { name: '1', sequence: '1' });
+    expect(t.input.isRaw).toBe(true);
+    t.input.emit('keypress', '', { name: 'return' });
+    expect(await result).toBe('0');
+  });
+  it('refreshes live documents and stops polling after exit', async () => {
+    vi.useFakeTimers();
+    try {
+      const t = terminal(); const refresh = vi.fn(async () => 'Updated evidence');
+      const result = t.select({ ...menu, document: 'Initial evidence', refresh, refreshMs: 100 });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(t.screen()).toContain('Updated evidence');
+      t.controller.abort(); await result;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(refresh).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+  it('shows refresh errors and ignores late results after the reader closes', async () => {
+    vi.useFakeTimers();
+    try {
+      const t = terminal();
+      const result = t.select({ ...menu, document: 'Initial', refresh: () => { throw new Error('offline'); }, refreshMs: 100 });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(t.screen()).toContain('offline');
+      t.input.emit('keypress', '0', { name: '0', sequence: '0' });
+      await result;
+      const closedScreen = t.screen();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(t.screen()).toBe(closedScreen);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
   it('uses a minimal brand mark and complete frame on spacious terminals', () => {
     const rendered = renderMenu(menu, 0, { columns: 100, rows: 40, color: false });
     expect(rendered).toContain('F E R N');

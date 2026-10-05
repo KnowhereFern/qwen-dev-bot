@@ -3,6 +3,7 @@ import type { Key } from 'node:readline';
 import type { ReadStream, WriteStream } from 'node:tty';
 import type { TerminalScreenLine } from './home.js';
 import { terminalCellWidth, wrapTerminalLine } from './presentation.js';
+import { renderDocument } from './document.js';
 
 export interface TerminalChoice { value: string; label: string; description?: string }
 export interface TerminalMenu {
@@ -10,6 +11,9 @@ export interface TerminalMenu {
   choices: TerminalChoice[];
   header?: TerminalScreenLine[];
   initial?: string;
+  document?: string;
+  refresh?: () => Promise<string>;
+  refreshMs?: number;
 }
 
 export const deliveryChoices: TerminalChoice[] = [
@@ -89,11 +93,19 @@ export async function selectTerminalMenu(menu: TerminalMenu, options: {
     let previous: string[] = [];
     let emphasis = false;
     let animation: ReturnType<typeof setTimeout> | undefined;
+    let offset = 0;
+    let documentView: ReturnType<typeof renderDocument> | undefined;
+    let documentText = menu.document;
+    let refreshTimer: ReturnType<typeof setInterval> | undefined;
+    let refreshing = false;
     const draw = () => {
       try {
-        const lines = renderMenu(menu, selected, {
+        const dimensions = {
           columns: output.columns || 80, rows: output.rows || 24, color: options.color, emphasis,
-        }).split('\n');
+        };
+        documentView = documentText !== undefined ? renderDocument(menu.title, documentText, offset, dimensions) : undefined;
+        if (documentView) offset = documentView.offset;
+        const lines = (documentView?.screen ?? renderMenu(menu, selected, dimensions)).split('\n');
         // Paint only changed rows: selection motion must not flash the whole screen.
         let update = '';
         for (let row = 0; row < Math.max(lines.length, previous.length); row++) {
@@ -111,6 +123,7 @@ export async function selectTerminalMenu(menu: TerminalMenu, options: {
       if (finished) return;
       finished = true;
       clearTimeout(animation);
+      clearInterval(refreshTimer);
       input.removeListener('keypress', keypress);
       input.removeListener('end', abort);
       output.removeListener('resize', resize);
@@ -124,6 +137,20 @@ export async function selectTerminalMenu(menu: TerminalMenu, options: {
     const keypress = (_text: string, key: Key) => {
       if (key.ctrl && (key.name === 'c' || key.name === 'd')) { options.interrupt(); finish(null); return; }
       if (key.name === 'escape' || key.name === 'q') { finish('0'); return; }
+      if (documentView) {
+        if (key.name === 'return' || key.sequence === '0') { finish('0'); return; }
+        if (key.name === 'up' || key.name === 'k') offset--;
+        else if (key.name === 'down' || key.name === 'j') offset++;
+        else if (key.name === 'pageup') offset -= documentView.pageSize;
+        else if (key.name === 'pagedown' || key.name === 'space') offset += documentView.pageSize;
+        else if (key.name === 'home') offset = 0;
+        else if (key.name === 'end') offset = documentView.maxOffset;
+        else if (key.name === 'tab') offset = key.shift
+          ? documentView.sections.filter((section) => section < offset).at(-1) ?? 0
+          : documentView.sections.find((section) => section > offset) ?? documentView.maxOffset;
+        else return;
+        draw(); return;
+      }
       if (key.name === 'up' || key.name === 'k') selected = (selected - 1 + menu.choices.length) % menu.choices.length;
       else if (key.name === 'down' || key.name === 'j' || key.name === 'tab') selected = (selected + 1) % menu.choices.length;
       else if (key.name === 'home') selected = 0;
@@ -148,6 +175,15 @@ export async function selectTerminalMenu(menu: TerminalMenu, options: {
       input.resume();
       output.write('\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J');
       draw();
+      if (menu.refresh && !finished) refreshTimer = setInterval(() => {
+        if (refreshing || finished) return;
+        refreshing = true;
+        void Promise.resolve().then(menu.refresh!).then((text) => {
+          if (!finished) { documentText = text; draw(); }
+        }, (error: unknown) => {
+          if (!finished) { documentText = `Live status unavailable: ${String(error)}\nReturn and retry when the connection is available.`; draw(); }
+        }).finally(() => { refreshing = false; });
+      }, menu.refreshMs ?? 3_000);
     } catch (error) { finish(null, error); }
   });
 }

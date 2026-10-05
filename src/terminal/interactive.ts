@@ -31,6 +31,10 @@ export interface TerminalIO {
   signal?: AbortSignal;
   screen?(lines: TerminalScreenLine[]): void;
   select?(menu: TerminalMenu): Promise<string | null>;
+  document?(title: string, text: string): Promise<void>;
+  begin?(title: string): void;
+  finish?(): Promise<void>;
+  live?(title: string, read: () => Promise<string>, refreshMs: number): Promise<void>;
 }
 
 export interface TerminalSnapshot {
@@ -146,6 +150,45 @@ export async function runInteractiveTerminal(options: {
     } finally { Object.assign(console, saved); stop?.(success); }
   };
 
+  async function reviewProgram(plan: PortfolioPlan, current: TerminalSnapshot): Promise<string | undefined> {
+    const checks = ['CONFIGURED CHECKS', 'Required checks cannot be waived by this console.',
+      ...current.config.gates.map((gate) => `${gate.id} — ${gate.required ? 'required' : 'optional'}: ${gate.command} ${gate.args.join(' ')}`),
+      `Configured automatic staging: ${current.config.deployment.staging.enabled ? 'enabled' : 'disabled'}`].join('\n');
+    const full = `${formatTerminalPlan(plan)}\n\n${checks}`;
+    if (!io.document || !io.select) {
+      io.print(full);
+      if (!['draft', 'awaiting_initial_approval', 'awaiting_material_approval', 'approving'].includes(plan.status)) {
+        io.print('This program is not awaiting approval.'); return undefined;
+      }
+      io.print('\n1. Approve this revision\n2. Request changes (redraft before initial approval)\n0. Defer');
+      return (await io.question('Review decision: '))?.trim();
+    }
+    const parts = full.split(/\n\n(?=OBJECTIVE\n|ACCEPTANCE\n|CONSTRAINTS\n|FROZEN TECHNOLOGY\n|DEPLOYMENT AUTHORITY\n|OBJECTIVE COVERAGE\n|CURRENT DELIVERY STORIES\n|LATEST REVISION\n|CONFIGURED CHECKS\n)/);
+    const names = ['Overview', 'Objective', 'Acceptance criteria', 'Constraints', 'Technology decisions', 'Deployment authority', 'Coverage & evidence', 'Delivery steps', 'Revision history', 'Required checks'];
+    const sectionKeys = parts.map((_, index) => index === 9 ? 'c' : String(index + 1));
+    const pending = ['draft', 'awaiting_initial_approval', 'awaiting_material_approval', 'approving'].includes(plan.status);
+    while (!io.signal?.aborted) {
+      const selection = await io.select({ title: `Review plan · version ${plan.revision ?? 1}`, header: [
+        { text: `  Fern Delivery · ${plan.title}`, tone: 'title' }, { text: '', tone: 'rule' },
+        { text: `  ${planStatusLabel(plan.status)}`, tone: 'attention' },
+        { text: `  ${planSize(plan)} · Reading does not change this program.` },
+      ], choices: [
+        ...parts.map((_, index) => ({ value: sectionKeys[index], label: names[index] ?? 'Plan details', description: index === 0 ? plan.objective : 'Open the read-only reader. Scroll or jump between sections; return here when finished.' })),
+        { value: 'f', label: 'Read complete plan', description: 'All contracts, evidence, constraints and required checks. Nothing is omitted.' },
+        ...(pending ? [{ value: 'a', label: 'Approve this revision…', description: 'Requires a typed confirmation. A running worker may pick up approved work.' },
+          { value: 'r', label: 'Request changes…', description: 'Draft revisions before approval; approved boundaries remain protected.' }] : []),
+        { value: '0', label: 'Defer / back', description: 'Leave this plan unchanged.' },
+      ] });
+      if (!selection || selection === '0') return undefined;
+      if (selection === 'a' && pending) return '1';
+      if (selection === 'r' && pending) return '2';
+      const index = sectionKeys.indexOf(selection);
+      const part = selection === 'f' ? full : parts[index];
+      if (part !== undefined) await io.document(selection === 'f' ? 'Complete plan' : names[index] ?? 'Plan details', part);
+    }
+    return undefined;
+  }
+
   async function selectProject(): Promise<string | undefined> {
     const items = projects();
     if (io.select) {
@@ -190,8 +233,11 @@ export async function runInteractiveTerminal(options: {
     return selected;
   }
 
-  async function choose(title: string, labels: string[], prompt: string): Promise<string | undefined> {
-    if (io.select) return (await io.select({ title, choices: [
+  async function choose(title: string, labels: string[], prompt: string, context?: string): Promise<string | undefined> {
+    if (io.select) return (await io.select({ title, ...(context ? { header: [
+      { text: `  Fern Delivery · ${title}`, tone: 'title' as const }, { text: '', tone: 'rule' as const },
+      ...context.split('\n').map((text) => ({ text: `  ${text}` })),
+    ] } : {}), choices: [
       ...labels.map((label, index) => ({ value: String(index + 1), label })),
       { value: '0', label: 'Back to dashboard' },
     ] })) ?? undefined;
@@ -269,11 +315,11 @@ export async function runInteractiveTerminal(options: {
   async function modelConnection(current: TerminalSnapshot): Promise<void> {
     const config = current.config;
     const resolved = credential(config);
-    io.print(`\nMODEL CONNECTION\nModel: ${config.qwen.model} (preserved)\nProvider route: ${config.qwen.billingPlan}\nEndpoint: ${config.qwen.baseUrl}\nCredential: ${config.qwen.credentialEnvKey} — ${resolved ? `found in ${resolved.source}; ${liveVerified(config) ? 'live verified this session' : 'not live-verified'}` : 'missing'}\n1. Configure provider/endpoint\n2. Add/replace credential (hidden input; user-only storage)\n3. Verify live model connection\n0. Return`);
-    const action = io.select ? await choose('Model connection', ['Configure provider / endpoint', 'Add or replace credential (hidden input)', 'Verify live model connection'], 'Connection: ') : (await io.question('Connection: '))?.trim();
+    const context = `Model: ${config.qwen.model} (preserved)\nProvider route: ${config.qwen.billingPlan}\nEndpoint: ${config.qwen.baseUrl}\nCredential: ${config.qwen.credentialEnvKey} — ${resolved ? `found in ${resolved.source}; ${liveVerified(config) ? 'live verified this session' : 'not live-verified'}` : 'missing'}`;
+    io.print(`\nMODEL CONNECTION\n${context}`);
+    const action = await choose('Model connection', ['Configure provider / endpoint', 'Add or replace credential (hidden input)', 'Verify live model connection'], 'Connection: ', context);
     if (action === '1') {
-      io.print('1. Standard API\n2. Token Plan Personal\n3. Token Plan Team\n4. Custom compatible endpoint');
-      const route = (await io.question('Provider route (Enter cancels): '))?.trim();
+      const route = await choose('Provider route', ['Standard API', 'Token Plan Personal', 'Token Plan Team', 'Custom compatible endpoint'], 'Provider route (Enter cancels): ');
       const billing = ({ '1': 'standard', '2': 'token-plan-personal', '3': 'token-plan-team', '4': 'custom' } as Record<string, QwenBillingPlan>)[route ?? ''];
       if (!billing) return;
       const suggested = billing.startsWith('token-plan-') ? TOKEN_PLAN_QWEN_BASE_URL : billing === 'standard' ? DEFAULT_QWEN_BASE_URL : config.qwen.baseUrl;
@@ -312,6 +358,10 @@ export async function runInteractiveTerminal(options: {
   }
 
   async function watchProgress(): Promise<void> {
+    if (io.live) {
+      await io.live('Live progress · read-only', async () => formatLiveStatus(snapshot(root!), await workerStatus()), options.refreshMs ?? 3_000);
+      return;
+    }
     io.print('LIVE PROGRESS — read-only; Enter returns. This does not run or resume delivery.');
     let open = true;
     let checking = false;
@@ -353,21 +403,14 @@ export async function runInteractiveTerminal(options: {
         action = (await io.question('Choose a number (0 exits): '))?.trim();
       }
       if (action === undefined || action === '0') return 0;
+      io.begin?.(deliveryChoices.find((choice) => choice.value === action)?.label ?? 'Fern Delivery');
       try {
-        if (!current && !['6', '8'].includes(action)) { io.print('Set up this project first: choose 6.'); continue; }
+        if (!current && !['6', '8'].includes(action)) throw new Error('Set up this project first: choose Project setup.');
         switch (action) {
           case '1': {
             const plan = await selectPlan(current!.plans);
             if (!plan) break;
-            io.print(formatTerminalPlan(plan));
-            io.print('\nCONFIGURED CHECKS (required checks cannot be waived by this console)');
-            current!.config.gates.forEach((gate) => io.print(`${gate.id} — ${gate.required ? 'required' : 'optional'}: ${gate.command} ${gate.args.join(' ')}`));
-            io.print(`Configured automatic staging: ${current!.config.deployment.staging.enabled ? 'enabled' : 'disabled'}`);
-            if (!['draft', 'awaiting_initial_approval', 'awaiting_material_approval', 'approving'].includes(plan.status)) {
-              io.print('This program is not awaiting approval.'); break;
-            }
-            io.print('\n1. Approve this revision\n2. Request changes (redraft before initial approval)\n0. Defer');
-            const review = (await io.question('Review decision: '))?.trim();
+            const review = await reviewProgram(plan, current!);
             if (review === '2') { await redraft(plan); break; }
             if (review !== '1') { io.print('Deferred; program remains unchanged.'); break; }
             const confirmation = `approve revision ${plan.revision ?? 1}`;
@@ -426,6 +469,7 @@ export async function runInteractiveTerminal(options: {
           default: io.print('Choose a listed menu number.');
         }
       } catch (error) { io.print(`Error: ${terminalText(error instanceof Error ? error.message : String(error))}\nThe console remains available. Review status before retrying.`); }
+      if (!io.signal?.aborted) await io.finish?.();
       if (io.select && !io.signal?.aborted && await io.question('\nPress Enter to return to the dashboard: ') === null) return 0;
     }
   } finally { io.close(); }

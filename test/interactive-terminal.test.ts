@@ -51,6 +51,39 @@ async function session(current: TerminalSnapshot, answers: Array<string | null>,
 }
 
 describe('interactive terminal', () => {
+  it('reviews every plan section in the reader, then cancels typed approval without writes', async () => {
+    const current = fixture();
+    const selections = ['1', '1', ...Array.from({ length: 9 }, (_, i) => String(i + 1)), 'c', 'f', 'a', '0'];
+    const answers = ['', ''];
+    const document = vi.fn(async (_title: string, _text: string) => {});
+    const execute = vi.fn(async (_args: string[]) => 0);
+    const question = vi.fn(async () => answers.shift() ?? null);
+    await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current,
+      credential: () => null, workerStatus: async () => 'inactive', execute,
+      io: { select: async () => selections.shift() ?? null, document, question, print() {}, close() {} },
+    });
+    expect(document).toHaveBeenCalledTimes(11);
+    expect(document.mock.calls.map((call) => call[0])).toEqual(['Overview', 'Objective', 'Acceptance criteria', 'Constraints', 'Technology decisions', 'Deployment authority', 'Coverage & evidence', 'Delivery steps', 'Revision history', 'Required checks', 'Complete plan']);
+    expect(execute).not.toHaveBeenCalled();
+    expect(question).toHaveBeenCalledWith('Type approve revision 5 to approve (Enter cancels): ');
+  });
+
+  it.each([
+    ['4'], ['3', '2'], ['5', '1'], ['5', '2'], ['5', '3'], ['5', '4', '1'], ['5', '5'],
+    ['6', '0'], ['6', '1'], ['6', '2'], ['6', '3'], ['7', '1'], ['7', '2'], ['7', '3'],
+    ['8', '0'], ['8', '1', '1'], ['8', '1', '2'], ['8', '1', '3'], ['8', '1', '4'], ['8', '2'], ['8', '3'], ['2', '1'],
+  ])('keeps native path %j inside the shared action shell', async (...path: string[]) => {
+    const current = fixture(); const selections = [...path, '0'];
+    const begin = vi.fn(); const finish = vi.fn(async () => {}); const close = vi.fn();
+    const execute = vi.fn(async (_args: string[]) => 0);
+    await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current,
+      credential: () => null, workerStatus: async () => 'inactive', execute,
+      io: { select: async () => selections.shift() ?? null, document: async () => {}, begin, finish,
+        question: async () => null, secret: async () => null, print() {}, close },
+    });
+    expect(begin).toHaveBeenCalledOnce(); expect(finish).toHaveBeenCalledOnce(); expect(close).toHaveBeenCalledOnce();
+    expect(execute.mock.calls.every(([args]) => !['init', 'update', 'plan', 'plan-redraft', 'plan-approve', 'reconcile', 'verify'].includes(args[0]))).toBe(true);
+  });
   it('native navigation keeps results visible and does not bypass approval confirmation', async () => {
     const current = fixture();
     const selections = ['1', '1', '0'];
@@ -66,6 +99,26 @@ describe('interactive terminal', () => {
     expect(question).toHaveBeenCalledWith('Type approve revision 5 to approve (Enter cancels): ');
     expect(question).toHaveBeenCalledWith('\nPress Enter to return to the dashboard: ');
     expect(print).toHaveBeenCalledWith('Cancelled; no approval was recorded.');
+  });
+
+  it('keeps command failures in the shared results shell', async () => {
+    const current = fixture(); const picks = ['4']; const print = vi.fn(); const finish = vi.fn(async () => {});
+    await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current,
+      credential: () => null, workerStatus: async () => 'inactive', execute: async () => 1,
+      io: { select: async () => picks.shift() ?? null, question: async () => null, begin() {}, finish, print, close() {} },
+    });
+    expect(print.mock.calls.flat().join('\n')).toContain('doctor failed');
+    expect(finish).toHaveBeenCalledOnce();
+  });
+
+  it('uses the live reader without running a recovery cycle', async () => {
+    const current = fixture(); const picks = ['3', '1']; const execute = vi.fn();
+    const live = vi.fn(async (_title: string, read: () => Promise<string>) => { expect(await read()).toContain('Demo'); });
+    await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current,
+      credential: () => null, workerStatus: async () => 'inactive', execute,
+      io: { select: async () => picks.shift() ?? null, live, question: async () => null, print() {}, close() {} },
+    });
+    expect(live).toHaveBeenCalledOnce(); expect(execute).not.toHaveBeenCalled();
   });
 
   it('opens and exits without approval, Qwen requests, or worker side effects', async () => {

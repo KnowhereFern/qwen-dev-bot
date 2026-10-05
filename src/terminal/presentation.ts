@@ -4,6 +4,7 @@ import { terminalText } from './interactive.js';
 import type { TerminalIO } from './interactive.js';
 import type { TerminalScreenLine } from './home.js';
 import { selectTerminalMenu } from './menu.js';
+import { renderContent, renderPrompt } from './document.js';
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 const graphemes = (text: string) => Array.from(segmenter.segment(text), (item) => item.segment);
@@ -96,6 +97,12 @@ export function createTerminalIO(): TerminalIO {
   const session = new AbortController();
   let active: ReturnType<typeof createInterface> | undefined;
   let activity: TerminalActivity | undefined;
+  const styled = process.env.TERM !== 'dumb';
+  const color = styled && !process.env.NO_COLOR;
+  let transcript: string[] = [];
+  let transcriptSize = 0;
+  let transcriptTruncated = false;
+  let sectionTitle = 'Fern Delivery';
   const interrupt = () => session.abort();
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', interrupt);
@@ -111,9 +118,11 @@ export function createTerminalIO(): TerminalIO {
     session.signal.addEventListener('abort', abort, { once: true });
     rl.once('close', abort);
     rl.once('SIGINT', interrupt);
-    rl.setPrompt(prompt);
-    if (hidden) process.stdout.write(prompt);
-    try { return await rl.question(hidden ? '' : prompt, { signal: question.signal }); }
+    if (styled) process.stdout.write(renderPrompt(prompt, process.stdout.columns || 80, color, hidden));
+    const inputPrompt = styled ? (color ? '\x1b[1;36m  › \x1b[0m' : '  › ') : terminalText(prompt);
+    rl.setPrompt(inputPrompt);
+    if (hidden) process.stdout.write(inputPrompt);
+    try { return await rl.question(hidden ? '' : inputPrompt, { signal: question.signal }); }
     catch (error) { if (question.signal.aborted || session.signal.aborted) return null; throw error; }
     finally {
       session.signal.removeEventListener('abort', abort);
@@ -127,11 +136,36 @@ export function createTerminalIO(): TerminalIO {
     signal: session.signal,
     question: (prompt) => ask(prompt),
     secret: (prompt) => ask(prompt, true),
+    begin(title) {
+      sectionTitle = title;
+      transcript = []; transcriptSize = 0; transcriptTruncated = false;
+      if (styled) process.stdout.write('\x1b[H\x1b[2J' + renderTerminalScreen([
+        { text: `  Fern / ${title}`, tone: 'title' }, { text: '', tone: 'rule' },
+      ], { columns: process.stdout.columns, color }));
+    },
     ...(process.env.TERM === 'dumb' ? {} : {
       select: (menu: import('./menu.js').TerminalMenu) => selectTerminalMenu(menu, {
         input: process.stdin, output: process.stdout, signal: session.signal,
         color: !process.env.NO_COLOR, interrupt, reducedMotion: process.env.QWEN_HARNESS_REDUCED_MOTION === '1',
       }),
+      document: async (title: string, text: string) => {
+        await selectTerminalMenu({ title, document: text, choices: [{ value: '0', label: 'Back' }] }, {
+          input: process.stdin, output: process.stdout, signal: session.signal, color, interrupt, reducedMotion: true,
+        });
+      },
+      live: async (title: string, read: () => Promise<string>, refreshMs: number) => {
+        await selectTerminalMenu({ title, document: await read(), refresh: read, refreshMs, choices: [{ value: '0', label: 'Back' }] }, {
+          input: process.stdin, output: process.stdout, signal: session.signal, color, interrupt, reducedMotion: true,
+        });
+      },
+      finish: async () => {
+        const content = (transcriptTruncated ? 'Showing recent output. Earlier output remains in terminal scrollback.\n\n' : '') + transcript.join('\n');
+        if (renderContent(content, process.stdout.columns || 80, false).length > (process.stdout.rows || 24) - 8) {
+          await selectTerminalMenu({ title: `${sectionTitle} / results`, document: content, choices: [{ value: '0', label: 'Back' }] }, {
+            input: process.stdin, output: process.stdout, signal: session.signal, color, interrupt, reducedMotion: true,
+          });
+        }
+      },
     }),
     screen(lines) {
       activity?.pause();
@@ -145,7 +179,13 @@ export function createTerminalIO(): TerminalIO {
     print(text) {
       activity?.pause();
       if (active) process.stdout.write('\r\x1b[2K');
-      process.stdout.write(`${terminalText(text)}\n`);
+      const safe = terminalText(text);
+      const retained = safe.slice(-200_000);
+      if (retained.length !== safe.length) transcriptTruncated = true;
+      transcript.push(retained); transcriptSize += retained.length;
+      // Keep a bounded recent-result reader; the full command output remains in scrollback/logs.
+      while (transcriptSize > 200_000 && transcript.length > 1) { transcriptSize -= transcript.shift()!.length; transcriptTruncated = true; }
+      process.stdout.write(styled ? `${renderContent(safe, process.stdout.columns || 80, color).join('\n')}\n` : `${safe}\n`);
       if (active) active.prompt(true);
       else activity?.resume();
     },
