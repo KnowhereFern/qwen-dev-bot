@@ -8,7 +8,7 @@ The interactive console has four shared surfaces: keyboard menus, read-only read
 | --- | --- |
 | Project selection and setup | Existing/new folder selection; setup, asset refresh and sign-in cancellation; same action heading and prompt presentation |
 | Plan creation and revision | File prompts, invalid values, cancellation and frozen-objective guards |
-| Plan review | All ten sections and full plan reachable; no omitted contracts; separate approval action and exact typed revision/hash guards |
+| Plan review | All ten sections and full plan reachable; no omitted contracts; separate numbered confirmation with Cancel selected; exact revision/hash guards preserved |
 | Model connection | All provider routes; private input; cancellation; explicit live verification; no keys in output |
 | Delivery | Worker-status read; blocked unapproved work; separately confirmed start/cycle; shared-worker warning preserved |
 | Evidence | Deployment, feedback, logs, evidence report and controller history routes |

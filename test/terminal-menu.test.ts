@@ -18,6 +18,26 @@ function terminal(color = false, reducedMotion = false) {
 }
 
 describe('keyboard menu', () => {
+  it('selects multi-digit choices without prematurely choosing the first digit', async () => {
+    const t = terminal();
+    const result = t.select({ title: 'Review', choices: Array.from({ length: 13 }, (_, i) => ({ value: String(i + 1), label: `Choice ${i + 1}` })) });
+    t.input.emit('keypress', '1', { name: '1', sequence: '1' });
+    expect(t.input.isRaw).toBe(true);
+    expect(t.screen()).toContain('Number: 1');
+    t.input.emit('keypress', '2', { name: '2', sequence: '2' });
+    expect(await result).toBe('12');
+  });
+  it('confirms an ambiguous single-digit choice with Enter', async () => {
+    const t = terminal(); const result = t.select({ title: 'Review', choices: [{ value: '1', label: 'One' }, { value: '10', label: 'Ten' }] });
+    t.input.emit('keypress', '1', { name: '1', sequence: '1' });
+    t.input.emit('keypress', '', { name: 'return' });
+    expect(await result).toBe('1');
+  });
+  it('defaults confirmation menus to Cancel when Enter is pressed', async () => {
+    const t = terminal(); const result = t.select({ title: 'Approve revision 5', initial: '0', choices: [{ value: '1', label: 'Approve' }, { value: '0', label: 'Cancel' }] });
+    t.input.emit('keypress', '', { name: 'return' });
+    expect(await result).toBe('0');
+  });
   it.each([5, 6, 8])('fits the document reader into %i terminal rows', (rows) => {
     const view = renderDocument('Plan', 'One\nTwo\nThree\nFour\nFive', 0, { columns: 40, rows, color: false });
     expect(view.screen.split('\n').length).toBeLessThanOrEqual(rows - 1);

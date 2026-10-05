@@ -29,7 +29,7 @@ export const deliveryChoices: TerminalChoice[] = [
 ];
 
 /** A bounded viewport: the selected item and navigation hint stay visible on resize. */
-export function renderMenu(menu: TerminalMenu, selected: number, options: { columns: number; rows: number; color: boolean; emphasis?: boolean }): string {
+export function renderMenu(menu: TerminalMenu, selected: number, options: { columns: number; rows: number; color: boolean; emphasis?: boolean; numberInput?: string }): string {
   const width = Math.max(10, Math.min(96, options.columns - 2));
   const height = Math.max(4, options.rows - 1);
   const paint = (text: string, code: string) => options.color ? `\x1b[${code}m${text}\x1b[0m` : text;
@@ -62,7 +62,8 @@ export function renderMenu(menu: TerminalMenu, selected: number, options: { colu
     ];
   }
   const title = wrap(`  ${menu.title}`)[0];
-  const hint = wrap(width < 50 ? '  ↑↓ move · Enter · Esc' : '  ↑ ↓ move · Enter open · shortcut key · Esc back')[0];
+  const hint = wrap(options.numberInput ? `  Number: ${options.numberInput} · Enter selects · Backspace edits`
+    : width < 50 ? '  ↑↓ move · Enter · Esc' : '  ↑ ↓ move · Enter open · number selection · Esc back')[0];
   const item = menu.choices[selected];
   const description = height >= 10 ? wrap(`  ${item?.description ?? 'Select an option to continue.'}`).slice(0, 2) : [];
   const menuRows = Math.min(menu.choices.length, Math.max(1, height - description.length - 4));
@@ -98,10 +99,11 @@ export async function selectTerminalMenu(menu: TerminalMenu, options: {
     let documentText = menu.document;
     let refreshTimer: ReturnType<typeof setInterval> | undefined;
     let refreshing = false;
+    let numberInput = '';
     const draw = () => {
       try {
         const dimensions = {
-          columns: output.columns || 80, rows: output.rows || 24, color: options.color, emphasis,
+          columns: output.columns || 80, rows: output.rows || 24, color: options.color, emphasis, numberInput,
         };
         documentView = documentText !== undefined ? renderDocument(menu.title, documentText, offset, dimensions) : undefined;
         if (documentView) offset = documentView.offset;
@@ -151,6 +153,22 @@ export async function selectTerminalMenu(menu: TerminalMenu, options: {
         else return;
         draw(); return;
       }
+      if (key.sequence && /^\d$/.test(key.sequence)) {
+        const candidate = numberInput + key.sequence;
+        const matches = menu.choices.filter((choice) => choice.value.startsWith(candidate));
+        if (!matches.length) { numberInput = ''; draw(); return; }
+        const exact = menu.choices.findIndex((choice) => choice.value === candidate);
+        if (exact >= 0 && matches.length === 1) { finish(candidate); return; }
+        numberInput = candidate;
+        if (exact >= 0) selected = exact;
+        draw(); return;
+      }
+      if (key.name === 'backspace') { numberInput = numberInput.slice(0, -1); draw(); return; }
+      if (key.name === 'return' && numberInput) {
+        if (menu.choices.some((choice) => choice.value === numberInput)) finish(numberInput);
+        return;
+      }
+      numberInput = '';
       if (key.name === 'up' || key.name === 'k') selected = (selected - 1 + menu.choices.length) % menu.choices.length;
       else if (key.name === 'down' || key.name === 'j' || key.name === 'tab') selected = (selected + 1) % menu.choices.length;
       else if (key.name === 'home') selected = 0;

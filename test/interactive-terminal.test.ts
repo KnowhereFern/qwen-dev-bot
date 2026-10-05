@@ -51,9 +51,22 @@ async function session(current: TerminalSnapshot, answers: Array<string | null>,
 }
 
 describe('interactive terminal', () => {
-  it('reviews every plan section in the reader, then cancels typed approval without writes', async () => {
+  it('approves through two numbered decisions while preserving exact revision and hash', async () => {
+    const current = fixture(); const picks = ['1', '1', '12', '1', '0'];
+    const menus: import('../src/terminal/menu.js').TerminalMenu[] = [];
+    const execute = vi.fn(async (_args: string[]) => 0);
+    await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current,
+      credential: () => null, workerStatus: async () => 'inactive', execute,
+      io: { select: async (menu) => { menus.push(menu); return picks.shift() ?? null; },
+        document: async () => {}, question: async () => '', print() {}, close() {} },
+    });
+    expect(menus.every((menu) => menu.choices.every((choice) => /^\d+$/.test(choice.value)))).toBe(true);
+    expect(menus.find((menu) => menu.title === 'Approve revision 5')?.initial).toBe('0');
+    expect(execute).toHaveBeenCalledExactlyOnceWith(['plan-approve', current.config.project.root, '--plan', 'plan-demo', '--revision', '5', '--hash', 'reviewed-hash']);
+  });
+  it('reviews every plan section in the reader, then cancels numbered approval without writes', async () => {
     const current = fixture();
-    const selections = ['1', '1', ...Array.from({ length: 9 }, (_, i) => String(i + 1)), 'c', 'f', 'a', '0'];
+    const selections = ['1', '1', ...Array.from({ length: 10 }, (_, i) => String(i + 1)), '11', '12', '0', '0'];
     const answers = ['', ''];
     const document = vi.fn(async (_title: string, _text: string) => {});
     const execute = vi.fn(async (_args: string[]) => 0);
@@ -65,7 +78,7 @@ describe('interactive terminal', () => {
     expect(document).toHaveBeenCalledTimes(11);
     expect(document.mock.calls.map((call) => call[0])).toEqual(['Overview', 'Objective', 'Acceptance criteria', 'Constraints', 'Technology decisions', 'Deployment authority', 'Coverage & evidence', 'Delivery steps', 'Revision history', 'Required checks', 'Complete plan']);
     expect(execute).not.toHaveBeenCalled();
-    expect(question).toHaveBeenCalledWith('Type approve revision 5 to approve (Enter cancels): ');
+    expect(question.mock.calls.flat().join(' ')).not.toContain('Type approve');
   });
 
   it.each([
@@ -96,7 +109,7 @@ describe('interactive terminal', () => {
       io: { select: async () => selections.shift() ?? null, question, print, close() {} },
     });
     expect(execute).not.toHaveBeenCalled();
-    expect(question).toHaveBeenCalledWith('Type approve revision 5 to approve (Enter cancels): ');
+    expect(question.mock.calls.flat().join(' ')).not.toContain('Type approve');
     expect(question).toHaveBeenCalledWith('\nPress Enter to return to the dashboard: ');
     expect(print).toHaveBeenCalledWith('Cancelled; no approval was recorded.');
   });
@@ -142,9 +155,9 @@ describe('interactive terminal', () => {
     expect(output).toContain('Assessed commit: abc123');
   });
 
-  it('requires exact revision confirmation and passes stale-review guards to existing approval', async () => {
+  it('requires numbered confirmation and passes exact revision/hash guards to approval', async () => {
     const current = fixture();
-    const result = await session(current, ['1', '1', '1', 'approve revision 5', '0']);
+    const result = await session(current, ['1', '1', '1', '1', '0']);
     expect(result.calls).toEqual([['plan-approve', current.config.project.root, '--plan', 'plan-demo', '--revision', '5', '--hash', 'reviewed-hash']]);
     expect(result.output).toContain('already-running worker may pick it up immediately');
     expect(result.calls.some((call) => call.includes('--install-service'))).toBe(false);
@@ -160,13 +173,13 @@ describe('interactive terminal', () => {
     const current = fixture();
     current.plans[0].status = 'awaiting_material_approval';
     current.plans[0].approvedAt = 1;
-    const result = await session(current, ['1', '1', '1', 'approve revision 5', '0']);
+    const result = await session(current, ['1', '1', '1', '1', '0']);
     expect(result.calls[0][0]).toBe('plan-approve-revision');
   });
 
   it('requests a review-only redraft using project feedback, never approval', async () => {
     const current = fixture();
-    const result = await session(current, ['1', '1', '2', '', 'review.md', '', 'draft', '0']);
+    const result = await session(current, ['1', '1', '2', '', 'review.md', '', '1', '0']);
     expect(result.calls).toEqual([['plan-redraft', current.config.project.root, '--plan', 'plan-demo', '--requirements', 'OBJECTIVE.md', '--feedback', 'review.md', '--max-stories', '25']]);
     expect(result.output).toContain('drafting never approves');
   });
@@ -183,12 +196,12 @@ describe('interactive terminal', () => {
   it('creates a new draft only after explicit provider-call confirmation', async () => {
     const current = fixture();
     current.plans = [];
-    const result = await session(current, ['2', 'OBJECTIVE.md', '40', 'draft', '0']);
+    const result = await session(current, ['2', 'OBJECTIVE.md', '40', '1', '0']);
     expect(result.calls).toEqual([['plan', current.config.project.root, '--requirements', 'OBJECTIVE.md', '--max-stories', '40']]);
   });
 
   it('keeps the console available after stale approval or provider failures', async () => {
-    const result = await session(fixture(), ['1', '1', '1', 'approve revision 5', '3', '2', '0'], async (args) => {
+    const result = await session(fixture(), ['1', '1', '1', '1', '3', '2', '0'], async (args) => {
       if (args[0] === 'plan-approve') throw new Error('The program changed since review.');
       return 0;
     });
@@ -203,7 +216,7 @@ describe('interactive terminal', () => {
     current.plans[0].approvedAt = 1;
     const cancelled = await session(current, ['7', '1', '', '0']);
     expect(cancelled.calls).toEqual([]);
-    const started = await session(current, ['7', '1', 'start worker', '0']);
+    const started = await session(current, ['7', '1', '1', '0']);
     expect(started.calls[0]).toEqual(['update', expect.any(String), '--install-service']);
     expect(started.output).toContain('ALL enabled registered projects');
   });
@@ -218,7 +231,7 @@ describe('interactive terminal', () => {
     const current = fixture();
     current.plans[0].status = 'active';
     current.plans[0].approvedAt = 1;
-    const result = await session(current, ['7', '2', 'run cycle', '0']);
+    const result = await session(current, ['7', '2', '1', '0']);
     expect(result.calls).toEqual([['reconcile', current.config.project.root]]);
   });
 
@@ -263,7 +276,7 @@ describe('interactive terminal', () => {
 
   it('offers setup for an unconfigured folder without forcing an external command', async () => {
     const current = fixture();
-    const answers = ['6', '1', 'Demo', 'owner/demo', 'owner', 'yes', 'setup', '0'];
+    const answers = ['6', '1', 'Demo', 'owner/demo', 'owner', '1', '1', '0'];
     const calls: string[][] = [];
     const output: string[] = [];
     await runInteractiveTerminal({
@@ -280,7 +293,7 @@ describe('interactive terminal', () => {
 
   it('configures a Token Plan route while preserving the model and never starting a worker', async () => {
     const current = fixture();
-    const result = await session(current, ['8', '1', '2', '', '', 'connect', '0']);
+    const result = await session(current, ['8', '1', '2', '', '', '1', '0']);
     expect(result.calls[0]).toEqual(['update', current.config.project.root, '--billing-plan', 'token-plan-personal', '--base-url', 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1', '--api-key-env', 'BAILIAN_TOKEN_PLAN_API_KEY', '--no-service', '--skip-dependencies']);
     expect(result.calls[0]).not.toContain('--model');
   });
@@ -288,13 +301,13 @@ describe('interactive terminal', () => {
   it('never tests the live provider simply by viewing connection status', async () => {
     const viewed = await session(fixture(), ['8', '0', '0']);
     expect(viewed.calls).toEqual([]);
-    const verified = await session(fixture(), ['8', '3', 'verify', '0']);
+    const verified = await session(fixture(), ['8', '3', '1', '0']);
     expect(verified.calls).toEqual([['verify', expect.any(String)]]);
   });
 
   it('labels a successful connection test truthfully for this session', async () => {
     const current = fixture();
-    const answers = ['8', '3', 'verify', '0'];
+    const answers = ['8', '3', '1', '0'];
     const output: string[] = [];
     await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current,
       credential: () => ({ apiKey: 'opaque-fixture-key', envKey: current.config.qwen.credentialEnvKey, source: 'Qwen user .env' }), execute: async () => 0,
@@ -322,7 +335,7 @@ describe('interactive terminal', () => {
 
   it('saves a hidden credential without putting the key in output or command arguments', async () => {
     const current = fixture();
-    const answers = ['8', '2', 'save key', '0'];
+    const answers = ['8', '2', '1', '0'];
     const key = `sk-${'a'.repeat(24)}`;
     const output: string[] = [];
     const save = vi.fn();
@@ -346,7 +359,7 @@ describe('interactive terminal', () => {
 
   it('opens GitHub sign-in only after explicit confirmation', async () => {
     const current = fixture();
-    const answers = ['6', '3', 'login', '0'];
+    const answers = ['6', '3', '1', '0'];
     const login = vi.fn(async () => 0);
     const execute = vi.fn(async () => 0);
     await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current, credential: () => null, loginGitHub: login, execute,

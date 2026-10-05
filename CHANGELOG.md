@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.39] - 2026-10-05
+
+- Replace typed confirmation phrases with numbered decisions for approval, setup, connection, credentials, drafting and execution. Cancel is selected by default.
+- Number all plan-review and project choices; support multi-digit selection without prematurely opening the first digit.
+- Preserve exact plan revision/hash checks, separate execution confirmation, and hidden credential entry.
+
 ## [1.0.0-rc.38] - 2026-10-05
 
 - Carry the Fern presentation through prompts, confirmations, errors, command results and live progress.

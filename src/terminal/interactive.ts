@@ -165,7 +165,7 @@ export async function runInteractiveTerminal(options: {
     }
     const parts = full.split(/\n\n(?=OBJECTIVE\n|ACCEPTANCE\n|CONSTRAINTS\n|FROZEN TECHNOLOGY\n|DEPLOYMENT AUTHORITY\n|OBJECTIVE COVERAGE\n|CURRENT DELIVERY STORIES\n|LATEST REVISION\n|CONFIGURED CHECKS\n)/);
     const names = ['Overview', 'Objective', 'Acceptance criteria', 'Constraints', 'Technology decisions', 'Deployment authority', 'Coverage & evidence', 'Delivery steps', 'Revision history', 'Required checks'];
-    const sectionKeys = parts.map((_, index) => index === 9 ? 'c' : String(index + 1));
+    const sectionKeys = parts.map((_, index) => String(index + 1));
     const pending = ['draft', 'awaiting_initial_approval', 'awaiting_material_approval', 'approving'].includes(plan.status);
     while (!io.signal?.aborted) {
       const selection = await io.select({ title: `Review plan · version ${plan.revision ?? 1}`, header: [
@@ -174,17 +174,17 @@ export async function runInteractiveTerminal(options: {
         { text: `  ${planSize(plan)} · Reading does not change this program.` },
       ], choices: [
         ...parts.map((_, index) => ({ value: sectionKeys[index], label: names[index] ?? 'Plan details', description: index === 0 ? plan.objective : 'Open the read-only reader. Scroll or jump between sections; return here when finished.' })),
-        { value: 'f', label: 'Read complete plan', description: 'All contracts, evidence, constraints and required checks. Nothing is omitted.' },
-        ...(pending ? [{ value: 'a', label: 'Approve this revision…', description: 'Requires a typed confirmation. A running worker may pick up approved work.' },
-          { value: 'r', label: 'Request changes…', description: 'Draft revisions before approval; approved boundaries remain protected.' }] : []),
+        { value: '11', label: 'Read complete plan', description: 'All contracts, evidence, constraints and required checks. Nothing is omitted.' },
+        ...(pending ? [{ value: '12', label: 'Approve this revision…', description: 'Opens a separate confirmation. A running worker may pick up approved work.' },
+          { value: '13', label: 'Request changes…', description: 'Draft revisions before approval; approved boundaries remain protected.' }] : []),
         { value: '0', label: 'Defer / back', description: 'Leave this plan unchanged.' },
       ] });
       if (!selection || selection === '0') return undefined;
-      if (selection === 'a' && pending) return '1';
-      if (selection === 'r' && pending) return '2';
+      if (selection === '12' && pending) return '1';
+      if (selection === '13' && pending) return '2';
       const index = sectionKeys.indexOf(selection);
-      const part = selection === 'f' ? full : parts[index];
-      if (part !== undefined) await io.document(selection === 'f' ? 'Complete plan' : names[index] ?? 'Plan details', part);
+      const part = selection === '11' ? full : parts[index];
+      if (part !== undefined) await io.document(selection === '11' ? 'Complete plan' : names[index] ?? 'Plan details', part);
     }
     return undefined;
   }
@@ -194,11 +194,11 @@ export async function runInteractiveTerminal(options: {
     if (io.select) {
       const selected = await io.select({ title: 'Choose your project', choices: [
         ...items.map((item, index) => ({ value: String(index + 1), label: item.name, description: item.root })),
-        { value: 'n', label: 'Open another folder', description: 'Use an existing project or start with an empty folder.' },
+        { value: String(items.length + 1), label: 'Open another folder', description: 'Use an existing project or start with an empty folder.' },
         { value: '0', label: 'Exit' },
       ] });
       if (!selected || selected === '0') return undefined;
-      if (selected !== 'n') return items[Number(selected) - 1]?.root;
+      if (selected !== String(items.length + 1)) return items[Number(selected) - 1]?.root;
       const folder = (await io.question('Project folder (Enter cancels): '))?.trim();
       return folder ? path.resolve(folder) : undefined;
     }
@@ -245,6 +245,18 @@ export async function runInteractiveTerminal(options: {
     return (await io.question(prompt))?.trim();
   }
 
+  async function confirm(title: string, detail: string): Promise<boolean> {
+    if (io.select) return await io.select({ title, initial: '0', header: [
+      { text: '  Fern Delivery · Confirm decision', tone: 'title' }, { text: '', tone: 'rule' },
+      { text: `  ${detail}`, tone: 'attention' },
+    ], choices: [
+      { value: '1', label: title, description: detail },
+      { value: '0', label: 'Cancel', description: 'Leave everything unchanged.' },
+    ] }) === '1';
+    io.print(`${detail}\n1. ${title}\n0. Cancel`);
+    return (await io.question('Choose a number [0 cancels]: '))?.trim() === '1';
+  }
+
   async function redraft(plan?: PortfolioPlan): Promise<void> {
     if (plan && (!['draft', 'awaiting_initial_approval'].includes(plan.status) || plan.approvedAt !== null)) {
       io.print('The objective is already approved. Material revisions remain paused; automatic redrafting here cannot change the frozen objective.');
@@ -263,8 +275,7 @@ export async function runInteractiveTerminal(options: {
     if (answer === undefined) return;
     const max = answer ? Number(answer) : defaultMax;
     if (!Number.isSafeInteger(max) || max < 1) throw new Error('Maximum stories must be a positive integer.');
-    const confirm = (await io.question('This calls Qwen to produce a review-only draft. Type draft to continue: '))?.trim();
-    if (confirm !== 'draft') { io.print('Cancelled; no program was generated or approved.'); return; }
+    if (!await confirm('Generate draft', 'This calls Qwen using your provider plan. It does not approve delivery.')) { io.print('Cancelled; no program was generated or approved.'); return; }
     await execute(plan
       ? ['plan-redraft', root!, '--plan', plan.id, '--requirements', sourcePath, '--feedback', feedback!, '--max-stories', String(max)]
       : ['plan', root!, '--requirements', sourcePath, '--max-stories', String(max)]);
@@ -276,7 +287,7 @@ export async function runInteractiveTerminal(options: {
     if (action === '4') { root = undefined; return; }
     if (action === '3') {
       io.print('Sign in to an existing GitHub account using GitHub CLI. No account or repository is created by this console.');
-      if ((await io.question('Type login to open GitHub CLI sign-in (Enter cancels): '))?.trim() !== 'login') return;
+      if (!await confirm('Open GitHub sign-in', 'Sign in to an existing GitHub account. No new account or repository is created.')) return;
       const code = await (options.loginGitHub ?? (() => new Promise<number>((resolve, reject) => {
         const child = spawn('gh', ['auth', 'login'], { cwd: root, stdio: 'inherit', shell: false });
         child.once('error', reject);
@@ -288,7 +299,7 @@ export async function runInteractiveTerminal(options: {
     }
     if (action === '2') {
       if (!current) { io.print('Set up this folder first.'); return; }
-      if ((await io.question('Type refresh to update harness-owned assets (Enter cancels): '))?.trim() === 'refresh') await execute(['update', root!, '--no-service']);
+      if (await confirm('Refresh harness assets', 'Update harness-owned files without starting the worker.')) await execute(['update', root!, '--no-service']);
       return;
     }
     if (action !== '1') return;
@@ -302,11 +313,11 @@ export async function runInteractiveTerminal(options: {
     if (trusted === undefined) return;
     const projectName = name || current?.config.project.name || path.basename(root!);
     if (projectName.startsWith('-') || (trusted && !/^[A-Za-z0-9][A-Za-z0-9-]*(?:\[bot\])?$/.test(trusted))) throw new Error('Use a project name and GitHub login, not CLI flags.');
-    const tools = (await io.question(`Install/upgrade Qwen Code during setup? [${current ? 'y/N' : 'Y/n'}]: `))?.trim().toLowerCase();
-    if (tools === undefined) return;
-    const installQwen = tools ? ['y', 'yes'].includes(tools) : !current;
+    const tools = await choose('Qwen Code during setup', ['Install or upgrade Qwen Code', 'Keep the existing installation'], 'Choose a number (0 cancels): ');
+    if (!['1', '2'].includes(tools ?? '')) return;
+    const installQwen = tools === '1';
     io.print('Setup writes harness configuration/rules, installs locked dependencies and links the CLI/extension. It enables objective programs and gated auto-merge; existing staging/production authority is preserved. It does not approve work or start the worker.');
-    if ((await io.question('Type setup to continue (Enter cancels): '))?.trim() !== 'setup') return;
+    if (!await confirm('Set up this project', `Configure ${projectName} (${repository}). Writes harness assets and installs dependencies; no work is approved or started.`)) return;
     await execute(['init', root!, '--yes', '--name', projectName, '--repo', repository,
       ...(trusted ? ['--trusted-author', trusted] : []), ...(installQwen ? ['--install-qwen'] : []), '--no-service', '--install-cli', '--link-extension', '--configure-github']);
     io.print('Setup complete. Next: Model connection, Readiness, then Create/review program. No work was approved.');
@@ -332,13 +343,13 @@ export async function runInteractiveTerminal(options: {
       const envKey = env || (billing.startsWith('token-plan-') ? 'BAILIAN_TOKEN_PLAN_API_KEY' : config.qwen.credentialEnvKey);
       if (!/^[A-Z_][A-Z0-9_]*$/.test(envKey)) throw new Error('Use an uppercase environment variable name, not a key.');
       io.print(`Model requests and the configured credential will be sent to ${url.origin}. This changes only the execution connection, not the model, product stack, approved objective, or deployment authority. An existing worker reads it on a later cycle. No subscription is purchased.`);
-      if ((await io.question('Type connect to save (Enter cancels): '))?.trim() !== 'connect') return;
+      if (!await confirm('Save model connection', `Model requests and credentials will be sent to ${url.origin}. No worker is started.`)) return;
       await execute(['update', root!, '--billing-plan', billing, '--base-url', url.toString().replace(/\/$/, ''), '--api-key-env', envKey, '--no-service', '--skip-dependencies']);
       verifiedConnection = undefined;
     } else if (action === '2') {
       if (!io.secret) throw new Error('Hidden credential input is unavailable. Configure the named environment variable through your credential manager.');
       io.print('The key will be hidden and stored in your user Qwen .env with owner-only permissions, never in this repository, logs, or command arguments.');
-      if ((await io.question('Type save key to continue (Enter cancels): '))?.trim() !== 'save key') return;
+      if (!await confirm('Enter and save a credential', 'Store a key privately in your user Qwen environment, outside this repository.')) return;
       const secret = await io.secret('Provider API key (hidden; Enter cancels): ');
       if (!secret) return;
       const problem = qwenCredentialCompatibilityProblem(config, { apiKey: secret, envKey: config.qwen.credentialEnvKey, source: 'Qwen user .env' });
@@ -349,7 +360,7 @@ export async function runInteractiveTerminal(options: {
       const effective = credential(config);
       io.print(effective && effective.apiKey !== secret ? `Key saved, but ${effective.source} currently takes precedence. Resolve that source before verification; no active worker credential was replaced.` : 'Key saved. Verify the connection explicitly next.');
     } else if (action === '3') {
-      if ((await io.question('This makes a small live Qwen request using your provider plan. Type verify to continue: '))?.trim() === 'verify') {
+      if (await confirm('Test model connection', 'Make a small live Qwen request using your provider plan.')) {
         await execute(['verify', root!]);
         const key = credential(config);
         if (key) verifiedConnection = { root: root!, model: config.qwen.model, endpoint: config.qwen.baseUrl, envKey: config.qwen.credentialEnvKey, apiKey: key.apiKey };
@@ -413,9 +424,8 @@ export async function runInteractiveTerminal(options: {
             const review = await reviewProgram(plan, current!);
             if (review === '2') { await redraft(plan); break; }
             if (review !== '1') { io.print('Deferred; program remains unchanged.'); break; }
-            const confirmation = `approve revision ${plan.revision ?? 1}`;
             io.print('Approval freezes this program and publishes executable work for the current wave. An already-running worker may pick it up immediately.');
-            if ((await io.question(`Type ${confirmation} to approve (Enter cancels): `))?.trim() !== confirmation) {
+            if (!await confirm(`Approve revision ${plan.revision ?? 1}`, `${plan.title} · ${plan.id} · revision ${plan.revision ?? 1}. Publishes executable work; a running worker may start it immediately.`)) {
               io.print('Cancelled; no approval was recorded.'); break;
             }
             await execute([plan.status === 'awaiting_material_approval' ? 'plan-approve-revision' : 'plan-approve', root, '--plan', plan.id, '--revision', String(plan.revision ?? 1), '--hash', plan.contentHash]);
@@ -455,12 +465,12 @@ export async function runInteractiveTerminal(options: {
             }
             if (execution === '2') {
               io.print('This reconciles durable state and may implement approved product work; it is not a read-only status check.');
-              if ((await io.question('Type run cycle to continue (Enter cancels): '))?.trim() === 'run cycle') await execute(['reconcile', root]);
+              if (await confirm('Run one delivery cycle', 'This may implement approved work in this project; it is not a read-only check.')) await execute(['reconcile', root]);
               break;
             }
             io.print('This installs/starts the shared worker for ALL enabled registered projects, not just this project. The host must stay awake and connected.');
             projects().forEach((item) => io.print(`- ${item.name}: ${item.root}`));
-            if ((await io.question('Type start worker to continue (Enter cancels): '))?.trim() !== 'start worker') break;
+            if (!await confirm('Start shared worker', 'Starts execution for ALL enabled registered projects, not just this project.')) break;
             await execute(['update', root, '--install-service']);
             io.print('Service installation attempted. Check its result above; installation is not proof of successful delivery.');
             break;
