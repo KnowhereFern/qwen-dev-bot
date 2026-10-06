@@ -88,6 +88,13 @@ describe('Qwen extension packaging', () => {
     expect(objective).toContain('Delegate all shell commands, tests, and file mutations to the saved workflow implementer.');
     expect(objective).toContain('a denied tool call does not authorize a workaround');
     expect(objective).toContain('same args and resumeFromRunId; do not start a duplicate writer');
+    expect(objective).toContain('LOCAL IMPLEMENTATION PHASE');
+    expect(objective).toContain('The external deterministic supervisor runs AFTER this Goal returns');
+    expect(objective).toContain('An unpushed candidate or absent PR alone is not a blocker for this local Goal');
+    expect(objective).toContain('Those downstream delivery invariants remain mandatory');
+    expect(objective).toContain('the saved workflow review passes, and the required project checks pass');
+    expect(objective).toContain('Preserve every acceptance criterion');
+    expect(objective).toContain('is not a successful handoff');
   });
 
   it('replaces a completed Goal for verifier-driven repair while retaining the session', () => {
@@ -107,5 +114,7 @@ describe('Qwen extension packaging', () => {
     expect(repair).toContain('unit gate failed');
     expect(repair).toContain('exactly once per execution or verifier-repair attempt');
     expect(repair).toContain('start a fresh workflow without resumeFromRunId and include all verifier feedback in its args');
+    expect(repair).toContain('LOCAL IMPLEMENTATION PHASE');
+    expect(repair).toContain('Do not push, create a PR, merge, deploy');
   });
 });

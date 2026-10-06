@@ -29,6 +29,14 @@ The installed Qwen CLI reported `0.24.5`. Its headless `auto` setup denied shell
 - Local validation passed 349 tests, TypeScript and release checks. A real saved-model Qwen3.8-Max transport-only smoke returned a schema-conforming terminal event through the new collector. That synthetic result is not product review evidence.
 - The failed attempt remains recorded. Task 43 retained its candidate and two failures; no counters were cleared.
 
+## Local handoff recovery
+
+- On RC45, workflow `wf_beb9a9fb6082b3c1` passed its local checks and workflow review for candidate `04466ec7b17e860fcb443f4abab98ce0c747e4ce`, with no further content edits. Qwen's Goal verification then blocked on the missing remote PR, although the supervisor creates that PR only after the session returns successfully.
+- RC46 explicitly defines the Qwen Goal as the local implementation handoff. The full task delivery invariant remains controller-owned and unchanged: exact-commit gates and review, push, PR, CI, merge and post-merge verification still follow.
+- Blocked Goal states remain failures, not inferred successes. Missing implementation, failed checks, failed workflow review and genuine implementation dependencies cannot be relabeled as handoff success.
+- The worker was stopped after this confirmed failure. Task 43 retains three failed attempts and its original candidate; the interrupted subsequent attempt was released without another failure. No exhausted tasks were restarted or counters cleared.
+- Local validation passed all 349 tests and TypeScript. The live handoff correction remains unproven until the resumed harness reaches controller verification.
+
 ## Remaining limits
 
 - Installation preflight validates the matching extension and hook files. It does not prove upstream hook execution is fail-closed on timeout or startup errors.

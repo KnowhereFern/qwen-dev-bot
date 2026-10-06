@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.46] - 2026-10-05
+
+- Separate the local Qwen implementation handoff from controller-owned PR delivery so an absent PR cannot deadlock the session that must return before publication.
+- Keep acceptance criteria, workflow review, required checks, failure classification and supervisor delivery verification mandatory.
+
 ## [1.0.0-rc.45] - 2026-10-05
 
 - Read independent-review verdicts from streamed terminal events so a large CLI transcript is not parsed as one exit-time pipe write.
