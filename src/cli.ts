@@ -24,7 +24,7 @@ import { RepositoryAssessor } from './program/repository-assessor.js';
 import { buildEvidenceReport, formatEvidenceReport } from './program/evidence-report.js';
 import { runInteractiveTerminal } from './terminal/interactive.js';
 
-const VERSION = '1.0.0-rc.46';
+const VERSION = '1.0.0-rc.47';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? (process.stdin.isTTY && process.stdout.isTTY ? 'interactive' : 'help');
@@ -158,6 +158,28 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         store.close();
       }
       return 0;
+    }
+    case 'recovery-authorize': {
+      const issue = integerValue(args, '--issue');
+      const additionalAttempts = integerValue(args, '--additional-attempts');
+      const authorizationId = valueOf(args, '--authorization');
+      const authorizedBy = valueOf(args, '--authorized-by');
+      const reason = valueOf(args, '--reason');
+      if (!hasFlag(args, '--yes') || !issue || !additionalAttempts || !authorizationId || !authorizedBy || !reason ||
+          [authorizationId, authorizedBy, reason].some((value) => !value.trim() || value.startsWith('--'))) {
+        throw new Error('recovery-authorize requires --yes --issue N --additional-attempts N --authorization ID --authorized-by OPERATOR --reason TEXT');
+      }
+      const config = loadProjectConfig(root);
+      const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      try {
+        const task = store.findByIssue(issue);
+        if (!task) throw new Error(`No task exists for issue #${issue}`);
+        const recovered = store.authorizeRecovery(task.id, { authorizationId, additionalAttempts, authorizedBy, reason });
+        const budget = store.retryBudget(task.id);
+        if (json) console.log(JSON.stringify({ issue, state: recovered.state, authorizationId, ...budget }, null, 2));
+        else console.log(`Issue #${issue}: ${recovered.state}; ${budget.failures} historical failures retained, total ceiling ${budget.limit}. Authorization: ${authorizationId}.`);
+        return 0;
+      } finally { store.close(); }
     }
     case 'logs': {
       const config = loadProjectConfig(root);
@@ -564,7 +586,7 @@ function formatControllerReleases(releases: ControllerRelease[]): string {
 }
 
 function firstPositional(args: string[]): string | undefined {
-  const valueOptions = new Set(['--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment']);
+  const valueOptions = new Set(['--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment', '--additional-attempts', '--authorization', '--authorized-by', '--reason']);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] as string;
     if (valueOptions.has(arg)) {
@@ -634,6 +656,7 @@ Commands:
   run | reconcile      Run one bounded project supervisor tick
   worker [--once]      Run the persistent multi-project worker
   status [--json]      Show tasks, leases, sessions, PRs, and rewards
+  recovery-authorize   Record an explicit bounded recovery authorization; never reset history
   logs [--lines N]     Tail the redacted append-only event ledger
   reward               Show the latest stored universal reward scorecard
   community [--force]  Scan allowlisted sources and create review-only issues
@@ -651,6 +674,11 @@ Commands:
   controller-promote   Promote a validated controller at an idle boundary
   controller-rollback  Restore the previous controller release
   uninstall --yes      Remove unchanged installer-owned files
+
+Recovery authorization options (operator-only):
+  --yes --issue N --additional-attempts N --authorization ID --authorized-by OPERATOR --reason TEXT [--json]
+  Adds at most three attempts. Reusing an authorization ID cannot add attempts again.
+  An already-running worker may claim the released task immediately.
 
 Init options:
   --dry-run --yes --name NAME --repo OWNER/NAME --trusted-author LOGIN --billing-plan PLAN

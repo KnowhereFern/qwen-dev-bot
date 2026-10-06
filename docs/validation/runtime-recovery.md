@@ -39,8 +39,11 @@ The installed Qwen CLI reported `0.24.5`. Its headless `auto` setup denied shell
 
 ## Remaining limits
 
+- RC47 adds the operator-only `recovery-authorize` command after explicit user authorization for Cantina issues 35–42. Each authorization records its operator, reason, task contract hash, failure baseline and absolute ceiling. Replay cannot grant more attempts or re-release the task. Old failure counters, fingerprints, sessions and required checks remain unchanged.
+- The RC46 harness delivered Cantina PR 44 through exact-commit verification, GitHub checks, merge commit `613c011761a886457ce0b5654b7905dfc7143cac`, and the controller's post-merge verification. This completed the blocker-documentation task, not the product objective or staging acceptance.
+
 - Installation preflight validates the matching extension and hook files. It does not prove upstream hook execution is fail-closed on timeout or startup errors.
 - The hook additionally checks Qwen's recorded first subagent transcript entry for the `harness-implementer` role, matching session, agent and worktree. Missing or mismatched evidence denies mutation. This depends on the supported Qwen transcript layout and does not constitute OS-level isolation from a malicious implementation agent.
 - Packaged extension loading and the recorded implementer path have been exercised locally; upstream hook runtime failure behavior remains a limit.
 - Preserve existing failed/quarantined task history. Do not reset counters to make the run appear successful.
-- No successful Cantina issue-to-merge delivery, staging acceptance, or observation period is established by these tests.
+- Cantina product-objective acceptance, staging acceptance and the observation period remain unproven.

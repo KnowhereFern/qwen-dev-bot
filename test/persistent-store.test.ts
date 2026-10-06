@@ -20,6 +20,66 @@ function taskSpec(dependencies: number[]): TaskSpec {
 }
 
 describe('PersistentTaskStore', () => {
+  it('authorizes bounded recovery atomically, preserves history and replays safely after restart', () => {
+    const dir = makeTmp('authorized-recovery');
+    let store = new PersistentTaskStore('recovery', dir);
+    const task = store.upsert({ issueNumber: 1, title: 'failed', state: 'failed', maxAttempts: 5, spec: taskSpec([]) });
+    store.patch(task.id, { attempts: 5, lineageFailures: 5, failureLineageId: task.id,
+      identicalFailures: 1, lastFailureFingerprint: 'prior', lastError: 'prior error', qwenSessionId: 'session', baseSha: 'base' });
+    const before = store.get(task.id);
+    const auth = { authorizationId: 'human-1', additionalAttempts: 3, authorizedBy: 'owner', reason: 'runtime repaired' };
+    expect(() => store.transition(task.id, 'ready')).toThrow();
+    const recovered = store.authorizeRecovery(task.id, auth);
+    expect(recovered).toEqual({ ...before, state: 'ready', updatedAt: recovered.updatedAt, version: before.version + 1 });
+    expect(store.retryBudget(task.id)).toEqual({ failures: 5, limit: 8 });
+    store.close();
+    store = new PersistentTaskStore('recovery', dir);
+    expect(store.authorizeRecovery(task.id, auth)).toEqual(recovered);
+    expect(() => store.authorizeRecovery(task.id, { ...auth, additionalAttempts: 2 })).toThrow(/conflicts/);
+    expect(store.listEvents('task.recovery_authorized')).toHaveLength(1);
+    for (const error of ['new compiler failure', 'different test failure', 'another provider failure']) {
+      expect(store.claimNext('worker', 1_000)?.id).toBe(task.id);
+      store.recordFailure(task.id, error, 3);
+    }
+    expect(store.get(task.id)).toMatchObject({ state: 'failed', attempts: 8, lineageFailures: 8 });
+    expect(store.authorizeRecovery(task.id, auth).state).toBe('failed');
+    expect(store.retryBudget(task.id)).toEqual({ failures: 8, limit: 8 });
+    const child = store.upsert({ issueNumber: 2, title: 'child', state: 'ready', maxAttempts: 5, failureLineageId: task.id, lineageFailures: 8 });
+    expect(store.retryBudget(child.id)).toEqual({ failures: 8, limit: 8 });
+    expect(store.claimNext('worker', 1_000)).toBeNull();
+    expect(store.get(child.id).state).toBe('quarantined');
+    store.close();
+  });
+
+  it('retains identical-failure quarantine despite an explicit recovery allowance', () => {
+    const store = new PersistentTaskStore('recovery-identical', makeTmp('recovery-identical'));
+    const task = store.upsert({ issueNumber: 1, title: 'quarantine', state: 'quarantined', maxAttempts: 5 });
+    store.patch(task.id, { attempts: 5, lineageFailures: 5, identicalFailures: 3, lastFailureFingerprint: failureFingerprint('same failure') });
+    store.authorizeRecovery(task.id, { authorizationId: 'human-1', additionalAttempts: 3, authorizedBy: 'owner', reason: 'runtime repaired' });
+    store.claimNext('worker', 1_000);
+    expect(store.recordFailure(task.id, 'same failure', 3)).toMatchObject({ state: 'quarantined', attempts: 6, identicalFailures: 4 });
+    store.close();
+  });
+
+  it('rejects invalid, unexhausted, merged and active-lineage recovery without partial effects', () => {
+    const store = new PersistentTaskStore('recovery-invalid', makeTmp('recovery-invalid'));
+    const task = store.upsert({ issueNumber: 1, title: 'failed', state: 'failed', maxAttempts: 5 });
+    const auth = { authorizationId: 'human-1', additionalAttempts: 3, authorizedBy: 'owner', reason: 'repair' };
+    for (const additionalAttempts of [0, -1, 4, 1.5, NaN]) {
+      expect(() => store.authorizeRecovery(task.id, { ...auth, additionalAttempts })).toThrow();
+    }
+    expect(() => store.authorizeRecovery(task.id, { ...auth, reason: ' ' })).toThrow();
+    expect(() => store.authorizeRecovery(task.id, auth)).toThrow(/exhausted/);
+    store.patch(task.id, { attempts: 5, lineageFailures: 5, mergeSha: 'merged' });
+    expect(() => store.authorizeRecovery(task.id, auth)).toThrow(/Merged/);
+    store.patch(task.id, { mergeSha: null });
+    store.upsert({ issueNumber: 2, title: 'live sibling', state: 'active', failureLineageId: task.id });
+    expect(() => store.authorizeRecovery(task.id, auth)).toThrow(/active/);
+    expect(store.get(task.id).state).toBe('failed');
+    expect(store.listEvents('task.recovery_authorized')).toHaveLength(0);
+    store.close();
+  });
+
   it('enforces one failure budget across replacement siblings and restarts', () => {
     const dir = makeTmp('persistent-lineage-budget');
     let store = new PersistentTaskStore('budget', dir);

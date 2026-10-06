@@ -668,6 +668,55 @@ export class PersistentTaskStore {
     return { failures, limit };
   }
 
+  authorizeRecovery(id: string, authorization: {
+    authorizationId: string; additionalAttempts: number; authorizedBy: string; reason: string;
+  }): TaskRecord {
+    if (!Number.isSafeInteger(authorization.additionalAttempts) || authorization.additionalAttempts < 1 || authorization.additionalAttempts > 3 ||
+        [authorization.authorizationId, authorization.authorizedBy, authorization.reason].some((value) => typeof value !== 'string' || !value.trim())) {
+      throw new Error('Recovery requires a named authorization, author, reason and 1-3 additional attempts');
+    }
+    const binding = createHash('sha256').update(JSON.stringify({ id, authorizationId: authorization.authorizationId,
+      additionalAttempts: authorization.additionalAttempts, authorizedBy: authorization.authorizedBy, reason: authorization.reason })).digest('hex');
+    const key = `task:recovery:${authorization.authorizationId}`;
+    let event: HarnessEvent | undefined;
+    let result: TaskRecord;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const prior = this.listEvents('task.recovery_authorized').find((entry) => entry.idempotencyKey === key);
+      if (prior) {
+        if (prior.payload.binding !== binding) throw new Error('Recovery authorization conflicts with its original binding');
+        result = this.get(id);
+      } else {
+        const current = this.get(id);
+        const budget = this.failureBudget(current);
+        if (!['failed', 'quarantined'].includes(current.state) || budget.failures < budget.limit) {
+          throw new Error('Recovery authorization requires an exhausted failed or quarantined task');
+        }
+        if (budget.members.some((member) => isTaskLeased(member.state))) throw new Error('Recovery lineage still has active execution');
+        if (current.mergeSha) throw new Error('Merged tasks require post-merge recovery, not implementation reentry');
+        const now = Date.now();
+        result = { ...current, state: 'ready', updatedAt: now, version: current.version + 1, leaseOwner: null, leaseExpiresAt: null };
+        event = this.makeEvent('task.recovery_authorized', id, {
+          binding, authorizationId: authorization.authorizationId,
+          authorizedBy: redactText(authorization.authorizedBy), reason: redactText(authorization.reason),
+          additionalAttempts: authorization.additionalAttempts,
+          failureLineageId: current.failureLineageId ?? current.id,
+          failures: budget.failures, priorLimit: budget.limit, absoluteLimit: budget.failures + authorization.additionalAttempts,
+          priorState: current.state, priorVersion: current.version,
+          contractHash: createHash('sha256').update(JSON.stringify(current.spec)).digest('hex'),
+        }, key);
+        this.writeTask(result, current.version);
+        this.insertEvent(event);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    if (event) this.ledger.append(event);
+    return result;
+  }
+
   private failureBudget(task: TaskRecord, tasks = this.list()) {
     const lineageId = task.failureLineageId ?? task.id;
     const members = tasks.filter((member) => (member.failureLineageId ?? member.id) === lineageId);
@@ -679,7 +728,12 @@ export class PersistentTaskStore {
         members.reduce((total, member) => total + member.attempts, 0),
         ...members.map((member) => member.lineageFailures ?? 0),
       ),
-      limit: Math.min(task.maxAttempts, ...members.map((member) => member.maxAttempts)),
+      limit: Math.max(
+        Math.min(task.maxAttempts, ...members.map((member) => member.maxAttempts)),
+        ...this.listEvents('task.recovery_authorized')
+          .filter((event) => event.payload.failureLineageId === lineageId)
+          .map((event) => Number(event.payload.absoluteLimit)),
+      ),
     };
   }
 

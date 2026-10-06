@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.47] - 2026-10-06
+
+- Add explicit, recorded recovery authorization for exhausted tasks without resetting failure history or weakening checks.
+- Cap each authorization at three additional attempts, preserve the shared lineage ceiling across replacements and restarts, and prevent duplicate authorization from granting more attempts.
+- Keep repeated-failure quarantine and merged-task safeguards in force.
+
 ## [1.0.0-rc.46] - 2026-10-05
 
 - Separate the local Qwen implementation handoff from controller-owned PR delivery so an absent PR cannot deadlock the session that must return before publication.
