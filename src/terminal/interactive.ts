@@ -373,7 +373,7 @@ export async function runInteractiveTerminal(options: {
       await io.live('Live progress · read-only', async () => formatLiveStatus(snapshot(root!), await workerStatus()), options.refreshMs ?? 3_000);
       return;
     }
-    io.print('LIVE PROGRESS — read-only; Enter returns. This does not run or resume delivery.');
+    io.print('LIVE PROGRESS — read-only; 0 or Enter returns. This does not run or resume delivery.');
     let open = true;
     let checking = false;
     let previous = '';
@@ -388,7 +388,7 @@ export async function runInteractiveTerminal(options: {
     };
     await refresh();
     const timer = setInterval(() => { void refresh(); }, options.refreshMs ?? 3_000);
-    try { await io.question('Enter to return: '); }
+    try { await io.question('0 · Back to dashboard (Enter also returns): '); }
     finally { open = false; clearInterval(timer); }
   }
 
@@ -468,6 +468,10 @@ export async function runInteractiveTerminal(options: {
               if (await confirm('Run one delivery cycle', 'This may implement approved work in this project; it is not a read-only check.')) await execute(['reconcile', root]);
               break;
             }
+            if (await workerStatus() === 'running') {
+              io.print('The shared worker is already running. Choose Live progress to follow delivery; no restart or setup update was performed.');
+              break;
+            }
             io.print('This installs/starts the shared worker for ALL enabled registered projects, not just this project. The host must stay awake and connected.');
             projects().forEach((item) => io.print(`- ${item.name}: ${item.root}`));
             if (!await confirm('Start shared worker', 'Starts execution for ALL enabled registered projects, not just this project.')) break;
@@ -480,7 +484,11 @@ export async function runInteractiveTerminal(options: {
         }
       } catch (error) { io.print(`Error: ${terminalText(error instanceof Error ? error.message : String(error))}\nThe console remains available. Review status before retrying.`); }
       if (!io.signal?.aborted) await io.finish?.();
-      if (io.select && !io.signal?.aborted && await io.question('\nPress Enter to return to the dashboard: ') === null) return 0;
+      if (io.select && !io.signal?.aborted) {
+        await io.select({ title: 'Return to dashboard', initial: '0', choices: [
+          { value: '0', label: 'Back to dashboard', description: 'Return without restarting or changing delivery.' },
+        ] });
+      }
     }
   } finally { io.close(); }
 }

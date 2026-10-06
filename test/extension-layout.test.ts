@@ -77,11 +77,17 @@ describe('Qwen extension packaging', () => {
       spec: null,
     } as TaskRecord;
     expect(renderObjective(task, [])).toContain(
-      '.qwen/workflows/harness-implement.js exactly once using its scriptPath',
+      '.qwen/workflows/harness-implement.js exactly once per execution or verifier-repair attempt using its scriptPath',
     );
     expect(renderObjective(task, [], '/tmp/project/.qwen/workflows/harness-implement.js')).toContain(
-      '/tmp/project/.qwen/workflows/harness-implement.js exactly once using its scriptPath',
+      '/tmp/project/.qwen/workflows/harness-implement.js exactly once per execution or verifier-repair attempt using its scriptPath',
     );
+    const objective = renderObjective(task, []);
+    expect(objective).toContain('You are the delivery coordinator, not the implementation writer.');
+    expect(objective).toContain('never call run_shell_command, exec, edit, write_file, notebook_edit, or agent directly');
+    expect(objective).toContain('Delegate all shell commands, tests, and file mutations to the saved workflow implementer.');
+    expect(objective).toContain('a denied tool call does not authorize a workaround');
+    expect(objective).toContain('same args and resumeFromRunId; do not start a duplicate writer');
   });
 
   it('replaces a completed Goal for verifier-driven repair while retaining the session', () => {
@@ -96,8 +102,10 @@ describe('Qwen extension packaging', () => {
     } as TaskRecord;
     expect(goalPromptFor(task, [])).toBe('/goal resume');
     const repair = goalPromptFor(task, ['unit gate failed']);
-    expect(repair).toMatch(/^\/goal Implement the normalized GitHub task/);
+    expect(repair).toMatch(/^\/goal You are the delivery coordinator/);
     expect(repair).not.toContain('/goal edit');
     expect(repair).toContain('unit gate failed');
+    expect(repair).toContain('exactly once per execution or verifier-repair attempt');
+    expect(repair).toContain('start a fresh workflow without resumeFromRunId and include all verifier feedback in its args');
   });
 });

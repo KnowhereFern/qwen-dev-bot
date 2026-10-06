@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.43] - 2026-10-05
+
+- Clarify that the parent session coordinates the saved workflow rather than running shell commands or editing directly.
+- Distinguish interrupted workflow continuation from a fresh verifier-driven repair so completed results are not reused as new work.
+
+## [1.0.0-rc.42] - 2026-10-05
+
+- Register implementation tools for saved Qwen workflows in headless mode, with a scoped writer hook and explicit read-only helper tool restrictions.
+- Constrain generated coverage identifiers before assessment validation instead of failing on overlong model output.
+- Wait for confirmed macOS service unload before replacing the background worker.
+- Preserve project configuration formatting when an update makes no semantic change.
+- Show the numbered return option in both live-progress and document-reader footers.
+
+## [1.0.0-rc.41] - 2026-10-05
+
+- Replace the post-action text prompt with a numbered dashboard return supporting Escape and Enter.
+- Avoid restarting or reinstalling a shared worker that is already running.
+
+## [1.0.0-rc.40] - 2026-10-05
+
+- Give the macOS background worker an explicit command-search path so it can reuse the existing GitHub CLI login and find installed tools.
+- Test service path escaping and ensure GitHub credentials are not copied into the service definition.
+
 ## [1.0.0-rc.39] - 2026-10-05
 
 - Replace typed confirmation phrases with numbered decisions for approval, setup, connection, credentials, drafting and execution. Cancel is selected by default.

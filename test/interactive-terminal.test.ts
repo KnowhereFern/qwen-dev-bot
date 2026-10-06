@@ -51,6 +51,33 @@ async function session(current: TerminalSnapshot, answers: Array<string | null>,
 }
 
 describe('interactive terminal', () => {
+  it('offers a numbered dashboard return after a failed command without a text prompt', async () => {
+    const current = fixture(); const picks = ['4', '0', '0'];
+    const menus: import('../src/terminal/menu.js').TerminalMenu[] = [];
+    const question = vi.fn(async () => null);
+    await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current,
+      credential: () => null, workerStatus: async () => 'inactive', execute: async () => 1,
+      io: { select: async (menu) => { menus.push(menu); return picks.shift() ?? null; },
+        question, print() {}, close() {} },
+    });
+    expect(menus.find((menu) => menu.title === 'Return to dashboard')?.choices).toEqual([
+      { value: '0', label: 'Back to dashboard', description: 'Return without restarting or changing delivery.' },
+    ]);
+    expect(question).not.toHaveBeenCalled();
+  });
+
+  it('does not reinstall or restart an already running worker', async () => {
+    const current = fixture(); current.plans[0]!.approvedAt = 1;
+    const picks = ['7', '1', '0', '0']; const execute = vi.fn(async () => 0);
+    const print = vi.fn();
+    await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current,
+      credential: () => null, workerStatus: async () => 'running', execute,
+      io: { select: async () => picks.shift() ?? null, question: async () => null, print, close() {} },
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(print.mock.calls.flat().join(' ')).toContain('already running');
+  });
+
   it('approves through two numbered decisions while preserving exact revision and hash', async () => {
     const current = fixture(); const picks = ['1', '1', '12', '1', '0'];
     const menus: import('../src/terminal/menu.js').TerminalMenu[] = [];
@@ -110,7 +137,7 @@ describe('interactive terminal', () => {
     });
     expect(execute).not.toHaveBeenCalled();
     expect(question.mock.calls.flat().join(' ')).not.toContain('Type approve');
-    expect(question).toHaveBeenCalledWith('\nPress Enter to return to the dashboard: ');
+    expect(question.mock.calls.flat().join(' ')).not.toContain('Press Enter to return');
     expect(print).toHaveBeenCalledWith('Cancelled; no approval was recorded.');
   });
 
@@ -385,7 +412,7 @@ describe('interactive terminal', () => {
       const running = runInteractiveTerminal({
         root: current.config.project.root, snapshot: () => current, credential: () => null,
         workerStatus: async () => 'inactive', refreshMs: 100, execute,
-        io: { question: async (prompt) => prompt === 'Enter to return: ' ? new Promise<string>((resolve) => { finishWatch = resolve; }) : answers.shift() ?? null, print: (text) => output.push(text), close() {} },
+        io: { question: async (prompt) => prompt === '0 · Back to dashboard (Enter also returns): ' ? new Promise<string>((resolve) => { finishWatch = resolve; }) : answers.shift() ?? null, print: (text) => output.push(text), close() {} },
       });
       await vi.advanceTimersByTimeAsync(10);
       current.plans[0].status = 'active';
@@ -393,7 +420,7 @@ describe('interactive terminal', () => {
       expect(output.join('\n')).toContain('Waiting for your approval');
       expect(output.join('\n')).toContain('Approved for delivery');
       expect(output.join('\n')).toContain('stage 1');
-      finishWatch?.('');
+      finishWatch?.('0');
       await running;
       expect(execute).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);

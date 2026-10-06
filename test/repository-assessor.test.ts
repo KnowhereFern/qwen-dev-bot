@@ -11,6 +11,7 @@ class AssessmentModel implements PortfolioPlanningModel {
   calls = 0;
   prompts: string[] = [];
   inputs: string[] = [];
+  schemas: Array<Parameters<PortfolioPlanningModel['completeJson']>[0]['jsonSchema']> = [];
   constructor(
     private readonly badEvidence = false,
     private readonly blankRisk = false,
@@ -19,6 +20,7 @@ class AssessmentModel implements PortfolioPlanningModel {
   async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]): Promise<{ value: T }> {
     this.calls += 1;
     this.prompts.push(input.system);
+    this.schemas.push(input.jsonSchema);
     this.inputs.push(typeof input.user === 'string' ? input.user : JSON.stringify(input.user));
     if (this.calls <= 4) {
       return { value: {
@@ -93,7 +95,36 @@ describe('RepositoryAssessor', () => {
     expect(model.prompts[0]).toContain('not proof of missing product code');
     expect(model.prompts[4]).toContain('do not add that track as target-product coverage');
     expect(model.prompts[4]).toContain('not separate missing or partial product capabilities');
+    expect(model.prompts[4]).toContain('Every coverage id must be unique, 1-32 characters');
+    expect(model.schemas[4]?.schema).toMatchObject({ properties: { coverage: { items: { properties: {
+      id: { type: 'string', minLength: 1, maxLength: 32, pattern: '^[A-Z][A-Z0-9_-]{0,31}$' },
+    } } } } });
     expect(model.inputs.every((input) => input.includes('<review-feedback>""</review-feedback>'))).toBe(true);
+  });
+
+  it.each([
+    ['STRIPE-ENROLLMENT-PAYMENT-CONFIRMATION'],
+    ['A'.repeat(33)],
+    ['1PAYMENT'],
+    ['PAYMENT CONFIRM'],
+    ['PAYMENT.CONFIRM'],
+  ])('rejects malformed coverage id %s without truncating it', async (id) => {
+    const config = defaultProjectConfig(gitRepo(), 'fixture', 'owner/fixture');
+    await expect(new RepositoryAssessor(config, coverageIdsModel([id])).assess({ sourcePath: 'PROJECT.md', content: 'Expose health.' }))
+      .rejects.toThrow(`Invalid coverage id ${id}: expected 1-32 characters`);
+  });
+
+  it('accepts boundary-length coverage ids and preserves uppercase normalization', async () => {
+    const config = defaultProjectConfig(gitRepo(), 'fixture', 'owner/fixture');
+    const ids = ['A', 'A'.repeat(32), 'payment_confirm-1'];
+    const assessment = await new RepositoryAssessor(config, coverageIdsModel(ids)).assess({ sourcePath: 'PROJECT.md', content: 'Expose health.' });
+    expect(assessment.coverage.map((entry) => entry.id)).toEqual(ids.map((id) => id.toUpperCase()));
+  });
+
+  it('reports duplicate coverage ids distinctly, including normalized duplicates', async () => {
+    const config = defaultProjectConfig(gitRepo(), 'fixture', 'owner/fixture');
+    await expect(new RepositoryAssessor(config, coverageIdsModel(['HEALTH', 'health'])).assess({ sourcePath: 'PROJECT.md', content: 'Expose health.' }))
+      .rejects.toThrow('Duplicate coverage id HEALTH');
   });
 
   it('provides explicit review evidence to every assessment stage without granting authority', async () => {
@@ -332,6 +363,16 @@ function coverageResponse<T>(input: Parameters<PortfolioPlanningModel['completeJ
     ? { corrections: [{ id: entry.id, status: entry.status, requiredAction: entry.requiredAction, rationale: entry.rationale, omitReason: null }] }
     : { coverage: [entry] };
   return { value: value as T };
+}
+
+function coverageIdsModel(ids: string[]): PortfolioPlanningModel {
+  return { async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]) {
+    return { value: (input.jsonSchema?.name === 'objective_coverage'
+      ? { coverage: ids.map((id) => ({
+          id, requirement: 'Expose health', status: 'missing', requiredAction: 'implement', rationale: 'Not implemented', evidence: [],
+        })) }
+      : { summary: 'Reviewed', findings: [], risks: [] }) as T };
+  } };
 }
 
 function gitRepo(): string {

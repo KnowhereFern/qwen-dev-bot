@@ -42,6 +42,7 @@ describe('keyboard menu', () => {
     const view = renderDocument('Plan', 'One\nTwo\nThree\nFour\nFive', 0, { columns: 40, rows, color: false });
     expect(view.screen.split('\n').length).toBeLessThanOrEqual(rows - 1);
     expect(view.screen).toContain('Esc back');
+    expect(view.screen).toContain('0/Enter/Esc back');
   });
   it.each([30, 60, 100])('keeps every document line reachable at width %i', (columns) => {
     const source = Array.from({ length: 100 }, (_, index) => `Evidence ${index}: ${'long text '.repeat(8)}`).join('\n');

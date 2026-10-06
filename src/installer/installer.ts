@@ -17,6 +17,7 @@ import {
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
+import { isDeepStrictEqual } from 'node:util';
 import {
   defaultProjectConfig,
   loadProjectConfig,
@@ -101,6 +102,8 @@ export async function installProject(options: InstallOptions): Promise<{ config:
   const configTarget = path.join(root, PROJECT_CONFIG_PATH);
   assertSafeTarget(root, configTarget);
   const existingConfig = existsSync(configTarget) ? loadProjectConfig(configTarget) : null;
+  const originalConfig = existingConfig ? structuredClone(existingConfig) : null;
+  const originalConfigBytes = existingConfig ? readFileSync(configTarget) : null;
   const detectedRepo =
     options.answers?.githubRepo ?? existingConfig?.project.githubRepo ?? (await detectRepository(root));
   const detectedAuthor =
@@ -220,7 +223,9 @@ export async function installProject(options: InstallOptions): Promise<{ config:
 
   const configReceipt = writeManagedFile(
     configTarget,
-    Buffer.from(serializeProjectConfig(config)),
+    originalConfigBytes && isDeepStrictEqual(originalConfig, config)
+      ? originalConfigBytes
+      : Buffer.from(serializeProjectConfig(config)),
     root,
     Boolean(options.dryRun),
     true,

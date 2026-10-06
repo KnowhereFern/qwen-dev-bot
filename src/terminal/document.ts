@@ -45,7 +45,7 @@ export function renderDocument(title: string, text: string, requestedOffset: num
     ...lines.slice(offset, offset + pageSize),
     ...Array.from({ length: Math.max(0, pageSize - (lines.length - offset)) }, () => ''),
     ...(compact ? [] : ['', fit(`  Lines ${offset + 1}–${Math.min(lines.length, offset + pageSize)} of ${lines.length} · Read-only`)]),
-    paint(fit(width < 60 ? '  ↑↓ scroll · Enter/Esc back' : '  ↑↓ scroll · PgUp/PgDn · Tab section · Enter/Esc back'), '36'),
+    paint(fit(width < 60 ? '  ↑↓ scroll · 0/Enter/Esc back' : '  ↑↓ scroll · PgUp/PgDn · Tab section · 0/Enter/Esc back'), '36'),
   ].join('\n');
   return { screen, offset, maxOffset, pageSize, sections };
 }

@@ -80,6 +80,44 @@ describe('guided installer', () => {
     expect(result.config.qwen.baseUrl).toBe('https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1');
   });
 
+  it('preserves exact config formatting on no-op updates but persists semantic changes', async () => {
+    const root = makeTmp('installer-config-format');
+    process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-config-format-state');
+    const options = {
+      root, yes: true,
+      answers: {
+        projectName: 'fixture', githubRepo: 'owner/fixture', trustedAuthor: 'owner',
+        qwenBillingPlan: 'standard' as const, autoMerge: false,
+        installQwen: false, linkExtension: false, installService: false,
+        bootstrapDependencies: false, configureGitHub: false,
+      },
+    };
+    await installProject(options);
+    const configFile = path.join(root, '.qwen-harness', 'project.yml');
+    const config = JSON.parse(readFileSync(configFile, 'utf8'));
+    config.gates.push({
+      id: 'next-typegen', kind: 'custom', command: 'node',
+      args: ['node_modules/next/dist/bin/next', 'typegen'], required: true, timeoutMs: 1_000,
+    });
+    const formatted = `${JSON.stringify(config, null, 2).replace(
+      /"args": \[\s*"node_modules\/next\/dist\/bin\/next",\s*"typegen"\s*\]/,
+      '"args": ["node_modules/next/dist/bin/next", "typegen"]',
+    )}\n`;
+    expect(formatted).toContain('"args": ["node_modules/next/dist/bin/next", "typegen"]');
+    writeFileSync(configFile, formatted);
+
+    const unchanged = await installProject(options);
+    expect(readFileSync(configFile, 'utf8')).toBe(formatted);
+    expect(unchanged.summary).toContain('unchanged .qwen-harness/project.yml');
+
+    const changed = await installProject({ ...options, answers: { ...options.answers, autoMerge: true } });
+    expect(changed.config.worker.autoMerge).toBe(true);
+    const persisted = JSON.parse(readFileSync(configFile, 'utf8'));
+    expect(persisted.worker.autoMerge).toBe(true);
+    expect(persisted.gates).toEqual(config.gates);
+    expect(changed.summary).toContain('wrote .qwen-harness/project.yml');
+  });
+
   it('installs idempotently and preserves modified files on uninstall', async () => {
     const root = makeTmp('installer-project');
     process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-state');
