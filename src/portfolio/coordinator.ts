@@ -17,6 +17,13 @@ const PLAN_MARKER = 'qwen-harness-plan:v1';
 const STORY_MARKER = 'qwen-harness-plan-story:v1';
 const NORMALIZED_STORY_MARKER = 'qwen-harness-plan-normalized:v1';
 
+export class RecoveryLineageError extends Error {
+  constructor(message: string, readonly storyKeys: string[], readonly originIssueNumbers: number[], readonly assessmentId: string) {
+    super(message);
+    this.name = 'RecoveryLineageError';
+  }
+}
+
 export class PortfolioCoordinator {
   constructor(
     private readonly config: ProjectConfig,
@@ -282,6 +289,7 @@ export class PortfolioCoordinator {
   }): Promise<PortfolioPlan> {
     const current = this.requirePlan(input.planId);
     if (!this.config.program.enabled) throw new Error('Program revision requires program.enabled');
+    const recoveryOrigins = this.recoveryOrigins(current, input.draft, input.assessment, input.material);
     const nextRevision = (current.revision ?? 1) + 1;
     const now = Date.now();
     const preserved = current.stories.map((story) =>
@@ -294,14 +302,9 @@ export class PortfolioCoordinator {
     const priorWaveKeys = input.reason === 'quarantine' ? [] : current.stories
       .filter((story) => (story.wave ?? 1) === (current.currentWave ?? 1) && !story.supersededAt)
       .map((story) => story.key);
-    const failureOriginIssueNumber = input.reason === 'quarantine'
-      ? current.stories
-          .filter((story) => (story.wave ?? 1) === (current.currentWave ?? 1))
-          .map((story) => story.normalizedIssueNumber)
-          .find((issueNumber) => issueNumber !== null && this.store.findByIssue(issueNumber)?.state === 'quarantined') ?? null
-      : null;
     const revisedDrafts = input.draft.stories.map((story) => ({
       ...story,
+      failureOriginIssueNumber: recoveryOrigins.get(story.key) ?? null,
       key: keyMap.get(story.key) as string,
       dependsOn: unique(story.dependsOn.map((key) => keyMap.get(key) ?? key)),
     }));
@@ -314,7 +317,7 @@ export class PortfolioCoordinator {
       ]),
       revision: nextRevision,
       supersededAt: null,
-      failureOriginIssueNumber: story.dependsOn.length === 0 ? failureOriginIssueNumber : null,
+      failureOriginIssueNumber: story.failureOriginIssueNumber,
       sourceIssueNumber: null,
       sourceIssueUrl: null,
       normalizedIssueNumber: null,
@@ -358,6 +361,74 @@ export class PortfolioCoordinator {
     }, `program:revision:${plan.id}:${nextRevision}`);
     if (!input.material || input.approvedMaterial) plan = await this.activateWave(plan.id, plan.currentWave ?? 1);
     return plan;
+  }
+
+  private recoveryOrigins(current: PortfolioPlan, draft: PortfolioDraft, assessment: RepositoryAssessment, material: boolean): Map<string, number> {
+    const identity = (value: string) => value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+    const failed = (task: TaskRecord) => ['failed', 'quarantined'].includes(task.state);
+    const records = current.stories.flatMap((story) => {
+      const task = story.normalizedIssueNumber === null ? null : this.store.findByIssue(story.normalizedIssueNumber);
+      return task ? [{ story, task }] : [];
+    });
+    const failedIssues = records.filter(({ task }) => failed(task)).map(({ task }) => task.issueNumber);
+    const reject = (keys: string[], message: string, origins = failedIssues): never => {
+      throw new RecoveryLineageError(message, keys, unique(origins), assessment.id);
+    };
+    const historicalIds = new Map<string, Set<string>>();
+    const established = new Set<string>();
+    const coverageAt = (revision: number) => {
+      const record = current.revisions?.find((item) => item.number === revision);
+      const saved = record ? this.store.getRepositoryAssessment(record.assessmentId) : null;
+      return saved?.coverage ?? (revision === (current.revision ?? 1) ? current.coverage : undefined);
+    };
+    for (const revision of new Set([current.revision ?? 1, ...current.stories.map((story) => story.revision ?? 1)])) {
+      for (const entry of coverageAt(revision) ?? []) {
+        const requirement = identity(entry.requirement);
+        established.add(requirement);
+        const meanings = historicalIds.get(entry.id) ?? new Set<string>();
+        meanings.add(requirement); historicalIds.set(entry.id, meanings);
+      }
+    }
+    const latest = new Map<string, Array<{ story: PortfolioStory; task: TaskRecord }>>();
+    for (const record of records) {
+      // Merely publishing or starting a replacement is not successful recovery.
+      if (!failed(record.task) && record.task.state !== 'done') continue;
+      const coverage = coverageAt(record.story.revision ?? 1);
+      const requirements = record.story.coverageIds?.map((id) => coverage?.find((entry) => entry.id === id)?.requirement);
+      if (!requirements?.length || requirements.some((value) => !value)) {
+        if (failed(record.task)) reject(draft.stories.map((story) => story.key), `Cannot resolve requirement identity for failed issue #${record.task.issueNumber}. Restore its saved assessment before revising.`, [record.task.issueNumber]);
+        continue;
+      }
+      for (const requirement of requirements) {
+        const key = identity(requirement!);
+        const previous = latest.get(key) ?? [];
+        const revision = record.story.revision ?? 1;
+        const priorRevision = previous[0]?.story.revision ?? 1;
+        if (!previous.length || revision > priorRevision) latest.set(key, [record]);
+        else if (revision === priorRevision) previous.push(record);
+      }
+    }
+    const origins = new Map<string, number>();
+    for (const story of draft.stories) {
+      if (!story.coverageIds?.length) {
+        if (failedIssues.length) reject([story.key], `Story ${story.key} needs coverage identities before recovery can be revised.`);
+        continue;
+      }
+      const matches: TaskRecord[] = [];
+      for (const id of story.coverageIds) {
+        const entries = assessment.coverage.filter((entry) => entry.id === id);
+        if (entries.length !== 1) reject([story.key], `Story ${story.key} has unresolved or ambiguous coverage ${id}.`);
+        const requirement = identity(entries[0]!.requirement);
+        const meanings = historicalIds.get(id);
+        if (meanings && (meanings.size !== 1 || !meanings.has(requirement))) reject([story.key], `Coverage ${id} changes an existing requirement identity; preserve it before revising ${story.key}.`);
+        if (failedIssues.length && !established.has(requirement) && !material) reject([story.key], `Story ${story.key} has an unrecognized requirement identity; preserve established wording or request a material revision.`);
+        matches.push(...(latest.get(requirement) ?? []).filter(({ task }) => failed(task)).map(({ task }) => task));
+      }
+      const lineages = new Set(matches.map((task) => task.failureLineageId ?? task.id));
+      if (lineages.size > 1) reject([story.key], `Story ${story.key} combines multiple failure lineages; split it into independent repair stories.`, matches.map((task) => task.issueNumber));
+      if (matches.length) origins.set(story.key, Math.max(...matches.map((task) => task.issueNumber)));
+    }
+    return origins;
   }
 
   async updateProgramState(

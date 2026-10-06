@@ -17,6 +17,13 @@ import { runProcess } from '../runtime/safe-process.js';
 import type { PortfolioPlanningModel, RequirementsDocument } from '../portfolio/planner.js';
 
 const AREAS = ['product', 'architecture', 'verification', 'operations'] as const;
+export class AssessmentContractError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AssessmentContractError';
+  }
+}
+
 const STATUSES = new Set<CapabilityStatus>(['implemented', 'partial', 'missing', 'unverified', 'externally_blocked']);
 const COVERAGE_ID_PATTERN = '^[A-Z][A-Z0-9_-]{0,31}$';
 const TEXT_EXTENSIONS = new Set([
@@ -135,6 +142,7 @@ export class RepositoryAssessor {
     operationalEvidence: EvidenceReference[] = [],
     commitSha?: string,
     reviewFeedback?: string,
+    priorCoverage: ObjectiveCoverage[] = [],
   ): Promise<RepositoryAssessment> {
     const snapshot = await collectRepositorySnapshot(this.config, signal, commitSha);
     const evidenceContext: EvidenceValidationContext = {
@@ -174,6 +182,7 @@ export class RepositoryAssessor {
       signal,
       system: [
         'Map every distinct target-product acceptance requirement in the supplied objective to repository evidence.',
+        ...(priorCoverage.length ? ['The supplied prior-coverage entries are frozen requirement identities: preserve every existing id and requirement text verbatim while updating status, requiredAction, rationale and evidence. Never omit, rename, merge or reinterpret an existing requirement. You may add newly identified requirements with new unique IDs within the objective.'] : []),
         'Split compound requirements into independently testable behaviors, especially when some parts exist and others are missing. Do not let an implemented sub-capability hide an incomplete pickup, exception, settlement, recovery, or operational outcome.',
         'Separate target-product behavior from harness-owned proof obligations. Issue/PR/deployment recovery, program revisions, evidence export, controller history, and maintenance observation are operational proof obligations, not missing target-product modules. Include them as unverified/operate coverage only when the objective makes them part of target acceptance; assess product charges, messages, and state-transition idempotency separately.',
         'If the objective explicitly places harness validation on a separate track outside product acceptance, do not add that track as target-product coverage or work. Track separation does not waive the separate proof. Maintenance observation belongs to that track when the objective says so.',
@@ -196,9 +205,18 @@ export class RepositoryAssessor {
         '</analyses>',
         `<operational-evidence>${JSON.stringify(operationalEvidence)}</operational-evidence>`,
         `<review-feedback>${JSON.stringify(reviewFeedback ?? '')}</review-feedback>`,
+        ...(priorCoverage.length ? [`<prior-coverage>${JSON.stringify(priorCoverage.map(({ id, requirement }) => ({ id, requirement })))}</prior-coverage>`] : []),
       ].join('\n'),
     });
     const coverage = validateCoverage(synthesis.value, evidenceContext);
+    for (const prior of priorCoverage) {
+      const current = coverage.find((entry) => entry.id === prior.id);
+      if (!current) throw new AssessmentContractError(`Reassessment omitted existing coverage id ${prior.id}`);
+      const normalize = (text: string) => text.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+      if (normalize(current.requirement) !== normalize(prior.requirement)) {
+        throw new AssessmentContractError(`Reassessment changed existing requirement for coverage id ${prior.id}`);
+      }
+    }
     const createdAt = Date.now();
     const id = `assessment_${sha256(`${projectIdFor(this.config)}:${snapshot.commitSha}:${sha256(document.content)}:${createdAt}`).slice(0, 20)}`;
     return {

@@ -4,13 +4,13 @@ import type { PortfolioPlan, ProgramRevision, ProjectConfig } from '../core/type
 import { StagingDeploymentController } from '../deployment/controller.js';
 import { EvolutionSignalCollector } from '../evolution/signals.js';
 import { REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from '../github/control-plane.js';
-import { matchesPortfolioTaskContract, PortfolioCoordinator } from '../portfolio/coordinator.js';
+import { matchesPortfolioTaskContract, PortfolioCoordinator, RecoveryLineageError } from '../portfolio/coordinator.js';
 import { PortfolioPlanner, readRequirementsDocument } from '../portfolio/planner.js';
 import { runProcess } from '../runtime/safe-process.js';
-import { RepositoryAssessor } from './repository-assessor.js';
+import { AssessmentContractError, RepositoryAssessor } from './repository-assessor.js';
 
 export interface ProgramTickResult {
-  action: 'disabled' | 'idle' | 'deployed' | 'deployment-failed' | 'reassessed' | 'awaiting-material-approval' | 'delivered' | 'maintaining';
+  action: 'disabled' | 'idle' | 'deployed' | 'deployment-failed' | 'reassessed' | 'recovery-blocked' | 'awaiting-material-approval' | 'delivered' | 'maintaining';
   planId: string | null;
   detail?: string;
 }
@@ -41,11 +41,38 @@ export class ProgramController {
     if (!plan) return { action: 'idle', planId: null };
 
     const quarantine = this.quarantinedWaveTask(plan);
+    if (plan.status === 'blocked') {
+      const exhausted = this.failedWaveTasks(plan).find((task) => {
+        const budget = this.store.retryBudget(task.id);
+        return budget.failures >= budget.limit;
+      });
+      if (exhausted) {
+        const budget = this.store.retryBudget(exhausted.id);
+        const detail = `Issue #${exhausted.issueNumber} exhausted its shared recovery budget (${budget.failures}/${budget.limit}). Automatic replacement work is blocked; review the failure evidence and explicitly authorize recovery before further attempts.`;
+        const key = `program:recovery-budget:${plan.id}:${exhausted.id}:${budget.failures}:${budget.limit}`;
+        if (!this.store.hasIdempotencyKey(key)) this.store.recordEvent('program.recovery_budget_exhausted', exhausted.id, { planId: plan.id, ...budget, detail }, key);
+        return { action: 'recovery-blocked', planId: plan.id, detail };
+      }
+    }
     if (plan.status === 'blocked' && quarantine) {
       const key = `program:quarantine:${plan.id}:${quarantine.id}:${quarantine.identicalFailures}`;
       if (!this.store.hasIdempotencyKey(key)) {
         this.store.recordEvent('program.reassessment_requested', quarantine.id, { planId: plan.id, reason: 'quarantine' });
-        const result = await this.reassess(plan, 'quarantine', signal);
+        let result: ProgramTickResult;
+        try {
+          result = await this.reassess(plan, 'quarantine', signal);
+        } catch (error) {
+          if (!(error instanceof RecoveryLineageError) && !(error instanceof AssessmentContractError)) throw error;
+          this.store.recordEvent('program.revision_rejected', quarantine.id, {
+            planId: plan.id,
+            ...(error instanceof RecoveryLineageError ? {
+              assessmentId: error.assessmentId, storyKeys: error.storyKeys,
+              originIssueNumbers: error.originIssueNumbers,
+            } : { classification: 'assessment-contract' }),
+            reason: error.message,
+          }, `${key}:rejected`);
+          result = { action: 'recovery-blocked', planId: plan.id, detail: error.message };
+        }
         this.store.recordEvent('program.quarantine_processed', quarantine.id, { planId: plan.id, result: result.action }, key);
         return result;
       }
@@ -119,7 +146,7 @@ export class ProgramController {
         }]
       : [];
     const operationalEvidence = [...checkEvidence, ...deploymentEvidence];
-    const assessment = await this.assessor.assess(document, signal, operationalEvidence, targetCommitSha);
+    const assessment = await this.assessor.assess(document, signal, operationalEvidence, targetCommitSha, undefined, plan.coverage ?? []);
     this.store.saveRepositoryAssessment(assessment);
     await this.recordExternalCommits(plan, assessment.commitSha, signal);
     const auditComplete = assessment.coverage.length > 0 && assessment.coverage.every((entry) => entry.status === 'implemented');
@@ -249,10 +276,14 @@ export class ProgramController {
   }
 
   private quarantinedWaveTask(plan: PortfolioPlan) {
+    return this.failedWaveTasks(plan).find((task) => task.state === 'quarantined');
+  }
+
+  private failedWaveTasks(plan: PortfolioPlan) {
     const issueNumbers = new Set(plan.stories
       .filter((story) => !story.supersededAt && (story.wave ?? 1) === (plan.currentWave ?? 1))
       .flatMap((story) => story.normalizedIssueNumber === null ? [] : [story.normalizedIssueNumber]));
-    return this.store.list(['quarantined']).find((task) => issueNumbers.has(task.issueNumber));
+    return this.store.list(['failed', 'quarantined']).filter((task) => issueNumbers.has(task.issueNumber));
   }
 
   private async reconcileDeployments(signal?: AbortSignal): Promise<void> {

@@ -4,7 +4,7 @@ import { PersistentTaskStore } from '../src/core/persistent-store.js';
 import type { RepositoryAssessment } from '../src/core/types.js';
 import type { CheckSummary, GitHubControl, RemoteIssue, RemotePullRequest } from '../src/github/control-plane.js';
 import { parseNormalizedSpec } from '../src/intake/normalizer.js';
-import { matchesPortfolioTaskContract, PortfolioCoordinator } from '../src/portfolio/coordinator.js';
+import { matchesPortfolioTaskContract, PortfolioCoordinator, RecoveryLineageError } from '../src/portfolio/coordinator.js';
 import type { PortfolioDraft } from '../src/portfolio/planner.js';
 import { makeTmp } from './helpers.js';
 
@@ -279,6 +279,7 @@ describe('PortfolioCoordinator', () => {
       createdAt: 1,
     };
     const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'program objective', draft: initial, assessment });
+    store.saveRepositoryAssessment(assessment);
     const approved = await coordinator.approve(created.plan.id);
     const failedIssue = approved.stories[0]?.normalizedIssueNumber as number;
     store.upsert({
@@ -299,6 +300,7 @@ describe('PortfolioCoordinator', () => {
     revisedDraft.stories[0]!.coverageIds = ['REQ1'];
     revisedDraft.stories[1]!.coverageIds = ['REQ2'];
     const nextAssessment = { ...assessment, id: 'assessment_next', commitSha: 'b'.repeat(40), createdAt: 2 };
+    store.saveRepositoryAssessment(nextAssessment);
     const revised = await coordinator.revise({
       planId: created.plan.id,
       draft: revisedDraft,
@@ -330,6 +332,71 @@ describe('PortfolioCoordinator', () => {
     expect(waveRoot?.dependsOn).toContain(priorWaveKey);
     expect(waveRoot?.normalizedIssueNumber).not.toBeNull();
     store.close();
+  });
+
+  it.each(['mapped', 'separate', 'ambiguous', 'missing', 'renamed', 'reinterpreted', 'material', 'completed', 'active'])('maps recovery by requirement identity before any published effects: %s', async (scenario) => {
+    const config = defaultProjectConfig(makeTmp('lineage-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    const store = new PersistentTaskStore('lineage-project', makeTmp('lineage-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const initial = draft();
+      initial.stories[0]!.coverageIds = ['A'];
+      initial.stories[1]!.coverageIds = ['B'];
+      initial.stories[1]!.dependsOn = [];
+      const assessment: RepositoryAssessment = {
+        id: 'lineage-initial', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [], createdAt: 1,
+        coverage: ['Foundation', 'Feature', 'Independent'].map((requirement, index) => ({
+          id: ['A', 'B', 'C'][index], requirement, status: 'missing', requiredAction: 'implement', rationale: 'Missing', evidence: [],
+        })),
+      };
+      store.saveRepositoryAssessment(assessment);
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: initial, assessment });
+      let approved = await coordinator.approve(created.plan.id);
+      const origins = approved.stories.map((story) => story.normalizedIssueNumber as number);
+      origins.forEach((issueNumber) => store.upsert({ issueNumber, title: 'failed work', state: 'quarantined' }));
+      if (scenario === 'completed' || scenario === 'active') {
+        const recovery = { ...approved.stories[0]!, key: 'RECOVERY', revision: 2, normalizedIssueNumber: 999 };
+        store.upsert({ issueNumber: 999, title: 'later recovery', state: scenario === 'completed' ? 'done' : 'active' });
+        const second = { ...assessment, id: 'lineage-second' };
+        store.saveRepositoryAssessment(second);
+        approved = { ...approved, revision: 2, stories: [...approved.stories, recovery], revisions: [...approved.revisions!, { ...approved.revisions![0], number: 2, assessmentId: second.id }] };
+        store.savePortfolioPlan(approved);
+      }
+      const replacement = draft();
+      replacement.stories[0]!.coverageIds = ['C'];
+      replacement.stories[1]!.coverageIds = ['NEW_A']; // A nonroot repair must inherit A, not independent C.
+      const next = { ...assessment, id: 'lineage-next', coverage: [...assessment.coverage, { ...assessment.coverage[0], id: 'NEW_A', requirement: '  FOUNDATION  ' }] };
+      if (scenario === 'separate') {
+        replacement.stories[0]!.coverageIds = ['NEW_A'];
+        replacement.stories[1]!.coverageIds = ['B'];
+      }
+      if (scenario === 'missing') replacement.stories[1]!.coverageIds = [];
+      if (scenario === 'ambiguous') replacement.stories[1]!.coverageIds = ['NEW_A', 'B'];
+      if (scenario === 'renamed' || scenario === 'material') next.coverage[next.coverage.length - 1].requirement = 'A genuinely new or unresolvable requirement';
+      if (scenario === 'reinterpreted') {
+        replacement.stories[1]!.coverageIds = ['A'];
+        next.coverage = next.coverage.map((entry) => entry.id === 'A' ? { ...entry, requirement: 'Different meaning' } : entry);
+      }
+      const before = store.getPortfolioPlan(approved.id);
+      const issueCount = github.issues.size;
+      const revise = () => coordinator.revise({ planId: approved.id, draft: replacement, assessment: next, reason: 'manual', material: scenario === 'material', summary: 'Recovery mapping' });
+      if (['ambiguous', 'missing', 'renamed', 'reinterpreted'].includes(scenario)) {
+        await expect(revise()).rejects.toMatchObject({ name: 'RecoveryLineageError', storyKeys: ['S2'], assessmentId: next.id });
+        expect(github.issues.size).toBe(issueCount);
+        expect(store.getPortfolioPlan(approved.id)).toEqual(before);
+      } else {
+        const revised = await revise();
+        const added = revised.stories.filter((story) => story.revision === (approved.revision ?? 1) + 1);
+        expect(added[0].failureOriginIssueNumber).toBe(scenario === 'separate' ? origins[0] : null);
+        expect(added[1].failureOriginIssueNumber).toBe(scenario === 'separate' ? origins[1] : ['mapped', 'active'].includes(scenario) ? origins[0] : null);
+        if (scenario === 'material') expect(revised.status).toBe('awaiting_material_approval');
+      }
+      expect(new RecoveryLineageError('reason', ['S1'], origins, assessment.id)).toBeInstanceOf(Error);
+    } finally { store.close(); }
   });
 
   it('refuses approval when the authenticated GitHub actor is not trusted', async () => {

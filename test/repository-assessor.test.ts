@@ -3,8 +3,9 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
-import { collectRepositorySnapshot, RepositoryAssessor } from '../src/program/repository-assessor.js';
+import { AssessmentContractError, collectRepositorySnapshot, RepositoryAssessor } from '../src/program/repository-assessor.js';
 import type { PortfolioPlanningModel } from '../src/portfolio/planner.js';
+import type { ObjectiveCoverage } from '../src/core/types.js';
 import { makeTmp } from './helpers.js';
 
 class AssessmentModel implements PortfolioPlanningModel {
@@ -79,6 +80,48 @@ class ImplementedCoverageModel implements PortfolioPlanningModel {
 }
 
 describe('RepositoryAssessor', () => {
+  const priorCoverage: ObjectiveCoverage[] = [{
+    id: 'HEALTH', requirement: 'Expose health', status: 'missing', requiredAction: 'implement', rationale: 'Previously missing', evidence: [],
+  }];
+
+  it('supplies frozen requirement identities and accepts updated classifications plus additions', async () => {
+    const config = defaultProjectConfig(gitRepo(), 'fixture', 'owner/fixture');
+    const model = new AssessmentModel();
+    const assessment = await new RepositoryAssessor(config, model).assess(
+      { sourcePath: 'PROJECT.md', content: 'Expose health.' }, undefined, [], undefined, undefined, priorCoverage,
+    );
+    expect(model.prompts[4]).toContain('preserve every existing id and requirement text verbatim');
+    expect(model.inputs[4]).toContain('<prior-coverage>[{"id":"HEALTH","requirement":"Expose health"}]</prior-coverage>');
+    expect(assessment.coverage[0]).toMatchObject({ id: 'HEALTH', requirement: 'Expose health', status: 'unverified' });
+    const extended = await new RepositoryAssessor(config, coverageIdsModel(['HEALTH', 'NEW-HEALTH-CHECK'])).assess(
+      { sourcePath: 'PROJECT.md', content: 'Expose health.' }, undefined, [], undefined, undefined, priorCoverage,
+    );
+    expect(extended.coverage.map((entry) => entry.id)).toEqual(['HEALTH', 'NEW-HEALTH-CHECK']);
+  });
+
+  it('rejects omitted or renamed prior identities and changed requirement meaning', async () => {
+    const config = defaultProjectConfig(gitRepo(), 'fixture', 'owner/fixture');
+    const document = { sourcePath: 'PROJECT.md', content: 'Expose health.' };
+    const omitted = new RepositoryAssessor(config, coverageIdsModel(['RENAMED'])).assess(
+      document, undefined, [], undefined, undefined, priorCoverage,
+    );
+    await expect(omitted).rejects.toThrow(AssessmentContractError);
+    await expect(omitted).rejects.toThrow('Reassessment omitted existing coverage id HEALTH');
+    const changed = new RepositoryAssessor(config, coverageIdsModel(['HEALTH'], 'Remove health')).assess(
+      document, undefined, [], undefined, undefined, priorCoverage,
+    );
+    await expect(changed).rejects.toThrow(AssessmentContractError);
+    await expect(changed).rejects.toThrow('Reassessment changed existing requirement for coverage id HEALTH');
+  });
+
+  it('allows only cosmetic requirement normalization when retaining identities', async () => {
+    const config = defaultProjectConfig(gitRepo(), 'fixture', 'owner/fixture');
+    const assessment = await new RepositoryAssessor(config, coverageIdsModel(['HEALTH'], '  ＥＸＰＯＳＥ  \n health  ')).assess(
+      { sourcePath: 'PROJECT.md', content: 'Expose health.' }, undefined, [], undefined, undefined, priorCoverage,
+    );
+    expect(assessment.coverage[0]?.id).toBe('HEALTH');
+  });
+
   it('runs four independent evidence reviews and ties coverage to an exact clean commit', async () => {
     const root = gitRepo();
     const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
@@ -365,11 +408,11 @@ function coverageResponse<T>(input: Parameters<PortfolioPlanningModel['completeJ
   return { value: value as T };
 }
 
-function coverageIdsModel(ids: string[]): PortfolioPlanningModel {
+function coverageIdsModel(ids: string[], requirement = 'Expose health'): PortfolioPlanningModel {
   return { async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]) {
     return { value: (input.jsonSchema?.name === 'objective_coverage'
       ? { coverage: ids.map((id) => ({
-          id, requirement: 'Expose health', status: 'missing', requiredAction: 'implement', rationale: 'Not implemented', evidence: [],
+          id, requirement, status: 'missing', requiredAction: 'implement', rationale: 'Not implemented', evidence: [],
         })) }
       : { summary: 'Reviewed', findings: [], risks: [] }) as T };
   } };

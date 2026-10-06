@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.44] - 2026-10-05
+
+- Enforce one shared retry budget across replacement and repair tasks, including after restart.
+- Preserve approved requirement identities during reassessment and attach repairs to their actual failure lineage.
+- Stop automatic replacement proposals when recovery is exhausted or cannot be linked safely; retain the evidence for review.
+
 ## [1.0.0-rc.43] - 2026-10-05
 
 - Clarify that the parent session coordinates the saved workflow rather than running shell commands or editing directly.

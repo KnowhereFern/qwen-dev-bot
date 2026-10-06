@@ -453,14 +453,28 @@ export class PersistentTaskStore {
       const rows = this.db
         .prepare(
           `SELECT * FROM tasks
-           WHERE project_id = ? AND state = 'ready' AND attempts < max_attempts
+           WHERE project_id = ? AND state = 'ready'
            ORDER BY priority ASC, issue_number ASC`,
         )
         .all(this.projectId) as unknown as TaskRow[];
       const dependencyTasks = (
         this.db.prepare('SELECT * FROM tasks WHERE project_id = ?').all(this.projectId) as unknown as TaskRow[]
       ).map(rowToTask);
-      const row = rows.find((candidate) => this.dependenciesSatisfied(rowToTask(candidate), dependencyTasks));
+      const row = rows.find((candidate) => {
+        const task = rowToTask(candidate);
+        const budget = this.failureBudget(task, dependencyTasks);
+        if (budget.failures >= budget.limit) {
+          this.transition(task.id, 'quarantined', {}, now);
+          this.recordEvent('task.lineage_budget_exhausted', task.id, {
+            failureLineageId: task.failureLineageId ?? task.id,
+            failures: budget.failures,
+            maxAttempts: budget.limit,
+          });
+          return false;
+        }
+        if (budget.members.some((member) => member.id !== task.id && isTaskLeased(member.state))) return false;
+        return this.dependenciesSatisfied(task, dependencyTasks);
+      });
       if (!row) {
         this.db.exec('COMMIT');
         return null;
@@ -595,8 +609,10 @@ export class PersistentTaskStore {
     const fingerprint = failureFingerprint(error);
     const identicalFailures = task.lastFailureFingerprint === fingerprint ? task.identicalFailures + 1 : 1;
     const attempts = task.attempts + 1;
+    const budget = this.failureBudget(task);
+    const lineageFailures = budget.failures + 1;
     const to: TaskState =
-      identicalFailures >= identicalLimit ? 'quarantined' : attempts >= task.maxAttempts ? 'failed' : 'ready';
+      identicalFailures >= identicalLimit ? 'quarantined' : lineageFailures >= budget.limit ? 'failed' : 'ready';
     return this.transition(
       id,
       to,
@@ -605,7 +621,7 @@ export class PersistentTaskStore {
         identicalFailures,
         lastFailureFingerprint: fingerprint,
         failureLineageId: task.failureLineageId ?? task.id,
-        lineageFailures: (task.lineageFailures ?? 0) + 1,
+        lineageFailures,
         lastError: error,
         leaseOwner: null,
         leaseExpiresAt: null,
@@ -628,21 +644,43 @@ export class PersistentTaskStore {
     const fingerprint = failureFingerprint(error);
     const identicalFailures = task.lastFailureFingerprint === fingerprint ? task.identicalFailures + 1 : 1;
     const attempts = task.attempts + 1;
+    const budget = this.failureBudget(task);
+    const lineageFailures = budget.failures + 1;
     const patch = {
       attempts,
       identicalFailures,
       lastFailureFingerprint: fingerprint,
       failureLineageId: task.failureLineageId ?? task.id,
-      lineageFailures: (task.lineageFailures ?? 0) + 1,
+      lineageFailures,
       lastError: error,
       leaseOwner: null,
       leaseExpiresAt: null,
     };
     if (identicalFailures >= identicalLimit) return this.transition(id, 'quarantined', patch, now);
-    if (attempts >= task.maxAttempts) return this.transition(id, 'failed', patch, now);
+    if (lineageFailures >= budget.limit) return this.transition(id, 'failed', patch, now);
     const updated = this.patch(id, patch, now);
     this.recordEvent('postmerge.retry_scheduled', id, { attempts, identicalFailures });
     return updated;
+  }
+
+  retryBudget(id: string): { failures: number; limit: number } {
+    const { failures, limit } = this.failureBudget(this.get(id));
+    return { failures, limit };
+  }
+
+  private failureBudget(task: TaskRecord, tasks = this.list()) {
+    const lineageId = task.failureLineageId ?? task.id;
+    const members = tasks.filter((member) => (member.failureLineageId ?? member.id) === lineageId);
+    return {
+      members,
+      // Own attempt counts are additive; inherited cumulative snapshots are not.
+      // The maximum also preserves historical counts when an origin is unavailable.
+      failures: Math.max(
+        members.reduce((total, member) => total + member.attempts, 0),
+        ...members.map((member) => member.lineageFailures ?? 0),
+      ),
+      limit: Math.min(task.maxAttempts, ...members.map((member) => member.maxAttempts)),
+    };
   }
 
   saveCheckpoint(checkpoint: RunCheckpoint): void {

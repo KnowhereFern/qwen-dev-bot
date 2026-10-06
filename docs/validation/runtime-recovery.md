@@ -18,6 +18,8 @@ The installed Qwen CLI reported `0.24.5`. Its headless `auto` setup denied shell
 - Local checks passed: 303 tests, TypeScript, release metadata checks, and both packaged command aliases. Full-screen terminal navigation through progress, Escape, numbered return and exit was exercised; no delivery actions were selected.
 - RC42 was installed into a new versioned runtime, and the Qwen extension was relinked to it. With the temporary workspace hook removed, a real parent write was denied by the installed extension and the target file remained absent. Structural preflight passed for the actual task-43 worktree.
 - The shared worker restarted on RC42 and resumed task 43 with its previous attempt count intact. A new saved workflow started its two read-only agents. This is progress, not task completion.
+- Workflow `wf_4f5241a6ee7331e4` subsequently completed its implementer and entered independent review. The isolated task-43 checkout contains a README change and a new blocker document written by the harness, not Codex. Task completion and merge remain unverified.
+- RC44 source validation passed 323 tests, TypeScript and release metadata checks. Both packaged aliases passed the package smoke test. Added checks cover shared failure budgets across siblings/restarts, per-requirement recovery lineage, rejected recovery proposals and frozen coverage identities. Existing failed/quarantined counters were not reset.
 
 ## Limits and rollout gates
 

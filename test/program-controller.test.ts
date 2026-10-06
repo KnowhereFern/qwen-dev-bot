@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
 import { PersistentTaskStore } from '../src/core/persistent-store.js';
 import { projectIdFor } from '../src/core/state-paths.js';
@@ -8,12 +8,62 @@ import { StagingDeploymentController } from '../src/deployment/controller.js';
 import { EvolutionSignalCollector } from '../src/evolution/signals.js';
 import type { CheckSummary, GitHubControl, RemoteIssue, RemotePullRequest } from '../src/github/control-plane.js';
 import { PortfolioPlanner, type PortfolioPlanningModel } from '../src/portfolio/planner.js';
+import { RecoveryLineageError } from '../src/portfolio/coordinator.js';
 import { ProgramController } from '../src/program/controller.js';
-import { RepositoryAssessor } from '../src/program/repository-assessor.js';
+import { AssessmentContractError, RepositoryAssessor } from '../src/program/repository-assessor.js';
 import { createGitFixture } from './fixtures/git.js';
 import { makeTmp } from './helpers.js';
 
 describe('ProgramController', () => {
+  it.each(['failed', 'quarantined'] as const)('does not generate replacement budgets for exhausted %s work', async (state) => {
+    const fixture = recoveryFixture(state, 5);
+    const reassess = vi.spyOn(fixture.controller, 'reassess');
+    expect((await fixture.controller.tick()).action).toBe('recovery-blocked');
+    expect((await fixture.controller.tick()).action).toBe('recovery-blocked');
+    expect(reassess).not.toHaveBeenCalled();
+    expect(fixture.store.listEvents('program.recovery_budget_exhausted')).toHaveLength(1);
+    expect(fixture.store.getPortfolioPlan('recovery')?.revision).toBe(1);
+    expect(fixture.store.findByIssue(10)).toMatchObject({ state, attempts: 5, lineageFailures: 5 });
+    fixture.store.close();
+  });
+
+  it('records a rejected recovery once across controller restarts, retaining approved work', async () => {
+    const fixture = recoveryFixture('quarantined', 3);
+    const error = new RecoveryLineageError('Split conflicting repairs', ['R2'], [10, 11], 'candidate-assessment');
+    const reassess = vi.spyOn(fixture.controller, 'reassess').mockRejectedValue(error);
+    expect((await fixture.controller.tick()).action).toBe('recovery-blocked');
+    expect(reassess).toHaveBeenCalledOnce();
+    const prior = fixture.store.getPortfolioPlan('recovery');
+    fixture.store.close();
+    const reopened = recoveryFixture('quarantined', 3, fixture.directory);
+    const next = vi.spyOn(reopened.controller, 'reassess');
+    expect((await reopened.controller.tick()).action).toBe('idle');
+    expect(next).not.toHaveBeenCalled();
+    expect(reopened.store.getPortfolioPlan('recovery')).toEqual(prior);
+    expect(reopened.store.listEvents('program.revision_rejected')).toHaveLength(1);
+    expect(reopened.store.listEvents('program.revision_rejected')[0]?.payload).toMatchObject({ assessmentId: 'candidate-assessment', originIssueNumbers: [10, 11], storyKeys: ['R2'] });
+    reopened.store.close();
+  });
+
+  it('does not mark transient reassessment failures as permanently processed', async () => {
+    const fixture = recoveryFixture('quarantined', 3);
+    const reassess = vi.spyOn(fixture.controller, 'reassess').mockRejectedValue(new Error('Provider unavailable'));
+    await expect(fixture.controller.tick()).rejects.toThrow('Provider unavailable');
+    await expect(fixture.controller.tick()).rejects.toThrow('Provider unavailable');
+    expect(reassess).toHaveBeenCalledTimes(2);
+    expect(fixture.store.listEvents('program.quarantine_processed')).toHaveLength(0);
+    fixture.store.close();
+  });
+
+  it('does not repeatedly request synthesis after it changes frozen requirement identities', async () => {
+    const fixture = recoveryFixture('quarantined', 3);
+    const reassess = vi.spyOn(fixture.controller, 'reassess').mockRejectedValue(new AssessmentContractError('Missing REQ1'));
+    expect((await fixture.controller.tick()).action).toBe('recovery-blocked');
+    expect((await fixture.controller.tick()).action).toBe('idle');
+    expect(reassess).toHaveBeenCalledOnce();
+    expect(fixture.store.listEvents('program.revision_rejected')[0]?.payload).toMatchObject({ classification: 'assessment-contract' });
+    fixture.store.close();
+  });
   it.each(['ready', 'writer-active', 'pending-ci', 'missing-request', 'stale', 'altered-contract', 'unapproved'] as const)(
     'verifies staging without completing pending acceptance: %s', async (scenario) => {
       const { repo } = await createGitFixture();
@@ -115,6 +165,28 @@ describe('ProgramController', () => {
     store.close();
   });
 });
+
+function recoveryFixture(state: 'failed' | 'quarantined', failures: number, directory = makeTmp('recovery-budget-controller')) {
+  const config = defaultProjectConfig(directory, 'fixture', 'owner/fixture');
+  config.program.enabled = true; config.evolution.enabled = false;
+  const store = new PersistentTaskStore(projectIdFor(config), directory);
+  if (!store.getPortfolioPlan('recovery')) {
+    store.savePortfolioPlan({
+      id: 'recovery', projectId: store.projectId, sourcePath: 'OBJECTIVE.md', contentHash: 'approved', sourceContent: 'Deliver',
+      title: 'Recovery', objective: 'Deliver', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [],
+      status: 'blocked', epicIssueNumber: null, epicIssueUrl: null, createdAt: 1, updatedAt: 1, approvedAt: 1, revision: 1, currentWave: 1,
+      stories: [{ key: 'S1', title: 'Repair', goal: 'Repair', acceptanceCriteria: ['Verified'], constraints: [], requiredGateIds: [], rewardCriterionIds: [],
+        risk: 'low', workType: 'implement', dependsOn: [], rollback: 'Revert', technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['REQ1'],
+        sourceIssueNumber: 1, sourceIssueUrl: 'https://github.test/issues/1', normalizedIssueNumber: 10, normalizedIssueUrl: 'https://github.test/issues/10', wave: 1 }],
+    });
+    const task = store.upsert({ issueNumber: 10, title: 'Repair', state, maxAttempts: 5, lineageFailures: failures, identicalFailures: 3 });
+    store.patch(task.id, { attempts: failures });
+  }
+  const github = new EmptyGitHub();
+  const model = new ImplementedAssessmentModel('unit');
+  const controller = new ProgramController(config, store, github, new RepositoryAssessor(config, model), new PortfolioPlanner(config, model), new EvolutionSignalCollector(config, store, github, model));
+  return { controller, store, directory };
+}
 
 class ImplementedAssessmentModel implements PortfolioPlanningModel {
   calls = 0;

@@ -20,6 +20,64 @@ function taskSpec(dependencies: number[]): TaskSpec {
 }
 
 describe('PersistentTaskStore', () => {
+  it('enforces one failure budget across replacement siblings and restarts', () => {
+    const dir = makeTmp('persistent-lineage-budget');
+    let store = new PersistentTaskStore('budget', dir);
+    const original = store.upsert({ issueNumber: 1, title: 'original', state: 'ready', maxAttempts: 3 });
+    store.claimNext('worker', 100);
+    store.recordFailure(original.id, 'first error', 3);
+    store.transition(original.id, 'cancelled');
+    const first = store.upsert({ issueNumber: 2, title: 'repair A', state: 'ready', maxAttempts: 9,
+      failureLineageId: original.id, lineageFailures: 1 });
+    const sibling = store.upsert({ issueNumber: 3, title: 'repair B', state: 'ready', maxAttempts: 9,
+      failureLineageId: original.id, lineageFailures: 1 });
+    expect(store.claimNext('worker', 100)?.id).toBe(first.id);
+    expect(store.claimNext('other-worker', 100)).toBeNull();
+    expect(store.recordFailure(first.id, 'different error', 3).lineageFailures).toBe(2);
+    store.transition(first.id, 'cancelled');
+    store.close();
+    store = new PersistentTaskStore('budget', dir);
+    expect(store.claimNext('worker', 100)?.id).toBe(sibling.id);
+    expect(store.recordFailure(sibling.id, 'third distinct error', 3)).toMatchObject({
+      state: 'failed', attempts: 1, lineageFailures: 3, identicalFailures: 1,
+    });
+    const replacement = store.upsert({ issueNumber: 4, title: 'repair C', state: 'ready', maxAttempts: 9,
+      failureLineageId: original.id, lineageFailures: 1 });
+    const beforeBudgetRead = { tasks: store.list(), events: store.listEvents() };
+    for (const id of [original.id, first.id, sibling.id, replacement.id]) {
+      expect(store.retryBudget(id)).toEqual({ failures: 3, limit: 3 });
+    }
+    expect({ tasks: store.list(), events: store.listEvents() }).toEqual(beforeBudgetRead);
+    const unrelated = store.upsert({ issueNumber: 5, title: 'unrelated', state: 'ready', maxAttempts: 3 });
+    expect(store.claimNext('worker', 100)?.id).toBe(unrelated.id);
+    expect(store.get(replacement.id)).toMatchObject({ state: 'quarantined', attempts: 0, lineageFailures: 1 });
+    expect(store.listEvents('task.lineage_budget_exhausted')).toHaveLength(1);
+    store.close();
+  });
+
+  it('blocks inherited exhausted budgets even without the origin record', () => {
+    const store = new PersistentTaskStore('orphan-budget', makeTmp('persistent-orphan-budget'));
+    const task = store.upsert({ issueNumber: 1, title: 'replacement', state: 'ready', maxAttempts: 5,
+      failureLineageId: 'historical-origin', lineageFailures: 5 });
+    expect(store.claimNext('worker', 100)).toBeNull();
+    expect(store.get(task.id)).toMatchObject({ state: 'quarantined', attempts: 0, lineageFailures: 5 });
+    store.close();
+  });
+
+  it('counts post-merge failures against the shared lineage budget', () => {
+    const store = new PersistentTaskStore('postmerge-budget', makeTmp('persistent-postmerge-budget'));
+    const original = store.upsert({ issueNumber: 1, title: 'original', state: 'ready', maxAttempts: 2 });
+    store.claimNext('worker', 100);
+    store.recordFailure(original.id, 'implementation failure', 3);
+    store.transition(original.id, 'cancelled');
+    const repair = store.upsert({ issueNumber: 2, title: 'repair', state: 'post_merge', maxAttempts: 2,
+      failureLineageId: original.id, lineageFailures: 1 });
+    expect(store.recordPostMergeFailure(repair.id, 'postmerge failure', 3)).toMatchObject({
+      state: 'failed', attempts: 1, lineageFailures: 2,
+    });
+    store.close();
+  });
+
   it('persists and deduplicates portfolio plans by requirements hash', () => {
     const stateDir = makeTmp('persistent-portfolio');
     let store = new PersistentTaskStore('portfolio-project', stateDir);
