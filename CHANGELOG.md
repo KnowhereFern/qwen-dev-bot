@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.45] - 2026-10-05
+
+- Read independent-review verdicts from streamed terminal events so a large CLI transcript is not parsed as one exit-time pipe write.
+- Reject missing, truncated, duplicate or invalid verdicts without accepting partial evidence or logging raw review content.
+- Preserve Unicode characters across process-output chunks and validate review score ranges and finding types.
+
 ## [1.0.0-rc.44] - 2026-10-05
 
 - Enforce one shared retry budget across replacement and repair tasks, including after restart.

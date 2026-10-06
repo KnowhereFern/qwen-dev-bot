@@ -21,7 +21,15 @@ The installed Qwen CLI reported `0.24.5`. Its headless `auto` setup denied shell
 - Workflow `wf_4f5241a6ee7331e4` subsequently completed its implementer and entered independent review. The isolated task-43 checkout contains a README change and a new blocker document written by the harness, not Codex. Task completion and merge remain unverified.
 - RC44 source validation passed 323 tests, TypeScript and release metadata checks. Both packaged aliases passed the package smoke test. Added checks cover shared failure budgets across siblings/restarts, per-requirement recovery lineage, rejected recovery proposals and frozen coverage identities. Existing failed/quarantined counters were not reset.
 
-## Limits and rollout gates
+## Review transport recovery
+
+- On RC44, task 43 produced candidate `04466ec7b17e860fcb443f4abab98ce0c747e4ce`. The controller supplied passing results for harness-security, next-typegen, check, build, typecheck and lint to its exact-commit reviewer.
+- The independent reviewer exited, but parsing its batch JSON failed near 65 KB. A local child-process reproduction of an unawaited large stdout write followed by exit captured 65,536 of 200,014 bytes. Installed CLI code similarly writes the complete batch transcript before explicitly exiting. This supports pipe truncation as the cause; the redacted review transcript does not prove its lost verdict.
+- RC45 uses streamed events and requires exactly one successful, complete terminal verdict. Invalid/missing/truncated verdicts fail closed; no partial response or cached review is accepted.
+- Local validation passed 349 tests, TypeScript and release checks. A real saved-model Qwen3.8-Max transport-only smoke returned a schema-conforming terminal event through the new collector. That synthetic result is not product review evidence.
+- The failed attempt remains recorded. Task 43 retained its candidate and two failures; no counters were cleared.
+
+## Remaining limits
 
 - Installation preflight validates the matching extension and hook files. It does not prove upstream hook execution is fail-closed on timeout or startup errors.
 - The hook additionally checks Qwen's recorded first subagent transcript entry for the `harness-implementer` role, matching session, agent and worktree. Missing or mismatched evidence denies mutation. This depends on the supported Qwen transcript layout and does not constitute OS-level isolation from a malicious implementation agent.
