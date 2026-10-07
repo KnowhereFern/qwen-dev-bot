@@ -21,6 +21,8 @@ import { homeScreen, planSize, planStatusLabel } from './home.js';
 import type { TerminalScreenLine } from './home.js';
 import { deliveryChoices } from './menu.js';
 import type { TerminalMenu } from './menu.js';
+import { listSpecifications } from '../intake/specification.js';
+import type { SpecificationRecord } from '../intake/specification.js';
 
 export interface TerminalIO {
   question(prompt: string): Promise<string | null>;
@@ -103,6 +105,7 @@ export async function runInteractiveTerminal(options: {
   io?: TerminalIO;
   snapshot?: (root: string) => TerminalSnapshot;
   projects?: () => Array<{ root: string; name: string }>;
+  specifications?: (root: string) => Array<Pick<SpecificationRecord, 'id' | 'createdAt'> & { draft: Pick<SpecificationRecord['draft'], 'title'> }>;
   workerStatus?: () => Promise<WorkerStatus>;
   credential?: typeof resolveQwenCredential;
   saveCredential?: typeof saveUserModelCredential;
@@ -112,6 +115,7 @@ export async function runInteractiveTerminal(options: {
   const io = options.io ?? createTerminalIO();
   const snapshot = options.snapshot ?? readTerminalSnapshot;
   const projects = options.projects ?? (() => new ProjectRegistry().list().map((item) => ({ root: item.root, name: item.id })));
+  const specifications = options.specifications ?? listSpecifications;
   const workerStatus = options.workerStatus ?? readWorkerStatus;
   const credential = options.credential ?? resolveQwenCredential;
   let verifiedConnection: { root: string; model: string; endpoint: string; envKey: string; apiKey: string } | undefined;
@@ -257,16 +261,68 @@ export async function runInteractiveTerminal(options: {
     return (await io.question('Choose a number [0 cancels]: '))?.trim() === '1';
   }
 
+  async function selectSpecification(): Promise<string | undefined> {
+    const saved = specifications(root!);
+    if (!saved.length) { io.print('No saved specifications. Choose a document or describe an idea first.'); return; }
+    const picked = await choose('Saved specifications', saved.map((record) => `${terminalText(record.draft.title)} · ${terminalText(record.createdAt)} · ${record.id}`), 'Choose specification: ');
+    return saved[Number(picked) - 1]?.id;
+  }
+
+  async function draftSpec(): Promise<void> {
+    const source = await choose('Draft a product spec', ['Use a document', 'Describe an idea', 'Review a saved specification'], 'Choose input: ',
+      'The harness writes a private proposal. This does not set up GitHub, approve a plan or start delivery.');
+    if (!source || source === '0') return;
+    if (source === '3') {
+      const id = await selectSpecification();
+      if (id) await execute(['spec-status', root!, '--spec', id]);
+      return;
+    }
+    if (!['1', '2'].includes(source)) return;
+    const input = (await io.question(source === '1'
+      ? 'Document inside this folder (Enter cancels): '
+      : 'Describe what you want to build (Enter cancels): '))?.trim();
+    if (!input) return;
+    if (input.startsWith('-')) throw new Error('Input cannot start with a CLI flag. Use ./ before a filename starting with a dash.');
+    const args = ['spec', root!, source === '1' ? '--input' : '--idea', input];
+    if (source === '1' && /\.pdf$/i.test(input)) {
+      const pages = (await io.question('PDF pages to include (for example 1-4; Enter includes all; 0 cancels): '))?.trim();
+      if (pages === undefined || pages === '0') return;
+      if (pages) {
+        if (!/^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(pages)) throw new Error('Use page numbers or ranges, for example 1-4,6.');
+        args.push('--pages', pages);
+      }
+    }
+    if (!await confirm('Generate private spec', 'Sends the selected input to your configured model provider and saves a private draft. No delivery approval or GitHub publication.')) return;
+    await execute(args);
+    io.print('Spec drafted for review. No delivery plan was approved or started.');
+  }
+
   async function redraft(plan?: PortfolioPlan): Promise<void> {
     if (plan && (!['draft', 'awaiting_initial_approval'].includes(plan.status) || plan.approvedAt !== null)) {
       io.print('The objective is already approved. Material revisions remain paused; automatic redrafting here cannot change the frozen objective.');
       return;
     }
-    const requirements = (await io.question(`Requirements file inside the project${plan ? ` [${plan.sourcePath}]` : ''}: `))?.trim();
-    if (requirements === undefined) return;
-    const sourcePath = requirements || plan?.sourcePath;
+    let sourcePath: string | undefined;
+    if (plan?.sourcePath.startsWith('harness-spec:')) sourcePath = plan.sourcePath;
+    else {
+      if (!plan && specifications(root!).length) {
+        const source = await choose('Delivery plan input', ['Use a saved model-generated specification', 'Use a requirements file'], 'Choose input: ');
+        if (!source || source === '0') return;
+        if (source === '1') {
+          const id = await selectSpecification();
+          if (!id) return;
+          sourcePath = `harness-spec:${id}`;
+        } else if (source !== '2') return;
+      }
+      if (!sourcePath) {
+        const requirements = (await io.question(`Requirements file inside the project${plan ? ` [${plan.sourcePath}]` : ''}: `))?.trim();
+        if (requirements === undefined) return;
+        sourcePath = requirements || plan?.sourcePath;
+      }
+    }
     if (!sourcePath) { io.print('No requirements file selected.'); return; }
     if (sourcePath.startsWith('-')) throw new Error('Use ./ before a filename starting with a dash; filenames cannot act as CLI flags.');
+    const sourceArgs = sourcePath.startsWith('harness-spec:') ? ['--spec', sourcePath.slice('harness-spec:'.length)] : ['--requirements', sourcePath];
     const feedback = plan ? (await io.question('Review feedback file inside the project (Enter cancels): '))?.trim() : undefined;
     if (plan && !feedback) return;
     if (feedback?.startsWith('-')) throw new Error('Use ./ before a filename starting with a dash; filenames cannot act as CLI flags.');
@@ -275,10 +331,10 @@ export async function runInteractiveTerminal(options: {
     if (answer === undefined) return;
     const max = answer ? Number(answer) : defaultMax;
     if (!Number.isSafeInteger(max) || max < 1) throw new Error('Maximum stories must be a positive integer.');
-    if (!await confirm('Generate draft', 'This calls Qwen using your provider plan. It does not approve delivery.')) { io.print('Cancelled; no program was generated or approved.'); return; }
+    if (!await confirm('Generate draft', `This calls Qwen and publishes proposal issues to ${snapshot(root!).config.project.githubRepo} on GitHub. Repository visibility has not been checked here; do not include confidential material unless its access is appropriate. This does not approve delivery.`)) { io.print('Cancelled; no program was generated or approved.'); return; }
     await execute(plan
-      ? ['plan-redraft', root!, '--plan', plan.id, '--requirements', sourcePath, '--feedback', feedback!, '--max-stories', String(max)]
-      : ['plan', root!, '--requirements', sourcePath, '--max-stories', String(max)]);
+      ? ['plan-redraft', root!, '--plan', plan.id, ...sourceArgs, '--feedback', feedback!, '--max-stories', String(max)]
+      : ['plan', root!, ...sourceArgs, '--max-stories', String(max)]);
     io.print('Draft saved. Return to Review/approve program; drafting never approves it.');
   }
 
@@ -397,7 +453,10 @@ export async function runInteractiveTerminal(options: {
       if (!root) { root = await selectProject(); if (!root) return 0; }
       let current: TerminalSnapshot | undefined;
       try { current = snapshot(root); }
-      catch (error) { io.print(`Project not ready: ${terminalText(String(error))}\nChoose Project setup to initialize this folder or switch projects.`); }
+      catch (error) {
+        // A new folder is a supported intake state, not a configuration failure.
+        if (existsSync(path.join(root, PROJECT_CONFIG_PATH))) io.print(`Project configuration needs attention: ${terminalText(String(error))}\nChoose Project setup (6) to repair it.`);
+      }
       const connection = current ? credential(current.config) : null;
       const lines = homeScreen({ root, snapshot: current,
         connection: current && liveVerified(current.config) ? 'verified' : connection ? 'found' : 'missing',
@@ -416,8 +475,9 @@ export async function runInteractiveTerminal(options: {
       if (action === undefined || action === '0') return 0;
       io.begin?.(deliveryChoices.find((choice) => choice.value === action)?.label ?? 'Fern Delivery');
       try {
-        if (!current && !['6', '8'].includes(action)) throw new Error('Set up this project first: choose Project setup.');
+        if (!current && !['6', '8', '9'].includes(action)) throw new Error('Set up this project first: choose Project setup.');
         switch (action) {
+          case '9': await draftSpec(); break;
           case '1': {
             const plan = await selectPlan(current!.plans);
             if (!plan) break;

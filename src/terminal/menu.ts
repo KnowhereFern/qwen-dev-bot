@@ -25,6 +25,7 @@ export const deliveryChoices: TerminalChoice[] = [
   { value: '6', label: 'Project setup', description: 'Set up a folder, connect GitHub or switch projects.' },
   { value: '7', label: 'Start / resume delivery', description: 'Start approved work. You will confirm before execution begins.' },
   { value: '8', label: 'Model connection', description: 'Connect your provider, save a key privately or test the connection.' },
+  { value: '9', label: 'Draft spec from idea/document', description: 'Let the harness turn your input into a private proposal. No Git setup or approval required.' },
   { value: '0', label: 'Exit', description: 'Close this console. Any running background worker keeps running.' },
 ];
 

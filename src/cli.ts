@@ -23,6 +23,9 @@ import { ProjectRegistry } from './registry.js';
 import { RepositoryAssessor } from './program/repository-assessor.js';
 import { buildEvidenceReport, formatEvidenceReport } from './program/evidence-report.js';
 import { runInteractiveTerminal } from './terminal/interactive.js';
+import { readIntakeSource } from './intake/source.js';
+import { intakeConnection } from './intake/connection.js';
+import { draftSpecification, loadSpecification, renderSpecification, specificationDocument } from './intake/specification.js';
 
 const VERSION = '1.0.0-rc.48';
 
@@ -51,6 +54,25 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     case 'ui':
       if (json) throw new Error('Interactive mode does not support --json. Use status or plan-status --json instead.');
       return runInteractiveTerminal({ root: firstPositional(args) });
+    case 'spec': {
+      if (hasFlag(args, '--approve')) throw new Error('Specification intake cannot approve or start delivery');
+      const source = await readIntakeSource(root, { input: strictValueOf(args, '--input'), idea: strictValueOf(args, '--idea'), pages: strictValueOf(args, '--pages') });
+      const config = existsSync(path.join(root, PROJECT_CONFIG_PATH)) ? loadProjectConfig(root) : intakeConnection(root);
+      const credential = resolveQwenCredential(config);
+      if (credential) assertQwenCredentialCompatibility(config, credential);
+      const model = new QwenApiClient({ model: config.qwen.model, baseUrl: config.qwen.baseUrl, credentialEnvKey: config.qwen.credentialEnvKey, apiKey: credential?.apiKey, timeoutMs: 9 * 60_000, maxAttempts: 1 });
+      console.error(`Read ${source.sections.length} source section(s). Draft only; no delivery is authorized.`);
+      const result = await draftSpecification({ root, source, model, modelName: config.qwen.model, baseUrl: config.qwen.baseUrl, onProgress: (message) => console.error(message) });
+      console.log(json ? JSON.stringify(result, null, 2) : `${result.markdown}\nPrivate draft: ${result.documentFile}\nPrivate record: ${result.file}\n${result.reused ? 'Reused the existing draft for this exact input.' : 'Draft saved.'} No issues, approvals, or execution were created.\nReview with: fern-harness spec-status ${root} --spec ${result.record.id}`);
+      return 0;
+    }
+    case 'spec-status': {
+      const id = strictValueOf(args, '--spec');
+      if (!id) throw new Error('spec-status requires --spec ID');
+      const record = loadSpecification(root, id);
+      console.log(json ? JSON.stringify(record, null, 2) : renderSpecification(record));
+      return 0;
+    }
     case 'init': {
       const result = await installProject({
         root,
@@ -248,13 +270,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     case 'plan': {
       const config = loadProjectConfig(root);
       const requirementsPath = valueOf(args, '--requirements');
-      if (!requirementsPath) throw new Error('plan requires --requirements FILE');
+      const specId = strictValueOf(args, '--spec');
+      if (Boolean(requirementsPath) === Boolean(specId)) throw new Error('plan requires exactly one --requirements FILE or --spec ID');
       const maxStories = integerValue(args, '--max-stories') ?? DEFAULT_MAX_PORTFOLIO_STORIES;
       const credential = resolveQwenCredential(config);
       if (credential) assertQwenCredentialCompatibility(config, credential);
       const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
       try {
-        const document = readRequirementsDocument(config.project.root, requirementsPath);
+        const document = specId ? specificationDocument(loadSpecification(root, specId)) : readRequirementsDocument(config.project.root, requirementsPath!);
         const github = new OctokitControlPlane({
           repo: config.project.githubRepo,
           token: await resolveGitHubToken(root),
@@ -316,9 +339,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const config = loadProjectConfig(root);
       const planId = valueOf(args, '--plan');
       const requirementsPath = valueOf(args, '--requirements');
-      if (!planId || !requirementsPath) throw new Error('plan-redraft requires --plan PLAN_ID --requirements FILE');
+      const specId = strictValueOf(args, '--spec');
+      if (!planId || Boolean(requirementsPath) === Boolean(specId)) throw new Error('plan-redraft requires --plan PLAN_ID and exactly one --requirements FILE or --spec ID');
       const feedbackPath = valueOf(args, '--feedback');
       const assessmentId = valueOf(args, '--assessment');
+      if (assessmentId && specId) throw new Error('Saved specifications require a fresh assessment; omit --assessment when redrafting with --spec');
       if (assessmentId && !feedbackPath) throw new Error('plan-redraft --assessment requires --feedback FILE');
       const reviseObjective = hasFlag(args, '--revise-objective');
       const expected = approvalExpectation(args);
@@ -327,7 +352,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       if (credential) assertQwenCredentialCompatibility(config, credential);
       const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
       try {
-        const document = readRequirementsDocument(config.project.root, requirementsPath);
+        const document = specId ? specificationDocument(loadSpecification(root, specId)) : readRequirementsDocument(config.project.root, requirementsPath!);
         const feedback = feedbackPath ? readRequirementsDocument(config.project.root, feedbackPath) : null;
         const github = new OctokitControlPlane({
           repo: config.project.githubRepo,
@@ -586,7 +611,7 @@ function formatControllerReleases(releases: ControllerRelease[]): string {
 }
 
 function firstPositional(args: string[]): string | undefined {
-  const valueOptions = new Set(['--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment', '--additional-attempts', '--authorization', '--authorized-by', '--reason']);
+  const valueOptions = new Set(['--input', '--idea', '--pages', '--spec', '--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment', '--additional-attempts', '--authorization', '--authorized-by', '--reason']);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] as string;
     if (valueOptions.has(arg)) {
@@ -612,6 +637,13 @@ function toggleFlagValue(args: string[], enabledFlag: string, disabledFlag: stri
 function valueOf(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
+}
+
+function strictValueOf(args: string[], flag: string): string | undefined {
+  if (!args.includes(flag)) return undefined;
+  const value = valueOf(args, flag);
+  if (!value?.trim() || value.startsWith('-')) throw new Error(`${flag} requires a value (use ./ before a filename beginning with a dash)`);
+  return value;
 }
 
 function integerValue(args: string[], flag: string): number | undefined {
@@ -660,6 +692,8 @@ Commands:
   logs [--lines N]     Tail the redacted append-only event ledger
   reward               Show the latest stored universal reward scorecard
   community [--force]  Scan allowlisted sources and create review-only issues
+  spec                 Turn an idea or document into a private proposed specification (no setup needed)
+  spec-status          Read a saved specification; never approves or starts delivery
   plan                 Turn a requirements file into a review-only delivery graph
   plan-redraft         Replace an unapproved draft while retaining its superseded history
   plan-approve         Approve one plan and create executable normalized tasks
@@ -690,9 +724,11 @@ Reward options:
   --task TASK_ID --issue NUMBER --json
 
 Plan options:
+  spec PROJECT (--input FILE | --idea TEXT) [--pages 1-4,7] [--json]
+  spec-status PROJECT --spec ID [--json]
   interactive [PROJECT] (also the default when launched without arguments in a terminal)
-  plan PROJECT --requirements FILE [--max-stories N] [--approve] [--json]
-  plan-redraft PROJECT --plan PLAN_ID --requirements FILE [--feedback FILE] [--assessment ID] [--max-stories N] [--revise-objective --revision N --hash HASH] [--json]
+  plan PROJECT (--requirements FILE | --spec ID) [--max-stories N] [--approve] [--json]
+  plan-redraft PROJECT --plan PLAN_ID (--requirements FILE | --spec ID) [--feedback FILE] [--assessment ID] [--max-stories N] [--revise-objective --revision N --hash HASH] [--json]
   plan-approve PROJECT --plan PLAN_ID [--revision N --hash HASH] [--json]
   plan-status PROJECT [--plan PLAN_ID] [--json]
   plan-reassess PROJECT --plan PLAN_ID [--json]

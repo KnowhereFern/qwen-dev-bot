@@ -131,7 +131,7 @@ describe('keyboard menu', () => {
     } finally { vi.useRealTimers(); }
   });
   it.each([5, 8, 12, 24, 40])('keeps selection and controls visible in %i rows', (rows) => {
-    const rendered = renderMenu(menu, 8, { columns: 80, rows, color: false });
+    const rendered = renderMenu(menu, deliveryChoices.findIndex((choice) => choice.value === '0'), { columns: 80, rows, color: false });
     expect(rendered.split('\n').length).toBeLessThanOrEqual(rows - 1);
     expect(rendered).toContain('›  0  Exit');
     expect(rendered).toContain('Esc back');

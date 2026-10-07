@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Let the harness draft a private, source-grounded product specification from an idea or PDF before Git/GitHub setup; keep assumptions, acceptance criteria and unproven claims explicit.
+- Add numbered spec drafting/review and direct saved-spec planning, without manual requirements-file preparation or implicit execution approval.
 - Include observed manual product work and explicit retry authorizations in evidence exports, scoped to the selected program and its task lineage.
 
 ## [1.0.0-rc.48] - 2026-10-07

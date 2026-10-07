@@ -64,15 +64,15 @@ export function homeScreen(options: {
   const deployment = snapshot?.deployments?.filter((item) => !plan || item.planId === plan.id)
     .sort((a, b) => b.updatedAt - a.updatedAt)[0];
   const initialReview = plan && plan.approvedAt === null && ['draft', 'awaiting_initial_approval'].includes(plan.status);
-  const status = !snapshot ? 'Set up this project' : plan ? planStatusLabel(plan.status) : 'No delivery plan yet';
-  const explanation = !snapshot ? 'Connect an existing repository and configure this folder.'
+  const status = !snapshot ? 'Start with your idea or document' : plan ? planStatusLabel(plan.status) : 'No delivery plan yet';
+  const explanation = !snapshot ? 'Draft a private spec first (9), or connect an existing repository (6).'
     : initialReview ? 'The plan is a proposal. It does not authorize work yet.'
     : plan?.status === 'awaiting_material_approval' ? 'Review the proposed change before delivery can continue.'
     : plan?.status === 'blocked' || plan?.status === 'paused' ? 'Check progress and logs for the reason and recovery options.'
     : plan?.status === 'delivered' || plan?.status === 'maintaining' ? 'The initial acceptance audit passed. Maintenance follows useful evidence.'
     : plan ? 'Plan approval, completed tasks, and verified delivery are different things.'
     : 'Give the harness an objective; it will propose a plan for your review.';
-  const next = !snapshot ? '6 — Set up this project' : connection === 'missing' ? '8 — Connect your AI model'
+  const next = !snapshot ? '9 — Draft a spec from your input' : connection === 'missing' ? '8 — Connect your AI model'
     : !plan ? '2 — Create a delivery plan' : pending.length ? '1 — Review the delivery plan'
     : connection !== 'verified' ? '8 — Test the AI connection'
     : worker === 'inactive' && unfinished.length ? '7 — Start or resume approved delivery' : '3 — Watch delivery progress';
@@ -84,7 +84,9 @@ export function homeScreen(options: {
   line(explanation);
   line('');
   line(`Plan     ${plan ? `${planSize(plan)} · version ${plan.revision ?? 1}${initialReview ? ' · not started' : ` · stage ${plan.currentWave ?? 1}`}` : 'Not created yet'}`);
-  line(`AI       ${snapshot?.config.qwen.model ?? 'Not configured'} · ${connection === 'verified' ? 'Connection: live verified this session' : connection === 'found' ? 'Key found · not tested this session (8)' : 'Key missing · connect your model (8)'}`);
+  line(snapshot
+    ? `AI       ${snapshot.config.qwen.model} · ${connection === 'verified' ? 'Connection: live verified this session' : connection === 'found' ? 'Key found · not tested this session (8)' : 'Key missing · connect your model (8)'}`
+    : 'AI       Spec intake uses your saved Qwen connection · checked when you generate');
   line(`Work     ${initialReview && !tasks.length ? 'Not scheduled until you approve the plan' : `${tasks.filter((task) => task.state === 'done').length} completed · ${unfinished.length} unfinished tasks`}`);
   line(`Service  ${worker === 'running' ? 'Shared background worker is running' : worker === 'inactive' ? 'Background worker is not running' : 'Background worker status is unknown'}`);
   line(`Staging  ${deploymentLabel(deployment)}`);
@@ -98,6 +100,7 @@ export function homeScreen(options: {
   choices('1  Review & approve plan', '2  Create or revise plan');
   choices('3  Watch progress & tasks', '4  Check readiness');
   line('7  Start or resume delivery');
+  line('9  Draft spec from idea/document');
   line('Project & tools', 'heading');
   choices('5  Staging, feedback, logs & proof', '6  Set up or switch project');
   choices('8  Connect or test AI', '0  Exit');

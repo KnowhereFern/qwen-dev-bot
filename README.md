@@ -4,6 +4,8 @@ A software product designed and built by Fern. It uses Qwen Code and `qwen3.8-ma
 
 **Release status:** `v1.0.0-rc.48`. The objective-delivery, staging, and controller-evolution paths are implemented and covered by deterministic tests. Stable `v1.0.0` remains gated on the measured Festival SOS run, the seven-day observation period, and a demonstrated controller promotion and rollback.
 
+**Source checkout preview:** [Idea/document intake](docs/spec-intake.md) now lets the harness write a private proposed specification before Git or GitHub setup. Use interactive option **9**, or `spec PROJECT --input FILE`. Drafting never approves or starts implementation. This addition is not yet part of the installed RC48 runtime.
+
 See [live test readiness](docs/live-test-readiness.md) for the current machine and end-to-end proof status.
 
 This is the canonical harness source and installer repository. For a blank application repository, use the separate [Harness Starter](https://github.com/KnowhereFern/qwen-harness-starter) template and run `node setup.mjs`. Each target project receives a small tracked control plane under `.qwen-harness/`, `.qwen/`, and `.github/`; project-specific gates, reward rubrics, protected paths, sources, and merge policy live in `.qwen-harness/project.yml`.

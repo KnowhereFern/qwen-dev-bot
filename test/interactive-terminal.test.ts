@@ -51,6 +51,88 @@ async function session(current: TerminalSnapshot, answers: Array<string | null>,
 }
 
 describe('interactive terminal', () => {
+  it('reviews a saved specification before setup without an approval action', async () => {
+    const root = makeTmp('terminal-saved-spec');
+    const answers = ['9', '3', '1', '0'];
+    const calls: string[][] = [];
+    await runInteractiveTerminal({ root, snapshot: () => { throw new Error('Not configured'); },
+      specifications: () => [{ id: 'spec_test', createdAt: 'today', draft: { title: 'Memory engine' } }],
+      projects: () => [], credential: () => null, workerStatus: async () => 'inactive',
+      execute: async (args) => { calls.push(args); return 0; },
+      io: { question: async () => answers.shift() ?? null, print() {}, close() {} },
+    });
+    expect(calls).toEqual([['spec-status', root, '--spec', 'spec_test']]);
+  });
+
+  it('creates a program from a saved specification without a handwritten requirements file', async () => {
+    const current = fixture(); current.plans = [];
+    const answers = ['2', '1', '1', '', '1', '0'];
+    const calls: string[][] = [];
+    await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current,
+      specifications: () => [{ id: 'spec_test', createdAt: 'today', draft: { title: 'Memory engine' } }],
+      credential: () => null, workerStatus: async () => 'inactive',
+      execute: async (args) => { calls.push(args); return 0; },
+      io: { question: async () => answers.shift() ?? null, print() {}, close() {} },
+    });
+    expect(calls).toEqual([['plan', current.config.project.root, '--spec', 'spec_test', '--max-stories', '25']]);
+  });
+
+  it('redrafts a specification-backed plan using its saved source', async () => {
+    const current = fixture(); current.plans[0].sourcePath = 'harness-spec:spec_test';
+    const answers = ['2', '1', 'feedback.md', '', '1', '0'];
+    const calls: string[][] = [];
+    await runInteractiveTerminal({ root: current.config.project.root, snapshot: () => current,
+      specifications: () => [], credential: () => null, workerStatus: async () => 'inactive',
+      execute: async (args) => { calls.push(args); return 0; },
+      io: { question: async () => answers.shift() ?? null, print() {}, close() {} },
+    });
+    expect(calls).toEqual([['plan-redraft', current.config.project.root, '--plan', 'plan-demo', '--spec', 'spec_test', '--feedback', 'feedback.md', '--max-stories', '25']]);
+  });
+
+  it('drafts a private spec from a document before project setup without approving delivery', async () => {
+    const root = makeTmp('terminal-spec');
+    const answers = ['9', '1', 'idea.pdf', '1-4,6', '1', '0'];
+    const calls: string[][] = [];
+    await runInteractiveTerminal({ root, snapshot: () => { throw new Error('Not configured'); },
+      projects: () => [], credential: () => null, workerStatus: async () => 'inactive',
+      execute: async (args) => { calls.push(args); return 0; },
+      io: { question: async () => answers.shift() ?? null, print() {}, close() {} },
+    });
+    expect(calls).toEqual([['spec', root, '--input', 'idea.pdf', '--pages', '1-4,6']]);
+    expect(homeScreen({ root, connection: 'missing', worker: 'inactive' }).some((line) => line.text.includes('Next: 9'))).toBe(true);
+  });
+
+  it('drafts an idea using numbered menus and defaults new folders to spec intake', async () => {
+    const root = makeTmp('terminal-idea');
+    const picks = ['9', '2', '1', '0', '0'];
+    const calls: string[][] = [];
+    const menus: import('../src/terminal/menu.js').TerminalMenu[] = [];
+    await runInteractiveTerminal({ root, snapshot: () => { throw new Error('Not configured'); },
+      projects: () => [], credential: () => null, workerStatus: async () => 'inactive',
+      execute: async (args) => { calls.push(args); return 0; },
+      io: { select: async (menu) => { menus.push(menu); return picks.shift() ?? null; },
+        question: async () => 'A reusable memory engine', print() {}, close() {} },
+    });
+    expect(calls).toEqual([['spec', root, '--idea', 'A reusable memory engine']]);
+    expect(menus[0].initial).toBe('9');
+  });
+
+  it.each([
+    ['9', '0', '0'],
+    ['9', '1', '', '0'],
+    ['9', '1', 'idea.pdf', '0', '0'],
+    ['9', '2', 'An idea', '0', '0'],
+    ['9', '1', '--approve', '0'],
+  ])('does not execute cancelled or flag-like spec input: %j', async (...answers) => {
+    const execute = vi.fn(async () => 0);
+    await runInteractiveTerminal({ root: makeTmp('terminal-spec-cancel'),
+      snapshot: () => { throw new Error('Not configured'); }, projects: () => [],
+      credential: () => null, workerStatus: async () => 'inactive', execute,
+      io: { question: async () => answers.shift() ?? null, print() {}, close() {} },
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('offers a numbered dashboard return after a failed command without a text prompt', async () => {
     const current = fixture(); const picks = ['4', '0', '0'];
     const menus: import('../src/terminal/menu.js').TerminalMenu[] = [];
