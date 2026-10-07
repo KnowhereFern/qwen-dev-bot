@@ -64,7 +64,7 @@ export async function createProductionHarness(
     await git.assertReady();
     const rewards = new UniversalRewardEngine([
       new ExecutionEvaluator(),
-      new QwenRubricEvaluator(qwenApi),
+      new QwenRubricEvaluator(qwenApi, credential),
       new QwenAgenticEvaluator(credential),
       new QwenVisualEvaluator(qwenApi),
     ]);

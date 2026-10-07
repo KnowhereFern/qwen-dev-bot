@@ -97,7 +97,7 @@ describe('Qwen extension packaging', () => {
     expect(objective).toContain('is not a successful handoff');
   });
 
-  it('replaces a completed Goal for verifier-driven repair while retaining the session', () => {
+  it('starts a fresh Goal for verifier-driven repair while retaining the task contract', () => {
     const task = {
       id: 'task-repair',
       issueNumber: 8,
