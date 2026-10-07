@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Include observed manual product work and explicit retry authorizations in evidence exports, scoped to the selected program and its task lineage.
+
 ## [1.0.0-rc.48] - 2026-10-07
 
 - Let empty-diff acceptance reviews inspect existing source and tests in the exact candidate checkout, without weakening required evidence or independent review.

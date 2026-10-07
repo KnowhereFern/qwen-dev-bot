@@ -11,6 +11,12 @@ describe('program evidence report', () => {
     const repair = store.upsert({ issueNumber: 20, title: 'staging repair', state: 'done', spec: spec('https://github.test/issues/19') });
     store.recordEvent('staging.repair_created', null, { planId: 'plan_1', issueNumber: 19 });
     store.recordEvent('program.external_commit_observed', null, { planId: 'plan_1', commitSha: 'b'.repeat(40) });
+    store.recordEvent('program.manual_intervention_observed', null, { planId: 'plan_1', autonomousDeliveryCredit: false });
+    store.recordEvent('task.recovery_authorized', primary.id, { additionalAttempts: 3 });
+    store.recordEvent('program.manual_intervention_observed', null, { planId: 'unrelated_plan' });
+    const unrelated = store.upsert({ issueNumber: 30, title: 'unrelated', state: 'failed', spec: spec('https://github.test/issues/99') });
+    store.recordEvent('task.recovery_authorized', unrelated.id, { additionalAttempts: 3 });
+    store.recordEvent('controller.promoted', null, { version: 'fixture-release' });
     const plan: PortfolioPlan = {
       id: 'plan_1', projectId: store.projectId, sourcePath: 'PROJECT.md', contentHash: 'objective', sourceContent: 'Build it',
       title: 'Program', objective: 'Build it', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [],
@@ -24,9 +30,15 @@ describe('program evidence report', () => {
       createdAt: 1_000, updatedAt: 2_000, approvedAt: 1_100, deliveredAt: 2_000,
     };
 
+    const before = store.list();
     const report = buildEvidenceReport(store, plan, 3_000);
+    expect(store.list()).toEqual(before);
     expect(report.tasks.map((task) => task.id)).toEqual(expect.arrayContaining([primary.id, repair.id]));
-    expect(report.metrics).toMatchObject({ verifiedCapabilities: 1, interventionCount: 1, elapsedMs: 1_000 });
+    expect(report.metrics).toMatchObject({ verifiedCapabilities: 1, interventionCount: 4, elapsedMs: 1_000 });
+    expect(report.interventions.map((event) => event.type)).toEqual([
+      'program.external_commit_observed', 'program.manual_intervention_observed', 'task.recovery_authorized', 'controller.promoted',
+    ]);
+    expect(report.interventions[1]?.payload.autonomousDeliveryCredit).toBe(false);
     expect(report.metrics.waitingMs).toBe(report.metrics.elapsedMs - report.metrics.activeMs);
     store.close();
   });

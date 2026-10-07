@@ -78,12 +78,16 @@ export function buildEvidenceReport(store: PersistentTaskStore, plan: PortfolioP
       'program.approved',
       'portfolio.redrafted',
       'program.external_commit_observed',
+      'program.manual_intervention_observed',
+      'task.recovery_authorized',
       'program.revised',
       'program.objective_accepted',
       'evolution.signal_decided',
       'controller.promoted',
       'controller.rolled_back',
-    ].includes(event.type),
+    ].includes(event.type) &&
+    (event.payload.planId === undefined || event.payload.planId === plan.id) &&
+    (event.taskId === null || taskIds.has(event.taskId)),
   );
   const controllerReleases = mergeControllerHistory(store.listControllerReleases(), readGlobalControllerHistory());
   const elapsedMs = Math.max(0, (plan.deliveredAt ?? now) - plan.createdAt);
