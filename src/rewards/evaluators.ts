@@ -5,6 +5,7 @@ import type { RewardCriterionConfig, RewardEvidence } from '../core/types.js';
 import { redactText } from '../core/ledger.js';
 import { QwenApiClient } from '../qwen/qwen-api.js';
 import { QwenStructuredResultCollector } from '../qwen/structured-result.js';
+import { createQwenModelSelection } from '../qwen/model-selection.js';
 import {
   qwenEnvironment,
   qwenMcpArgs,
@@ -128,6 +129,11 @@ async function evaluateRepositoryCriterion(
     renderReviewInput(criterion, context),
   ].join('\n\n');
   const outputStream = new QwenStructuredResultCollector();
+  const selection = createQwenModelSelection({
+    model: context.config.qwen.model,
+    baseUrl: context.config.qwen.baseUrl,
+    envKey: context.config.qwen.credentialEnvKey,
+  });
   const receipt = await runProcess({
     command: context.config.qwen.command,
     args: [
@@ -162,11 +168,12 @@ async function evaluateRepositoryCriterion(
     onStdout: (chunk) => outputStream.push(chunk),
     env: {
       ...qwenEnvironment(process.env, credential),
+      ...selection.env,
       QWEN_SANDBOX: 'true',
       QWEN_CODE_UNATTENDED_RETRY: '1',
     },
-  });
-  if (receipt.exitCode !== 0 || receipt.aborted || receipt.timedOut) throw new Error(`Qwen independent review failed: ${receipt.stderr.slice(-1_000)}`);
+  }).finally(() => selection.cleanup());
+  if (receipt.exitCode !== 0 || receipt.aborted || receipt.timedOut) throw new Error(`Qwen independent review failed (exit=${String(receipt.exitCode)}, aborted=${receipt.aborted}, timedOut=${receipt.timedOut}): ${redactText(receipt.stderr).slice(-1_000)}`);
   const result = outputStream.finish();
   let output: JudgeOutput;
   try {

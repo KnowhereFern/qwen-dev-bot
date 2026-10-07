@@ -3,6 +3,7 @@ import type { ProjectConfig, TaskRecord, TaskSpec } from '../core/types.js';
 import { redactText } from '../core/ledger.js';
 import { formatProcessFailure, runProcess } from '../runtime/safe-process.js';
 import { qwenWriterGuardEnvironment } from './writer-guard.js';
+import { createQwenModelSelection } from './model-selection.js';
 import {
   qwenEnvironment,
   qwenImplementationToolArgs,
@@ -142,6 +143,11 @@ export class QwenCodeExecutor implements QwenExecutor {
       input.onHeartbeat?.();
     };
 
+    const selection = createQwenModelSelection({
+      model: this.config.qwen.model,
+      baseUrl: this.config.qwen.baseUrl,
+      envKey: this.config.qwen.credentialEnvKey,
+    });
     const receipt = await runProcess({
       command: this.config.qwen.command,
       args,
@@ -152,6 +158,7 @@ export class QwenCodeExecutor implements QwenExecutor {
       onStdout: consume,
       env: {
         ...qwenEnvironment(process.env, this.credential),
+        ...selection.env,
         ...writerEnvironment,
         QWEN_CODE_UNATTENDED_RETRY: '1',
         ...qwenWorkflowEnvironment({
@@ -164,7 +171,7 @@ export class QwenCodeExecutor implements QwenExecutor {
         }),
         QWEN_SANDBOX: this.config.qwen.sandbox ? 'true' : 'false',
       },
-    });
+    }).finally(() => selection.cleanup());
     if (buffered.trim()) {
       const parsed = parseEvent(buffered);
       if (parsed) acceptEvent(parsed);

@@ -10,6 +10,7 @@ All notable changes to this project are documented here.
 - Start verifier-repair conversations fresh so synthetic cancellation messages from an earlier runtime abort cannot masquerade as new user instructions; retain saved sessions for ordinary continuation.
 - Preserve custom review credentials, task contracts, worktrees, retry ceilings, and failure history.
 - Supply bounded redacted check output and frozen constraints to reviewers, and disable implicit project instructions in repository reviews.
+- Pin the configured model, endpoint and credential variable together in private invocation settings so duplicate model names cannot select another provider route; leave persistent settings unchanged.
 
 ## [1.0.0-rc.47] - 2026-10-06
 
