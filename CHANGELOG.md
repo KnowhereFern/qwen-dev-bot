@@ -9,6 +9,7 @@ All notable changes to this project are documented here.
 - Let empty-diff acceptance reviews inspect existing source and tests in the exact candidate checkout, without weakening required evidence or independent review.
 - Start verifier-repair conversations fresh so synthetic cancellation messages from an earlier runtime abort cannot masquerade as new user instructions; retain saved sessions for ordinary continuation.
 - Preserve custom review credentials, task contracts, worktrees, retry ceilings, and failure history.
+- Supply bounded redacted check output and frozen constraints to reviewers, and disable implicit project instructions in repository reviews.
 
 ## [1.0.0-rc.47] - 2026-10-06
 

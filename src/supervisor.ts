@@ -458,7 +458,7 @@ export class HarnessSupervisor {
   private releaseInterruptedTask(taskId: string): void {
     const current = this.store.get(taskId);
     if (!['leased', 'active', 'verifying'].includes(current.state)) return;
-    const message = 'Worker shutdown interrupted the prior attempt; inspect the existing worktree and continue from its saved Qwen session.';
+    const message = 'Worker shutdown interrupted the prior attempt; inspect and continue from the existing worktree. The controller selects the appropriate session for recovery.';
     const released = this.store.transition(taskId, 'ready', {
       leaseOwner: null,
       leaseExpiresAt: null,

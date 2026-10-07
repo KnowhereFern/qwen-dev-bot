@@ -14,7 +14,7 @@ function fixture() {
   const config = defaultProjectConfig(worktree, 'fixture', 'owner/repo');
   const context = {
     config, worktree, commitSha: 'exact-candidate-sha', changedFiles: [], diff: '', gateResults: [],
-    task: { title: 'Verify checkout', spec: { goal: 'Verify existing behavior', acceptanceCriteria: ['Reject live keys'], technologyDecisions: [], deploymentDecisions: [] } },
+    task: { title: 'Verify checkout', spec: { goal: 'Verify existing behavior', acceptanceCriteria: ['Reject live keys'], constraints: ['No code changes; verification only'], rollback: 'No changes made', technologyDecisions: [], deploymentDecisions: [] } },
   } as unknown as RewardContext;
   const completeJson = vi.fn().mockResolvedValue({ value: verdict, raw: JSON.stringify(verdict), usage: {} });
   const api = { model: config.qwen.model, completeJson } as unknown as QwenApiClient;
@@ -46,10 +46,36 @@ describe('repository-aware empty-diff rubric', () => {
     expect(prompt).toContain(`Criterion: ${criterion.id}`);
     expect(prompt).toContain(`Commit: ${context.commitSha}`);
     expect(prompt).toContain('Reject live keys');
+    expect(prompt).toContain('No code changes; verification only');
+    expect(prompt).toContain('Frozen rollback: No changes made');
     expect(prompt).toContain('Missing required behavioral evidence must remain a blocking finding');
     expect(prompt).toContain('Do not invent a change requirement or waive an explicit requirement');
     expect(options.args).toContain('--sandbox');
+    expect(options.args).toContain('--safe-mode');
     expect(options.args).toContain('agent,workflow,shell,write,edit');
+    expect(options.args).toContain('create_sub_session,exec,run_shell_command,write_file,notebook_edit,web_fetch,web_search,exit_plan_mode,save_memory,skill');
+  });
+
+  it('supplies redacted, bounded gate excerpts without disguising failed or skipped gates', async () => {
+    const { context, criterion, completeJson, evaluator } = fixture();
+    const secret = `sk-${'a'.repeat(32)}`;
+    context.changedFiles = ['source.ts'];
+    context.diff = '+ change';
+    context.gateResults = Array.from({ length: 8 }, (_, index) => ({
+      id: `gate-${index}`, kind: 'unit', command: ['fixture-check'], required: true, applicable: index !== 1,
+      ok: index !== 0, exitCode: index === 0 ? 1 : 0, durationMs: 1,
+      stdout: `${'a'.repeat(3_000)} ${secret} verified 26 tests`, stderr: `${'b'.repeat(3_000)} failing detail`, evidenceHash: `hash-${index}`,
+    }));
+    await evaluator.evaluate(criterion, context);
+    const prompt = completeJson.mock.calls[0]![0].user as string;
+    expect(prompt).not.toContain(secret);
+    expect(prompt).toContain('[REDACTED] verified 26 tests');
+    expect(prompt).toContain('gate-0: FAIL; required=true; exit=1 (hash-0)');
+    expect(prompt).toContain('gate-1: NOT APPLICABLE');
+    expect(prompt).toContain('[TRUNCATED:');
+    expect(prompt).toContain('failing detail');
+    expect(prompt).toContain('gate-7: PASS');
+    expect(prompt.length).toBeLessThan(19_000);
   });
 
   it('preserves negative repository verdicts instead of treating no changes as success', async () => {
