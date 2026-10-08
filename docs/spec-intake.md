@@ -32,6 +32,8 @@ Review the draft and resolve consequential product decisions. Then configure the
 
 For a new repository, the draft can propose the stack and scaffolding before product tests exist. Configure required product-check commands for that proposed stack before approving the program. The harness creates their implementation in its first delivery work; an empty or security-only gate list cannot authorize a new program. A passing setup workflow alone is not product verification.
 
+In program mode, the worker waits for initial program approval before ingesting executable tasks or running repairs. Expected CI failures before the first product implementation are not permission to bypass that approval. Existing issue-based projects with program mode disabled retain their issue approval workflow.
+
 ```sh
 fern-harness plan /path/to/project --spec spec_ID
 ```

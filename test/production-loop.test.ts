@@ -1,6 +1,6 @@
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
 import { PersistentTaskStore } from '../src/core/persistent-store.js';
 import type { GateDefinition, GateResult, RewardCriterionConfig, TaskSpec } from '../src/core/types.js';
@@ -238,6 +238,53 @@ class MockGitHub implements GitHubControl {
 }
 
 describe('production supervisor trace', () => {
+  it.each(['no-plan', 'draft', 'active-without-approval'] as const)('blocks every execution path until initial program approval: %s', async (scenario) => {
+    const root = makeTmp('approval-boundary-root');
+    const state = makeTmp('approval-boundary-state');
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('bot');
+    config.intake.autoPromoteSelfRepair = true;
+    const store = new PersistentTaskStore('approval-boundary', state);
+    const github = new MockGitHub();
+    const repair = github.issues.get(1)!;
+    repair.author = 'bot';
+    repair.labels = ['self-repair', config.intake.approvalLabel];
+    const qwen = new MockQwenExecutor();
+    const normalizer = new MockNormalizer();
+    const execute = vi.spyOn(qwen, 'execute');
+    const normalize = vi.spyOn(normalizer, 'normalize');
+    try {
+      if (scenario !== 'no-plan') {
+        const created = await new PortfolioCoordinator(config, store, github).createDraft({
+          sourcePath: 'OBJECTIVE.md', content: 'Proposed objective', draft: {
+            title: 'Proposal', objective: 'Proposed objective', constraints: [], definitionOfDone: ['Tests pass'],
+            technologyDecisions: [], deploymentDecisions: [], stories: [],
+          },
+        });
+        if (scenario === 'active-without-approval') store.savePortfolioPlan({ ...created.plan, status: 'active', approvedAt: null });
+      }
+      // Recovery, normalized ready work and PR reconciliation cannot grandfather authority.
+      store.upsert({ issueNumber: 101, title: 'Previously normalized task', state: 'ready' });
+      const pending = store.upsert({ issueNumber: 102, title: 'Existing PR', state: 'pr_open' });
+      store.patch(pending.id, { prNumber: 99 });
+      const expired = store.upsert({ issueNumber: 103, title: 'Expired implementation', state: 'active' });
+      store.patch(expired.id, { leaseOwner: 'old-worker', leaseExpiresAt: 1 });
+      const before = store.list();
+      const issuesBefore = structuredClone([...github.issues.values()]);
+      const listIssues = vi.spyOn(github, 'listOpenIssues');
+      const supervisor = new HarnessSupervisor(config, store, github, new GitWorkspace(root, state, config), qwen,
+        normalizer, new GateRunner(), new UniversalRewardEngine([]), silentLogger, 'approval-worker');
+      expect(await supervisor.syncIntake()).toBe(0);
+      expect(await supervisor.tick()).toMatchObject({ action: 'awaiting-program-approval', ingested: 0, recovered: 0, processedTaskId: null });
+      expect(execute).not.toHaveBeenCalled();
+      expect(normalize).not.toHaveBeenCalled();
+      expect(listIssues).not.toHaveBeenCalled();
+      expect(store.list()).toEqual(before);
+      expect([...github.issues.values()]).toEqual(issuesBefore);
+    } finally { store.close(); }
+  });
+
   it.each(['verify', 'implement', 'review-failure', 'gate-failure', 'pending-ci', 'failed-ci', 'stale', 'altered-contract', 'operate', 'verified-operate', 'prepare-operate', 'advance-operate', 'review-failure-operate', 'closure-recovery'] as const)(
     'handles unchanged program work safely: %s', async (scenario) => {
       const { repo } = await createGitFixture();

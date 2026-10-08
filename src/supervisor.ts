@@ -41,6 +41,12 @@ export class HarnessSupervisor {
   ) {}
 
   async tick(signal?: AbortSignal): Promise<SupervisorTickResult> {
+    if (this.requiresInitialProgramApproval()) {
+      return {
+        community: { checked: 0, changed: 0, created: 0, skipped: 0, failed: 0 },
+        ingested: 0, recovered: 0, processedTaskId: null, action: 'awaiting-program-approval',
+      };
+    }
     try {
       const recovered = await this.recoverExpiredLeases();
       this.resumeProviderWaits();
@@ -94,6 +100,7 @@ export class HarnessSupervisor {
   }
 
   async syncIntake(): Promise<number> {
+    if (this.requiresInitialProgramApproval()) return 0;
     const issues = await this.github.listOpenIssues();
     let ingested = 0;
     for (const issue of issues) {
@@ -192,6 +199,14 @@ export class HarnessSupervisor {
       ingested += 1;
     }
     return ingested;
+  }
+
+  private requiresInitialProgramApproval(): boolean {
+    // Labels and pre-existing tasks are not a substitute for the initial program approval.
+    // Legacy issue-driven projects retain their explicit program.disabled behavior.
+    return this.config.program.enabled && !this.store.listPortfolioPlans().some((plan) =>
+      typeof plan.approvedAt === 'number' && Number.isFinite(plan.approvedAt) && plan.approvedAt > 0,
+    );
   }
 
   private async executeTask(claimed: TaskRecord, signal?: AbortSignal): Promise<void> {

@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.53] - 2026-10-07
+
+- Keep program-enabled projects idle until initial program approval, including automatic CI repairs and previously normalized work. An empty project's expected failing baseline cannot start product implementation through the repair path.
+- Give repository assessment one bounded model correction for invalid evidence or output shape without relaxing validation; distinguish saved specification references and approval prerequisites from repository files and product features.
+
 ## [1.0.0-rc.52] - 2026-10-07
 
 - Block new program approval when required product checks are absent; empty, optional-only and security-only checks cannot authorize delivery. Preserve existing active/completed program idempotence.
