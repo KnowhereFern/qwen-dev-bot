@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.54] - 2026-10-08
+
+- Stop sending a resolved writer-guard installation failure to the product agent as verifier feedback. Recheck the guard before filtering that exact error; preserve failed-session isolation, retry history, and all genuine verification failures.
+
 ## [1.0.0-rc.53] - 2026-10-07
 
 - Keep program-enabled projects idle until initial program approval, including automatic CI repairs and previously normalized work. An empty project's expected failing baseline cannot start product implementation through the repair path.
