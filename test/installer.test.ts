@@ -430,7 +430,7 @@ exit 1
     expect(existsSync(path.join(root, '.qwen-harness', 'install-receipt.json'))).toBe(true);
     expect(existsSync(path.join(state, 'controller', 'installed', harnessVersion, 'node_modules', 'qwen-dev-bot', 'bin', 'qwen-harness-launcher.mjs'))).toBe(true);
     expect(await uninstallProject(root)).toContain('unregistered project');
-  });
+  }, 15_000); // Exercises immutable runtime installation before the intentional link failure.
 
   it.skipIf(process.platform === 'win32')('refuses managed-path symlinks before writing template files', async () => {
     const root = makeTmp('installer-symlink-root');
