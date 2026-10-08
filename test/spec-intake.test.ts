@@ -164,6 +164,14 @@ describe('specification drafting', () => {
     await expect(draftSpecification({ root, stateRoot, source, model: { completeJson }, modelName: 'qwen3.8-max', baseUrl: 'https://example.com' })).rejects.toThrow('unknown source excerpt');
     expect(completeJson).toHaveBeenCalledTimes(3);
   });
+  it('repairs invalid product fields before entering citation-only recovery', async () => {
+    const root = temp(); const stateRoot = temp();
+    const bad = { ...fixture(), decisions: 'invalid' }; bad.requirements[0].evidence = [];
+    const completeJson = vi.fn().mockResolvedValueOnce({ value: bad }).mockResolvedValueOnce({ value: fixture() });
+    await draftSpecification({ root, stateRoot, source, model: { completeJson }, modelName: 'qwen3.8-max', baseUrl: 'https://example.com' });
+    expect(completeJson).toHaveBeenCalledTimes(2);
+    expect(completeJson.mock.calls[1][0].jsonSchema.name).toBe('input_specification');
+  });
   it('does not call the model or save a draft after cancellation', async () => {
     const root = temp(); const stateRoot = temp(); const { model, completeJson } = fakeModel();
     const controller = new AbortController(); controller.abort();

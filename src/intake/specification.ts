@@ -137,9 +137,8 @@ export function validateSpecification(value: unknown, source: IntakeSource): Spe
     }
     return { id, description: string(requirement.description), acceptanceCriteria: strings(requirement.acceptanceCriteria, 1), basis: requirement.basis, rationale: string(requirement.rationale), evidence };
   });
-  if (badEvidenceIds.size) throw new EvidenceValidationError([...badEvidenceIds], evidenceErrors);
   if (!Array.isArray(draft.decisions) || draft.decisions.length > 8) throw new Error('Limit product decisions to at most eight');
-  return {
+  const validated = {
     title: string(draft.title), objective: string(draft.objective), users: strings(draft.users, 1), requirements,
     assumptions: strings(draft.assumptions), decisions: draft.decisions.map((item) => {
       const decision = record(item);
@@ -147,6 +146,8 @@ export function validateSpecification(value: unknown, source: IntakeSource): Spe
     }),
     nonGoals: strings(draft.nonGoals), validation: strings(draft.validation, 1), unprovenClaims: strings(draft.unprovenClaims),
   };
+  if (badEvidenceIds.size) throw new EvidenceValidationError([...badEvidenceIds], evidenceErrors);
+  return validated;
 }
 
 export async function draftSpecification(options: {
