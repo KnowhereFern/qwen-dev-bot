@@ -141,9 +141,27 @@ describe('interactive terminal', () => {
     expect(menus[0].initial).toBe('9');
   });
 
+  it('returns from document input with 0 and defaults to reviewing the saved draft', async () => {
+    const root = makeTmp('terminal-spec-back');
+    const picks = ['9', '1', '3', '1', '0', '0'];
+    const menus: import('../src/terminal/menu.js').TerminalMenu[] = [];
+    const calls: string[][] = [];
+    const print = vi.fn();
+    await runInteractiveTerminal({ root, snapshot: () => { throw new Error('Not configured'); },
+      projects: () => [], specifications: () => [{ id: 'spec_saved', createdAt: 'today', draft: { title: 'Saved draft' } }],
+      credential: () => null, workerStatus: async () => 'inactive', execute: async (args) => { calls.push(args); return 0; },
+      io: { select: async (menu) => { menus.push(menu); return picks.shift() ?? null; }, question: async () => '0', print, close() {} },
+    });
+    expect(menus.filter((menu) => menu.title === 'Draft a product spec').map((menu) => menu.initial)).toEqual(['3', '3']);
+    expect(print).toHaveBeenCalledWith('0 · Back to spec menu (Enter also goes back)');
+    expect(calls).toEqual([['spec-status', root, '--spec', 'spec_saved']]);
+  });
+
   it.each([
     ['9', '0', '0'],
     ['9', '1', '', '0'],
+    ['9', '1', '0', '0', '0'],
+    ['9', '2', '0', '0', '0'],
     ['9', '1', 'idea.pdf', '0', '0'],
     ['9', '2', 'An idea', '0', '0'],
     ['9', '1', '--approve', '0'],

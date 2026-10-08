@@ -4,6 +4,8 @@ Fern can draft a product specification before a folder has Git, GitHub or harnes
 
 In the interactive console, choose **9 · Draft spec from idea/document**. Select a document or describe your idea. PDF page ranges let you exclude unrelated or sensitive pages before sending input to your configured provider.
 
+Type a menu number, then press Enter. If a draft already exists, **3 · Review a saved specification** is selected by default. In document/idea input, **0** followed by Enter (or an empty Enter) returns to the spec menu without generating anything.
+
 ```sh
 fern-harness spec /path/to/project --input idea.pdf --pages 1-8
 fern-harness spec /path/to/project --idea 'Build a tool that ...'

@@ -63,8 +63,9 @@ export function renderMenu(menu: TerminalMenu, selected: number, options: { colu
     ];
   }
   const title = wrap(`  ${menu.title}`)[0];
-  const hint = wrap(options.numberInput ? `  Number: ${options.numberInput} · Enter selects · Backspace edits`
-    : width < 50 ? '  ↑↓ move · Enter · Esc' : '  ↑ ↓ move · Enter open · number selection · Esc back')[0];
+  const validNumber = menu.choices.some((choice) => choice.value === options.numberInput);
+  const hint = wrap(options.numberInput ? `  Number: ${options.numberInput} · ${validNumber ? 'Enter selects' : 'Invalid choice'} · Backspace edits`
+    : width < 50 ? '  Number + Enter · Esc back' : '  ↑ ↓ move · number + Enter selects · Esc back')[0];
   const item = menu.choices[selected];
   const description = height >= 10 ? wrap(`  ${item?.description ?? 'Select an option to continue.'}`).slice(0, 2) : [];
   const menuRows = Math.min(menu.choices.length, Math.max(1, height - description.length - 4));
@@ -156,15 +157,17 @@ export async function selectTerminalMenu(menu: TerminalMenu, options: {
       }
       if (key.sequence && /^\d$/.test(key.sequence)) {
         const candidate = numberInput + key.sequence;
-        const matches = menu.choices.filter((choice) => choice.value.startsWith(candidate));
-        if (!matches.length) { numberInput = ''; draw(); return; }
         const exact = menu.choices.findIndex((choice) => choice.value === candidate);
-        if (exact >= 0 && matches.length === 1) { finish(candidate); return; }
         numberInput = candidate;
         if (exact >= 0) selected = exact;
         draw(); return;
       }
-      if (key.name === 'backspace') { numberInput = numberInput.slice(0, -1); draw(); return; }
+      if (key.name === 'backspace') {
+        numberInput = numberInput.slice(0, -1);
+        const exact = menu.choices.findIndex((choice) => choice.value === numberInput);
+        selected = exact >= 0 ? exact : Math.max(0, menu.choices.findIndex((choice) => choice.value === (menu.initial ?? '0')));
+        draw(); return;
+      }
       if (key.name === 'return' && numberInput) {
         if (menu.choices.some((choice) => choice.value === numberInput)) finish(numberInput);
         return;

@@ -253,8 +253,8 @@ export async function runInteractiveTerminal(options: {
     return selected;
   }
 
-  async function choose(title: string, labels: string[], prompt: string, context?: string): Promise<string | undefined> {
-    if (io.select) return (await io.select({ title, ...(context ? { header: [
+  async function choose(title: string, labels: string[], prompt: string, context?: string, initial?: string): Promise<string | undefined> {
+    if (io.select) return (await io.select({ title, initial, ...(context ? { header: [
       { text: `  Fern Delivery · ${title}`, tone: 'title' as const }, { text: '', tone: 'rule' as const },
       ...context.split('\n').map((text) => ({ text: `  ${text}` })),
     ] } : {}), choices: [
@@ -285,32 +285,38 @@ export async function runInteractiveTerminal(options: {
   }
 
   async function draftSpec(): Promise<void> {
-    const source = await choose('Draft a product spec', ['Use a document', 'Describe an idea', 'Review a saved specification'], 'Choose input: ',
-      'The harness writes a private proposal. This does not set up GitHub, approve a plan or start delivery.');
-    if (!source || source === '0') return;
-    if (source === '3') {
-      const id = await selectSpecification();
-      if (id) await execute(['spec-status', root!, '--spec', id]);
+    for (;;) {
+      const hasSaved = specifications(root!).length > 0;
+      const source = await choose('Draft a product spec', ['Use a document', 'Describe an idea', 'Review a saved specification'], 'Choose input: ',
+        hasSaved ? 'A saved draft is ready. Choose 3 to review it; no generation or approval is needed.' : 'The harness writes a private proposal. This does not set up GitHub, approve a plan or start delivery.', hasSaved ? '3' : '1');
+      if (!source || source === '0') return;
+      if (source === '3') {
+        const id = await selectSpecification();
+        if (id) await execute(['spec-status', root!, '--spec', id]);
+        return;
+      }
+      if (!['1', '2'].includes(source)) return;
+      io.print('0 · Back to spec menu (Enter also goes back)');
+      const input = (await io.question(source === '1'
+        ? 'Document inside this folder (0 or Enter goes back): '
+        : 'Describe what you want to build (0 or Enter goes back): '))?.trim();
+      if (input === undefined) return;
+      if (!input || input === '0') continue;
+      if (input.startsWith('-')) throw new Error('Input cannot start with a CLI flag. Use ./ before a filename starting with a dash.');
+      const args = ['spec', root!, source === '1' ? '--input' : '--idea', input];
+      if (source === '1' && /\.pdf$/i.test(input)) {
+        const pages = (await io.question('PDF pages to include (for example 1-4; Enter includes all; 0 cancels): '))?.trim();
+        if (pages === undefined || pages === '0') return;
+        if (pages) {
+          if (!/^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(pages)) throw new Error('Use page numbers or ranges, for example 1-4,6.');
+          args.push('--pages', pages);
+        }
+      }
+      if (!await confirm('Generate private spec', 'Sends the selected input to your configured model provider and saves a private draft. No delivery approval or GitHub publication.')) return;
+      await execute(args);
+      io.print('Spec drafted for review. No delivery plan was approved or started.');
       return;
     }
-    if (!['1', '2'].includes(source)) return;
-    const input = (await io.question(source === '1'
-      ? 'Document inside this folder (Enter cancels): '
-      : 'Describe what you want to build (Enter cancels): '))?.trim();
-    if (!input) return;
-    if (input.startsWith('-')) throw new Error('Input cannot start with a CLI flag. Use ./ before a filename starting with a dash.');
-    const args = ['spec', root!, source === '1' ? '--input' : '--idea', input];
-    if (source === '1' && /\.pdf$/i.test(input)) {
-      const pages = (await io.question('PDF pages to include (for example 1-4; Enter includes all; 0 cancels): '))?.trim();
-      if (pages === undefined || pages === '0') return;
-      if (pages) {
-        if (!/^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(pages)) throw new Error('Use page numbers or ranges, for example 1-4,6.');
-        args.push('--pages', pages);
-      }
-    }
-    if (!await confirm('Generate private spec', 'Sends the selected input to your configured model provider and saves a private draft. No delivery approval or GitHub publication.')) return;
-    await execute(args);
-    io.print('Spec drafted for review. No delivery plan was approved or started.');
   }
 
   async function redraft(plan?: PortfolioPlan): Promise<void> {

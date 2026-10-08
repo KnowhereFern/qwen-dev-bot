@@ -25,6 +25,8 @@ describe('keyboard menu', () => {
     expect(t.input.isRaw).toBe(true);
     expect(t.screen()).toContain('Number: 1');
     t.input.emit('keypress', '2', { name: '2', sequence: '2' });
+    expect(t.input.isRaw).toBe(true);
+    t.input.emit('keypress', '', { name: 'return' });
     expect(await result).toBe('12');
   });
   it('confirms an ambiguous single-digit choice with Enter', async () => {
@@ -164,10 +166,25 @@ describe('keyboard menu', () => {
     t.input.emit('keypress', '', { name });
     expect(await result).toBe('0');
   });
-  it('supports direct numeric shortcuts', async () => {
+  it('waits for Enter after a number instead of opening the next menu early', async () => {
     const t = terminal(); const result = t.select();
     t.input.emit('keypress', '8', { name: '8', sequence: '8' });
+    expect(t.input.isRaw).toBe(true);
+    expect(t.screen()).toContain('Number: 8');
+    t.input.emit('keypress', '', { name: 'return' });
     expect(await result).toBe('8');
+  });
+  it('does not execute the last valid selection after an invalid number', async () => {
+    const t = terminal(); const result = t.select({ title: 'Approve', initial: '0', choices: [{ value: '1', label: 'Approve' }, { value: '0', label: 'Cancel' }] });
+    for (const sequence of ['1', '2']) t.input.emit('keypress', sequence, { sequence });
+    t.input.emit('keypress', '', { name: 'return' });
+    expect(t.input.isRaw).toBe(true);
+    expect(t.screen()).toContain('Invalid choice');
+    t.input.emit('keypress', '', { name: 'backspace' });
+    t.input.emit('keypress', '', { name: 'backspace' });
+    t.input.emit('keypress', '0', { sequence: '0' });
+    t.input.emit('keypress', '', { name: 'return' });
+    expect(await result).toBe('0');
   });
   it.each(['c', 'd'])('interrupts on Ctrl-%s without executing a selection', async (name) => {
     const t = terminal(); const result = t.select();

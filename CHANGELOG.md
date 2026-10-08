@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.51] - 2026-10-07
+
+- Confirm numbered menu choices with Enter so a trailing Enter cannot accidentally select the next screen's default action; reject invalid numbers without activating a previous selection.
+- Add visible 0/Enter Back controls to document and idea input, and default spec intake to saved-draft review when one exists.
+
 ## [1.0.0-rc.50] - 2026-10-07
 
 - Repair PDF citations by having the model select exact source excerpts, preserving split words and hyphens without rewriting product requirements or accepting fabricated quotes.
