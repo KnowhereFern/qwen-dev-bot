@@ -7,6 +7,7 @@ All notable changes to this project are documented here.
 ## [1.0.0-rc.50] - 2026-10-07
 
 - Repair PDF citations by having the model select exact source excerpts, preserving split words and hyphens without rewriting product requirements or accepting fabricated quotes.
+- Use schema-guided JSON object output for intake and reject punctuation placeholders and repeated criteria before saving a proposed specification.
 
 ## [1.0.0-rc.49] - 2026-10-07
 

@@ -23,6 +23,14 @@ function fakeModel(value = fixture()) {
 }
 
 describe('source intake', () => {
+  it('rejects punctuation-only sections and repeated acceptance criteria', () => {
+    for (const value of [':{', ':', '...']) {
+      const draft = fixture(); draft.validation = [value];
+      expect(() => validateSpecification(draft, source)).toThrow('punctuation placeholder');
+    }
+    const draft = fixture(); draft.requirements[0].acceptanceCriteria.push(draft.requirements[0].acceptanceCriteria[0]);
+    expect(() => validateSpecification(draft, source)).toThrow('repeat identical');
+  });
   it('retries malformed model answers within the specification attempt limit', async () => {
     const root = temp(); const stateRoot = temp(); const { model, completeJson } = fakeModel();
     completeJson.mockRejectedValueOnce(new QwenOutputError('invalid_json'));

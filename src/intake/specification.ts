@@ -29,7 +29,7 @@ export interface SpecificationRecord {
   draft: SpecificationDraft;
   documentHash: string;
 }
-const PROMPT_VERSION = '3';
+const PROMPT_VERSION = '4';
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const text = { type: 'string', minLength: 1 };
 const texts = { type: 'array', items: text };
@@ -101,11 +101,14 @@ export function validateSpecification(value: unknown, source: IntakeSource): Spe
     if (typeof item !== 'string' || !item.trim() || item.length > 10_000) throw new Error('Specification text must be nonempty and bounded');
     const normalized = cleanIntakeText(item).replace(/\s+/g, ' ').trim();
     if (!normalized) throw new Error('Specification text cannot contain only invisible characters');
+    if (!/[\p{L}\p{N}]/u.test(normalized)) throw new Error('Specification text cannot be a punctuation placeholder');
     return normalized;
   };
   const strings = (item: unknown, minimum = 0): string[] => {
     if (!Array.isArray(item) || item.length < minimum || item.length > 100) throw new Error('Invalid specification list');
-    return item.map(string);
+    const values = item.map(string);
+    if (new Set(values.map((value) => value.toLowerCase())).size !== values.length) throw new Error('Specification lists cannot repeat identical entries');
+    return values;
   };
   const draft = record(value);
   if (!Array.isArray(draft.requirements) || !draft.requirements.length || draft.requirements.length > 60) throw new Error('Specification needs 1-60 requirements');

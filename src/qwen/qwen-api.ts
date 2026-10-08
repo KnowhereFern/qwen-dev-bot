@@ -11,6 +11,7 @@ export interface QwenApiOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   maxAttempts?: number;
+  structuredOutputMode?: 'json_schema' | 'json_object';
 }
 
 interface ChatResponse {
@@ -38,6 +39,7 @@ export class QwenApiClient {
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly maxAttempts: number;
+  private readonly structuredOutputMode: 'json_schema' | 'json_object';
 
   constructor(options: QwenApiOptions = {}) {
     const credentialEnvKey = options.credentialEnvKey ?? 'DASHSCOPE_API_KEY';
@@ -58,6 +60,7 @@ export class QwenApiClient {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_QWEN_API_TIMEOUT_MS;
     this.maxAttempts = options.maxAttempts ?? 3;
+    this.structuredOutputMode = options.structuredOutputMode ?? 'json_schema';
     if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs <= 0) throw new Error('Qwen API timeoutMs must be positive');
     if (!Number.isSafeInteger(this.maxAttempts) || this.maxAttempts <= 0) throw new Error('Qwen API maxAttempts must be positive');
   }
@@ -75,7 +78,7 @@ export class QwenApiClient {
     const request = {
       model: this.model,
       messages: [
-        { role: 'system', content: input.system },
+        { role: 'system', content: input.system + (input.jsonSchema && this.structuredOutputMode === 'json_object' ? `\nReturn JSON conforming to this schema:\n${JSON.stringify(input.jsonSchema.schema)}` : '') },
         { role: 'user', content: input.user },
       ],
       reasoning_effort: input.reasoningEffort,
@@ -83,7 +86,7 @@ export class QwenApiClient {
       temperature: 0,
       enable_thinking: true,
       preserve_thinking: true,
-      response_format: input.jsonSchema
+      response_format: input.jsonSchema && this.structuredOutputMode === 'json_schema'
         ? { type: 'json_schema', json_schema: { ...input.jsonSchema, strict: true } }
         : { type: 'json_object' },
     };

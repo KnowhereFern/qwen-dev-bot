@@ -2,6 +2,14 @@ import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_QWEN_API_TIMEOUT_MS, QwenApiClient } from '../src/qwen/qwen-api.js';
 
 describe('Qwen API boundary', () => {
+  it('supports schema-guided JSON object output for intake without constrained decoding', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ choices: [{ message: { content: '{"ok":true}' } }] }));
+    const client = new QwenApiClient({ apiKey: 'test-key', fetchImpl, structuredOutputMode: 'json_object' });
+    await client.completeJson({ system: 'Draft', user: 'Input', reasoningEffort: 'medium', jsonSchema: { name: 'test', schema: { type: 'object' } } });
+    const request = JSON.parse(String(fetchImpl.mock.calls[0][1]?.body));
+    expect(request.response_format).toEqual({ type: 'json_object' });
+    expect(request.messages[0].content).toContain('"type":"object"');
+  });
   it.each([
     ['length', '{"ok":true}', 'output_budget'],
     ['stop', '{"private":"do not echo this', 'invalid_json'],

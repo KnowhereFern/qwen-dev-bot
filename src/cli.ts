@@ -60,7 +60,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const config = existsSync(path.join(root, PROJECT_CONFIG_PATH)) ? loadProjectConfig(root) : intakeConnection(root);
       const credential = resolveQwenCredential(config);
       if (credential) assertQwenCredentialCompatibility(config, credential);
-      const model = new QwenApiClient({ model: config.qwen.model, baseUrl: config.qwen.baseUrl, credentialEnvKey: config.qwen.credentialEnvKey, apiKey: credential?.apiKey, timeoutMs: 9 * 60_000, maxAttempts: 1 });
+      const model = new QwenApiClient({ model: config.qwen.model, baseUrl: config.qwen.baseUrl, credentialEnvKey: config.qwen.credentialEnvKey, apiKey: credential?.apiKey, timeoutMs: 9 * 60_000, maxAttempts: 1, structuredOutputMode: 'json_object' });
       console.error(`Read ${source.sections.length} source section(s). Draft only; no delivery is authorized.`);
       const result = await draftSpecification({ root, source, model, modelName: config.qwen.model, baseUrl: config.qwen.baseUrl, onProgress: (message) => console.error(message) });
       console.log(json ? JSON.stringify(result, null, 2) : `${result.markdown}\nPrivate draft: ${result.documentFile}\nPrivate record: ${result.file}\n${result.reused ? 'Reused the existing draft for this exact input.' : 'Draft saved.'} No issues, approvals, or execution were created.\nReview with: fern-harness spec-status ${root} --spec ${result.record.id}`);
