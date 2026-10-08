@@ -121,6 +121,12 @@ export async function runInteractiveTerminal(options: {
   let verifiedConnection: { root: string; model: string; endpoint: string; envKey: string; apiKey: string } | undefined;
   const liveVerified = (config: ProjectConfig) => Boolean(verifiedConnection && verifiedConnection.root === root && verifiedConnection.model === config.qwen.model && verifiedConnection.endpoint === config.qwen.baseUrl && verifiedConnection.envKey === config.qwen.credentialEnvKey && verifiedConnection.apiKey === credential(config)?.apiKey);
   let root = options.root ? path.resolve(options.root) : existsSync(path.join(process.cwd(), PROJECT_CONFIG_PATH)) ? process.cwd() : undefined;
+  let documentOutput: string[] | undefined;
+  const output = (text: string, error = false) => {
+    const safe = terminalText(text);
+    if (documentOutput && !error) documentOutput.push(safe);
+    else io.print(safe);
+  };
   const command = options.execute ?? (async (argv: string[]) => {
     let stdout = '';
     let stderr = '';
@@ -129,15 +135,15 @@ export async function runInteractiveTerminal(options: {
       const lines = pending.split('\n');
       const remainder = lines.pop() ?? '';
       if (error) stderr = remainder; else stdout = remainder;
-      for (const line of lines) if (line) io.print(terminalText(line));
+      for (const line of lines) if (line || documentOutput && !error) output(line, error);
     };
     const result = await runProcess({
       command: process.execPath, args: [fileURLToPath(new URL('../../bin/qwen-harness.mjs', import.meta.url)), ...argv],
       cwd: root!, signal: io.signal,
       onStdout: (chunk) => emit(chunk, false), onStderr: (chunk) => emit(chunk, true),
     });
-    if (stdout) io.print(terminalText(stdout));
-    if (stderr) io.print(terminalText(stderr));
+    if (stdout) output(stdout);
+    if (stderr) output(stderr, true);
     return result.aborted ? 130 : result.exitCode ?? 1;
   });
   const execute = async (argv: string[]): Promise<void> => {
@@ -145,13 +151,23 @@ export async function runInteractiveTerminal(options: {
     const stop = io.activity?.(argv[0]);
     const saved = { log: console.log, info: console.info, warn: console.warn, error: console.error };
     let success = false;
+    const readable = Boolean(io.document && ['spec', 'spec-status'].includes(argv[0]) && !argv.includes('--json'));
+    documentOutput = readable ? [] : undefined;
+    let document = '';
     try {
       // Route existing command output through the console without letting evidence inject terminal control sequences.
-      for (const method of ['log', 'info', 'warn', 'error'] as const) console[method] = (...args) => io.print(terminalText(format(...args)));
+      for (const method of ['log', 'info', 'warn', 'error'] as const) console[method] = (...args) => output(format(...args), method === 'warn' || method === 'error');
       const code = await command(argv);
       if (code !== 0) throw new Error(`${argv[0]} failed (exit ${code}). No approval is inferred from this failure.`);
       success = true;
-    } finally { Object.assign(console, saved); stop?.(success); }
+      document = documentOutput?.join('\n') ?? '';
+    } finally {
+      if (!success && documentOutput?.length) io.print(documentOutput.join('\n'));
+      documentOutput = undefined;
+      Object.assign(console, saved);
+      stop?.(success);
+    }
+    if (readable && document.trim()) await io.document!('Proposed specification · not approved', document);
   };
 
   async function reviewProgram(plan: PortfolioPlan, current: TerminalSnapshot): Promise<string | undefined> {

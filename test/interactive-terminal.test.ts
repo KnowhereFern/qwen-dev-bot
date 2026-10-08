@@ -51,6 +51,30 @@ async function session(current: TerminalSnapshot, answers: Array<string | null>,
 }
 
 describe('interactive terminal', () => {
+  it.each([0, 1])('pages successful specification output, preserves failed output (exit %s)', async (exitCode) => {
+    const root = makeTmp('terminal-spec-reader');
+    const answers = ['9', '3', '1', '0'];
+    const events: string[] = [];
+    const print = vi.fn((text: string) => { events.push(`print:${text}`); });
+    const document = vi.fn(async (_title: string, text: string) => { events.push(`document:${text}`); });
+    await runInteractiveTerminal({ root, snapshot: () => { throw new Error('Not configured'); },
+      specifications: () => [{ id: 'spec_test', createdAt: 'today', draft: { title: 'Memory engine' } }],
+      projects: () => [], credential: () => null, workerStatus: async () => 'inactive',
+      execute: async () => { console.error('Reading private spec'); console.log('# Spec\n\n## Requirements\n- Build it'); return exitCode; },
+      io: { question: async () => answers.shift() ?? null, print, document,
+        activity: () => (success) => { events.push(`stop:${success}`); }, close() {} },
+    });
+    expect(print).toHaveBeenCalledWith('Reading private spec');
+    if (exitCode === 0) {
+      expect(document).toHaveBeenCalledWith('Proposed specification · not approved', '# Spec\n\n## Requirements\n- Build it');
+      expect(events.indexOf('stop:true')).toBeLessThan(events.findIndex((event) => event.startsWith('document:')));
+      expect(print).not.toHaveBeenCalledWith('# Spec\n\n## Requirements\n- Build it');
+    } else {
+      expect(document).not.toHaveBeenCalled();
+      expect(print).toHaveBeenCalledWith('# Spec\n\n## Requirements\n- Build it');
+    }
+  });
+
   it('reviews a saved specification before setup without an approval action', async () => {
     const root = makeTmp('terminal-saved-spec');
     const answers = ['9', '3', '1', '0'];

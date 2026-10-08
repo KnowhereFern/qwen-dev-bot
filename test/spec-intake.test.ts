@@ -6,6 +6,7 @@ import { cleanIntakeText, readIntakeSource, selectedPages, type IntakeSource } f
 import { draftSpecification, loadSpecification, renderSpecification, specificationDocument, validateSpecification } from '../src/intake/specification.js';
 import { intakeConnection } from '../src/intake/connection.js';
 import type { PortfolioPlanningModel } from '../src/portfolio/planner.js';
+import { QwenOutputError } from '../src/qwen/qwen-api.js';
 
 const roots: string[] = [];
 function temp() { const root = mkdtempSync(path.join(os.tmpdir(), 'fern-spec-test-')); roots.push(root); return root; }
@@ -22,6 +23,21 @@ function fakeModel(value = fixture()) {
 }
 
 describe('source intake', () => {
+  it('retries malformed model answers within the specification attempt limit', async () => {
+    const root = temp(); const stateRoot = temp(); const { model, completeJson } = fakeModel();
+    completeJson.mockRejectedValueOnce(new QwenOutputError('invalid_json'));
+    const result = await draftSpecification({ root, stateRoot, source, model, modelName: 'qwen3.8-max', baseUrl: 'https://example.com' });
+    expect(result.record.draft.title).toBe('Memory engine');
+    expect(completeJson).toHaveBeenCalledTimes(2);
+  });
+  it('does not endlessly retry output budget failures or mask authentication failures', async () => {
+    for (const error of [new QwenOutputError('output_budget'), new Error('HTTP 401')]) {
+      const root = temp(); const stateRoot = temp(); const { model, completeJson } = fakeModel();
+      completeJson.mockRejectedValue(error);
+      await expect(draftSpecification({ root, stateRoot, source, model, modelName: 'qwen3.8-max', baseUrl: 'https://example.com' })).rejects.toThrow(error instanceof QwenOutputError ? 'three attempts' : 'HTTP 401');
+      expect(completeJson).toHaveBeenCalledTimes(error instanceof QwenOutputError ? 3 : 1);
+    }
+  });
   it('reads ideas without Git or project setup and redacts dotted credentials', async () => {
     const result = await readIntakeSource(temp(), { idea: 'Build memory. sk-sp-THIS.IS.A.PRIVATE_TOKEN_123' });
     expect(result.sections[0].text).toBe('Build memory. [REDACTED]');

@@ -15,12 +15,20 @@ export interface QwenApiOptions {
 
 interface ChatResponse {
   choices?: Array<{
+    finish_reason?: string;
     message?: {
       content?: string;
       reasoning_content?: string;
     };
   }>;
   usage?: Record<string, unknown>;
+}
+
+export class QwenOutputError extends Error {
+  constructor(readonly kind: 'output_budget' | 'invalid_json') {
+    super(kind === 'output_budget' ? 'Qwen answer exceeded its output budget; no partial answer accepted' : 'Qwen answer was malformed JSON; no answer content logged');
+    this.name = 'QwenOutputError';
+  }
 }
 
 export class QwenApiClient {
@@ -111,11 +119,15 @@ export class QwenApiClient {
         throw new Error(`Qwen API request failed: HTTP ${response.status} ${body}`);
       }
       const data = JSON.parse(await readBoundedResponse(response, 10 * 1024 * 1024)) as ChatResponse;
+      if (data.choices?.[0]?.finish_reason === 'length') throw new QwenOutputError('output_budget');
       const message = data.choices?.[0]?.message;
       const raw = message?.content?.trim() ?? '';
       if (!raw) throw new Error('Qwen API returned no answer content');
+      let value: T;
+      try { value = parseJson<T>(raw); }
+      catch { throw new QwenOutputError('invalid_json'); }
       return {
-        value: parseJson<T>(raw),
+        value,
         raw,
         reasoning: message?.reasoning_content ?? '',
         usage: data.usage ?? {},

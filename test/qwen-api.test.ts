@@ -2,6 +2,16 @@ import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_QWEN_API_TIMEOUT_MS, QwenApiClient } from '../src/qwen/qwen-api.js';
 
 describe('Qwen API boundary', () => {
+  it.each([
+    ['length', '{"ok":true}', 'output_budget'],
+    ['stop', '{"private":"do not echo this', 'invalid_json'],
+  ])('rejects incomplete or malformed answers safely (%s)', async (finish_reason, content, kind) => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ choices: [{ finish_reason, message: { content } }] }));
+    const client = new QwenApiClient({ apiKey: 'test-key', fetchImpl });
+    await expect(client.completeJson({ system: 'JSON', user: 'test', reasoningEffort: 'low' })).rejects.toMatchObject({ kind });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it('allows bounded long-reasoning requests to run for five minutes by default', () => {
     expect(DEFAULT_QWEN_API_TIMEOUT_MS).toBe(5 * 60_000);
   });
