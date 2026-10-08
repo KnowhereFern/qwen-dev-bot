@@ -127,6 +127,18 @@ describe('specification drafting', () => {
     expect(completeJson).toHaveBeenCalledTimes(3);
     expect(readdirSync(root)).toEqual([]);
   });
+  it('repairs only rejected evidence without rewriting the product specification', async () => {
+    const root = temp(); const stateRoot = temp(); const draft = fixture(); draft.requirements[0].evidence[0].ref = 'wrong-page';
+    const completeJson = vi.fn().mockResolvedValueOnce({ value: draft }).mockResolvedValueOnce({ value: { corrections: [
+      { id: 'R1', evidence: [{ ref: 'idea', quote: 'memory engine with bounded context.' }] },
+    ] } });
+    const result = await draftSpecification({ root, stateRoot, source, model: { completeJson }, modelName: 'qwen3.8-max', baseUrl: 'https://example.com/v1' });
+    expect(result.record.draft.objective).toBe(draft.objective);
+    expect(result.record.draft.requirements[0].acceptanceCriteria).toEqual(draft.requirements[0].acceptanceCriteria);
+    expect(result.record.draft.requirements[0].evidence[0].ref).toBe('idea');
+    expect(completeJson).toHaveBeenCalledTimes(2);
+    expect(completeJson.mock.calls[1][0].jsonSchema.name).toBe('specification_evidence_repair');
+  });
   it('does not call the model or save a draft after cancellation', async () => {
     const root = temp(); const stateRoot = temp(); const { model, completeJson } = fakeModel();
     const controller = new AbortController(); controller.abort();
