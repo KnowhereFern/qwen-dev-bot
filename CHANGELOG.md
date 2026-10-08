@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.50] - 2026-10-07
+
+- Repair PDF citations by having the model select exact source excerpts, preserving split words and hyphens without rewriting product requirements or accepting fabricated quotes.
+
 ## [1.0.0-rc.49] - 2026-10-07
 
 - Let the harness draft a private, source-grounded product specification from an idea or PDF before Git/GitHub setup; keep assumptions, acceptance criteria and unproven claims explicit.

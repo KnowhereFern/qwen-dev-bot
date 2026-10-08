@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanIntakeText, readIntakeSource, selectedPages, type IntakeSource } from '../src/intake/source.js';
-import { draftSpecification, loadSpecification, renderSpecification, specificationDocument, validateSpecification } from '../src/intake/specification.js';
+import { draftSpecification, loadSpecification, renderSpecification, sourceExcerpts, specificationDocument, validateSpecification } from '../src/intake/specification.js';
 import { intakeConnection } from '../src/intake/connection.js';
 import type { PortfolioPlanningModel } from '../src/portfolio/planner.js';
 import { QwenOutputError } from '../src/qwen/qwen-api.js';
@@ -146,14 +146,23 @@ describe('specification drafting', () => {
   it('repairs only rejected evidence without rewriting the product specification', async () => {
     const root = temp(); const stateRoot = temp(); const draft = fixture(); draft.requirements[0].evidence[0].ref = 'wrong-page';
     const completeJson = vi.fn().mockResolvedValueOnce({ value: draft }).mockResolvedValueOnce({ value: { corrections: [
-      { id: 'R1', evidence: [{ ref: 'idea', quote: 'memory engine with bounded context.' }] },
+      { id: 'R1', excerpts: ['E1_0'] },
     ] } });
     const result = await draftSpecification({ root, stateRoot, source, model: { completeJson }, modelName: 'qwen3.8-max', baseUrl: 'https://example.com/v1' });
     expect(result.record.draft.objective).toBe(draft.objective);
     expect(result.record.draft.requirements[0].acceptanceCriteria).toEqual(draft.requirements[0].acceptanceCriteria);
     expect(result.record.draft.requirements[0].evidence[0].ref).toBe('idea');
+    expect(result.record.draft.requirements[0].evidence[0].quote).toBe(source.sections[0].text);
     expect(completeJson).toHaveBeenCalledTimes(2);
     expect(completeJson.mock.calls[1][0].jsonSchema.name).toBe('specification_evidence_repair');
+  });
+  it('preserves PDF split words and rejects fabricated excerpt selections', async () => {
+    const splitSource = { ...source, sections: [{ ref: 'page:9', text: 'A graph - \n based registry may tra verse skill blocks.' }] };
+    expect(sourceExcerpts(splitSource)[0].quote).toBe('A graph - based registry may tra verse skill blocks.');
+    const root = temp(); const stateRoot = temp(); const draft = fixture(); draft.requirements[0].evidence = [];
+    const completeJson = vi.fn().mockResolvedValueOnce({ value: draft }).mockResolvedValue({ value: { corrections: [{ id: 'R1', excerpts: ['invented'] }] } });
+    await expect(draftSpecification({ root, stateRoot, source, model: { completeJson }, modelName: 'qwen3.8-max', baseUrl: 'https://example.com' })).rejects.toThrow('unknown source excerpt');
+    expect(completeJson).toHaveBeenCalledTimes(3);
   });
   it('does not call the model or save a draft after cancellation', async () => {
     const root = temp(); const stateRoot = temp(); const { model, completeJson } = fakeModel();
