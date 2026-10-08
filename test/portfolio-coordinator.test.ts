@@ -82,6 +82,40 @@ function draft(): PortfolioDraft {
 }
 
 describe('PortfolioCoordinator', () => {
+  it.each(['empty', 'optional', 'security'])('keeps a program draft unapproved without required product gates: %s', async (kind) => {
+    const config = defaultProjectConfig(makeTmp('portfolio-gate-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = kind === 'empty' ? [] : [{ id: 'check', kind: kind === 'security' ? 'security' : 'unit', command: 'npm', args: ['test'], required: kind === 'security', timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('portfolio-gate-project', makeTmp('portfolio-gate-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: draft() });
+      const before = structuredClone(store.getPortfolioPlan(created.plan.id));
+      const issuesBefore = structuredClone([...github.issues.values()]);
+      await expect(coordinator.approve(created.plan.id)).rejects.toThrow('at least one required product verification gate');
+      expect(store.getPortfolioPlan(created.plan.id)).toEqual(before);
+      expect([...github.issues.values()]).toEqual(issuesBefore);
+      expect(store.list()).toEqual([]);
+      expect(before?.approvedAt).toBeNull();
+    } finally { store.close(); }
+  });
+
+  it.each(['active', 'done', 'delivered', 'maintaining'] as const)('preserves idempotent approval for an existing %s program with legacy empty gates', async (status) => {
+    const config = defaultProjectConfig(makeTmp('portfolio-existing-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.gates = [];
+    const store = new PersistentTaskStore('portfolio-existing', makeTmp('portfolio-existing-state'));
+    const coordinator = new PortfolioCoordinator(config, store, new PortfolioGitHub());
+    try {
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: draft() });
+      const existing = { ...created.plan, status, approvedAt: 1 };
+      store.savePortfolioPlan(existing);
+      expect(await coordinator.approve(existing.id)).toEqual(existing);
+    } finally { store.close(); }
+  });
+
   it('publishes idempotent review issues, then creates an exact dependency-aware normalized graph only after approval', async () => {
     const root = makeTmp('portfolio-root');
     const config = defaultProjectConfig(root, 'project', 'owner/project');
@@ -337,6 +371,7 @@ describe('PortfolioCoordinator', () => {
   it.each(['mapped', 'separate', 'ambiguous', 'missing', 'renamed', 'reinterpreted', 'material', 'completed', 'active'])('maps recovery by requirement identity before any published effects: %s', async (scenario) => {
     const config = defaultProjectConfig(makeTmp('lineage-root'), 'project', 'owner/project');
     config.program.enabled = true;
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
     config.intake.trustedAuthors.push('owner');
     const store = new PersistentTaskStore('lineage-project', makeTmp('lineage-state'));
     const github = new PortfolioGitHub();

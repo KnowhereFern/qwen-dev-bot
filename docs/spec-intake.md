@@ -30,6 +30,8 @@ The draft includes the objective, users, source-grounded requirements, acceptanc
 
 Review the draft and resolve consequential product decisions. Then configure the repository through normal project setup. The plan command can consume the saved spec directly—no hand-authored requirements file or copied PDF is necessary:
 
+For a new repository, the draft can propose the stack and scaffolding before product tests exist. Configure required product-check commands for that proposed stack before approving the program. The harness creates their implementation in its first delivery work; an empty or security-only gate list cannot authorize a new program. A passing setup workflow alone is not product verification.
+
 ```sh
 fern-harness plan /path/to/project --spec spec_ID
 ```

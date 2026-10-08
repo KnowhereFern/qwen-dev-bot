@@ -27,6 +27,14 @@ export interface DoctorReport {
   checks: DoctorCheck[];
 }
 
+export function programGateChecks(config: ProjectConfig): DoctorCheck[] {
+  if (!config.program.enabled) return [];
+  const configured = config.gates.some((gate) => gate.required && gate.kind !== 'security' && gate.id !== 'harness-security');
+  return [check('program-product-gates', configured ? 'pass' : 'fail', configured
+    ? 'Required product checks are configured (passing behavior still requires execution)'
+    : 'Configure required product checks before program approval; an empty or security-only check list is not delivery verification')];
+}
+
 export async function runDoctor(config: ProjectConfig, options: { live?: boolean } = {}): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
   const root = config.project.root;
@@ -40,6 +48,7 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
     ),
   );
   checks.push(...(await projectDependencyChecks(config)));
+  checks.push(...programGateChecks(config));
   checks.push(
     check(
       'config',

@@ -242,6 +242,9 @@ export class PortfolioCoordinator {
         `GitHub user ${actor} is not in intake.trustedAuthors; rerun setup/update with --trusted-author ${actor}`,
       );
     }
+    if (this.config.program.enabled && !this.config.gates.some((gate) => gate.required && gate.kind !== 'security' && gate.id !== 'harness-security')) {
+      throw new Error('Program approval requires at least one required product verification gate. Configure checks for the proposed stack before approving; the harness can create their implementation in its first story. Drafting remains available.');
+    }
 
     plan = await this.publishDraft(await this.recoverRemoteIssues(plan));
     plan = this.save({

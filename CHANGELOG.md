@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.52] - 2026-10-07
+
+- Block new program approval when required product checks are absent; empty, optional-only and security-only checks cannot authorize delivery. Preserve existing active/completed program idempotence.
+- Report missing product checks in readiness, while allowing a new repository to generate a proposed program before its first implementation.
+
 ## [1.0.0-rc.51] - 2026-10-07
 
 - Confirm numbered menu choices with Enter so a trailing Enter cannot accidentally select the next screen's default action; reject invalid numbers without activating a previous selection.
