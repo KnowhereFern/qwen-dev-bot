@@ -2,7 +2,7 @@ import path from 'node:path';
 import type { ProjectConfig, TaskRecord, TaskSpec } from '../core/types.js';
 import { redactText } from '../core/ledger.js';
 import { formatProcessFailure, runProcess } from '../runtime/safe-process.js';
-import { qwenWriterGuardEnvironment } from './writer-guard.js';
+import { qwenWriterGuardEnvironment, WRITER_GUARD_FAILURE } from './writer-guard.js';
 import { createQwenModelSelection } from './model-selection.js';
 import {
   qwenEnvironment,
@@ -70,9 +70,13 @@ export class QwenCodeExecutor implements QwenExecutor {
   async execute(input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
     const workflowPath = path.join(input.worktree, '.qwen', 'workflows', 'harness-implement.js');
     const writerEnvironment = qwenWriterGuardEnvironment({ worktree: input.worktree, workflowPath });
-    const feedback = input.feedback ?? [];
-    const repairAttempt = feedback.length > 0;
-    const prompt = goalPromptFor(input.task, feedback, workflowPath);
+    const originalFeedback = input.feedback ?? [];
+    const repairAttempt = originalFeedback.length > 0;
+    // The preflight above has just verified this controller-owned failure is
+    // resolved. Do not ask the product writer to repair the harness installation.
+    // Preserve history and fresh-session isolation even when no feedback remains.
+    const feedback = originalFeedback.filter((item) => item !== WRITER_GUARD_FAILURE);
+    const prompt = goalPromptFor(repairAttempt ? { ...input.task, qwenSessionId: null } : input.task, feedback, workflowPath);
 
     const args = [
       '--model',

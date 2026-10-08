@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 
 const HOOK_COMMAND = 'node "${CLAUDE_PLUGIN_ROOT}/hooks/enforce-writer.mjs"';
 
+export const WRITER_GUARD_FAILURE = 'Delivery writer guard is missing, stale, or unreadable. No implementation session was started. Re-run project setup/update with extension linking enabled using this installed fern-harness version, then resume delivery.';
+
 /** Structural preflight only. Runtime hook execution is verified separately. */
 export function qwenWriterGuardEnvironment(options: {
   worktree: string;
@@ -38,6 +40,6 @@ export function qwenWriterGuardEnvironment(options: {
       QWEN_HARNESS_WORKFLOW_PATH: options.workflowPath,
     };
   } catch {
-    throw new Error('Delivery writer guard is missing, stale, or unreadable. No implementation session was started. Re-run project setup/update with extension linking enabled using this installed fern-harness version, then resume delivery.');
+    throw new Error(WRITER_GUARD_FAILURE);
   }
 }
