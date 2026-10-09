@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.57] - 2026-10-09
+
+### Fixed
+
+- Save machine-generated gate execution receipts so local completion review can inspect actual checks instead of truncated agent summaries. Receipts record commands, outcomes, timeouts, and candidate fingerprints; required supervisor checks remain independent.
+- Replace stale passing receipts before a new run, reject unsafe receipt paths, redact credential arguments, and fail timed-out checks even if their termination handler exits successfully.
+- Require the implementation workflow and coordinator to read receipt evidence before handing work back for exact-commit verification. No active sessions are upgraded in place.
+
 ## [1.0.0-rc.56] - 2026-10-09
 
 - Record safe planning-stage and validation-attempt progress in the program ledger and worker logs without logging model prompts or responses.
