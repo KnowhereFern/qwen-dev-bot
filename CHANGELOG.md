@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.58] - 2026-10-09
+
+- Persist session-bound automatic-stop provenance from actual process limits. Start a fresh local Goal after confirmed automatic limits so synthetic cancellation text cannot masquerade as a new human instruction.
+- Preserve the candidate worktree, approved contract, failure history, and bounded continuation limits. Keep ordinary provider waits resumable; explicit user stops and external aborts do not grant automatic continuation.
+- Clear consumed stop markers and stale workflow identifiers when a new session is recorded. Cover restart persistence, mismatched provenance, provider waits, and cancellation precedence with regression tests.
+
 ## [1.0.0-rc.57] - 2026-10-09
 
 ### Fixed
