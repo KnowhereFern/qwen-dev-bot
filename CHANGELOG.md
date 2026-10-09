@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.60] - 2026-10-09
+
+- Tell repository assessments to cite supplied exact-commit execution evidence alongside requirement-specific source or tests. Do not treat global passing CI as proof of every requirement.
+- Distinguish a missing execution citation from a missing execution result in coverage diagnostics. Preserve the existing fail-closed validator and rejection of stale commit evidence.
+- Add regressions for citation instructions, uncited passing gates, matching gate citations, and stale execution evidence.
+
 ## [1.0.0-rc.59] - 2026-10-09
 
 - Run receipt-producing checks from the installed controller package so unfinished worktrees can retain their original protected harness scripts and task base.

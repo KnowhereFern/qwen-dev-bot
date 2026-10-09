@@ -27,7 +27,7 @@ import { readIntakeSource } from './intake/source.js';
 import { intakeConnection } from './intake/connection.js';
 import { draftSpecification, loadSpecification, renderSpecification, specificationDocument } from './intake/specification.js';
 
-const VERSION = '1.0.0-rc.59';
+const VERSION = '1.0.0-rc.60';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? (process.stdin.isTTY && process.stdout.isTTY ? 'interactive' : 'help');
