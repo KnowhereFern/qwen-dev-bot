@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.56] - 2026-10-09
+
+- Record safe planning-stage and validation-attempt progress in the program ledger and worker logs without logging model prompts or responses.
+- Forward cancellation through initial and correction planning requests, and refuse to publish cancelled results. Preserve bounded validation retries and JSON command output.
+
 ## [1.0.0-rc.55] - 2026-10-09
 
 - Carry approved technology, deployment, and acceptance boundaries into program reassessment. Retain decision identities and avoid asking again for unchanged approved exceptions.
