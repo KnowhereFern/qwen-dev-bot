@@ -250,6 +250,11 @@ export interface TaskRecord {
   commitSha: string | null;
   qwenSessionId: string | null;
   qwenWorkflowRunId: string | null;
+  qwenAutomaticStop?: {
+    sessionId: string;
+    workflowRunId: string | null;
+    kind: 'turn-limit' | 'budget-limit' | 'process-timeout';
+  } | null;
   prNumber: number | null;
   prUrl: string | null;
   mergeSha: string | null;

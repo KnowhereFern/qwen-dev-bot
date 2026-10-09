@@ -84,6 +84,7 @@ class BudgetPausedQwenExecutor implements QwenExecutor {
       sessionId: 'qwen-session-budget', workflowRunId: null, summary: 'turn budget reached',
       goalState: 'paused', goalReason: 'turn budget limit', needsContinuation: true,
       continuationKind: 'budget', usage: {}, durationMs: 1,
+      automaticStop: { sessionId: 'qwen-session-budget', workflowRunId: null, kind: 'turn-limit' },
     };
   }
 }
@@ -495,7 +496,7 @@ describe('production supervisor trace', () => {
 
     await supervisor.tick();
     let task = store.findByIssue(2);
-    expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0, continuations: 1 });
+    expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0, continuations: 1, qwenAutomaticStop: null });
     store.patch(task?.id as string, { resumeAfter: Date.now() - 1 });
     await supervisor.tick();
     task = store.findByIssue(2);
@@ -520,6 +521,36 @@ describe('production supervisor trace', () => {
 
     await supervisor.tick();
     expect(store.findByIssue(2)).toMatchObject({ state: 'ready', attempts: 1, continuations: 1 });
+    store.close();
+  });
+
+  it('persists observed automatic stops and clears them when the next session starts', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('automatic-stop-state');
+    const store = new PersistentTaskStore('automatic-stop-project', state);
+    const executor = new BudgetPausedQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config), executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-automatic-stop',
+    );
+    await supervisor.tick();
+    const task = store.findByIssue(2)!;
+    expect(task).toMatchObject({ state: 'ready', attempts: 0, continuations: 1,
+      qwenAutomaticStop: { sessionId: 'qwen-session-budget', workflowRunId: null, kind: 'turn-limit' } });
+    execute.mockImplementationOnce(async input => {
+      expect(input.task.qwenAutomaticStop).toEqual(task.qwenAutomaticStop);
+      input.onSession?.('next-session');
+      expect(store.get(task.id).qwenAutomaticStop).toBeNull();
+      return { sessionId: 'next-session', workflowRunId: null, summary: 'provider waiting', goalState: 'usage_limited',
+        goalReason: 'provider temporarily overloaded', needsContinuation: true, continuationKind: 'provider', usage: {}, durationMs: 1 };
+    });
+    await supervisor.tick();
+    expect(store.get(task.id)).toMatchObject({ state: 'waiting', attempts: 0, continuations: 2,
+      qwenSessionId: 'next-session', qwenAutomaticStop: null });
     store.close();
   });
 

@@ -20,6 +20,22 @@ function taskSpec(dependencies: number[]): TaskSpec {
 }
 
 describe('PersistentTaskStore', () => {
+  it('persists automatic-stop provenance across restart without changing retry history', () => {
+    const dir = makeTmp('automatic-stop-provenance');
+    let store = new PersistentTaskStore('automatic-stop', dir);
+    const task = store.upsert({ issueNumber: 1, title: 'continue', state: 'ready' });
+    expect(task.qwenAutomaticStop).toBeNull();
+    const marker = { sessionId: 'budget-session', workflowRunId: 'workflow', kind: 'budget-limit' as const };
+    store.patch(task.id, { qwenSessionId: marker.sessionId, qwenWorkflowRunId: marker.workflowRunId,
+      qwenAutomaticStop: marker, attempts: 2, continuations: 3, lineageFailures: 2 });
+    store.close();
+    store = new PersistentTaskStore('automatic-stop', dir);
+    expect(store.get(task.id)).toMatchObject({ qwenAutomaticStop: marker, attempts: 2, continuations: 3, lineageFailures: 2 });
+    store.patch(task.id, { qwenSessionId: 'new-session', qwenAutomaticStop: null });
+    expect(store.get(task.id)).toMatchObject({ qwenAutomaticStop: null, attempts: 2, continuations: 3, lineageFailures: 2 });
+    store.close();
+  });
+
   it('authorizes bounded recovery atomically, preserves history and replays safely after restart', () => {
     const dir = makeTmp('authorized-recovery');
     let store = new PersistentTaskStore('recovery', dir);

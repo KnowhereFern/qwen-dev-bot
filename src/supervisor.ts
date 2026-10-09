@@ -268,13 +268,16 @@ export class HarnessSupervisor {
         feedback: task.lastError ? [task.lastError] : [],
         onHeartbeat: heartbeat,
         onSession: (sessionId) => {
-          if (this.store.get(task.id).qwenSessionId !== sessionId) this.store.patch(task.id, { qwenSessionId: sessionId });
+          if (this.store.get(task.id).qwenSessionId !== sessionId) {
+            this.store.patch(task.id, { qwenSessionId: sessionId, qwenWorkflowRunId: null, qwenAutomaticStop: null });
+          }
         },
         signal,
       });
       task = this.store.patch(task.id, {
         qwenSessionId: qwenResult.sessionId,
         qwenWorkflowRunId: qwenResult.workflowRunId,
+        qwenAutomaticStop: qwenResult.needsContinuation ? qwenResult.automaticStop ?? null : null,
       });
       if (qwenResult.needsContinuation) {
         const continuations = (task.continuations ?? 0) + 1;
@@ -283,6 +286,7 @@ export class HarnessSupervisor {
           goalReason: qwenResult.goalReason,
           usage: qwenResult.usage,
           continuations,
+          automaticStop: task.qwenAutomaticStop ?? null,
         });
         if (qwenResult.continuationKind === 'provider') {
           const resumeAfter = Date.now() + Math.max(this.config.worker.pollIntervalMs, 30_000);
