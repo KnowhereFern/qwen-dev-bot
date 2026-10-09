@@ -67,6 +67,34 @@ describe('Qwen extension packaging', () => {
     expect(qwenCodeVersionAtLeast('not installed')).toBe(false);
   });
 
+  it('keeps machine evidence discoverable even when workflow reports are long', async () => {
+    const source = readFileSync(path.join(root, 'template', '.qwen', 'workflows', 'harness-implement.js'), 'utf8');
+    const prompts: Array<{ prompt: string; agentType: string }> = [];
+    const run = new Function('phase', 'parallel', 'agent', 'args', 'log', `return (async () => {\n${source}\n})();`);
+    const result = await run(
+      () => {},
+      (calls: Array<() => Promise<unknown>>) => Promise.all(calls.map(call => call())),
+      async (prompt: string, options: { agentType: string }) => {
+        prompts.push({ prompt, agentType: options.agentType });
+        return options.agentType === 'harness-reviewer'
+          ? { passed: false, findings: ['missing receipt'] }
+          : { summary: 'verbose report '.repeat(2000), changedFiles: [], tests: ['claimed pass'] };
+      },
+      { taskId: 'fixture' },
+      () => { throw new Error('Do not duplicate verbose reports in logs'); },
+    );
+    expect(JSON.stringify(result).slice(0,1000)).toContain('gateReceiptPath');
+    expect(result.gateReceiptPath).toBe('.qwen-harness/state/gate-receipt.json');
+    expect(result.review.passed).toBe(false);
+    expect(prompts.map(item => item.agentType)).toEqual([
+      'harness-researcher', 'harness-verifier', 'harness-implementer', 'harness-reviewer',
+    ]);
+    expect(prompts[2]!.prompt).toContain('After your final code edit, execute node .qwen-harness/scripts/run-gates.mjs');
+    expect(prompts[2]!.prompt).toContain('never author or edit the receipt yourself');
+    expect(prompts[3]!.prompt).toContain('A missing, incomplete, failed, stale, or wrong-worktree receipt is a blocker');
+    expect(prompts[3]!.prompt).toContain('Do not edit files or attempt shell tools');
+  });
+
   it('requires the supervisor-owned Goal to invoke the bounded saved workflow', () => {
     const task = {
       id: 'task-example',
@@ -95,6 +123,10 @@ describe('Qwen extension packaging', () => {
     expect(objective).toContain('the saved workflow review passes, and the required project checks pass');
     expect(objective).toContain('Preserve every acceptance criterion');
     expect(objective).toContain('is not a successful handoff');
+    expect(objective).toContain('use read_file to read .qwen-harness/state/gate-receipt.json');
+    expect(objective).toContain('Read all gate entries in bounded pages');
+    expect(objective).toContain('model-written test summary is not execution evidence');
+    expect(objective).toContain('never replaces the supervisor\'s independent exact-commit verification');
   });
 
   it('starts a fresh Goal for verifier-driven repair while retaining the task contract', () => {
