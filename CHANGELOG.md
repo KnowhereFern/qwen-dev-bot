@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.55] - 2026-10-09
+
+- Carry approved technology, deployment, and acceptance boundaries into program reassessment. Retain decision identities and avoid asking again for unchanged approved exceptions.
+- Preserve the prior approved contract when proposing a material revision. Support audited rejection and restoration without deleting proposals, completed work, or revision history.
+
 ## [1.0.0-rc.54] - 2026-10-08
 
 - Stop sending a resolved writer-guard installation failure to the product agent as verifier feedback. Recheck the guard before filtering that exact error; preserve failed-session isolation, retry history, and all genuine verification failures.
