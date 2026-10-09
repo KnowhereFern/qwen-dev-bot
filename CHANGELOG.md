@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.63] - 2026-10-09
+
+- Resume an unchanged candidate after an orderly verification interruption without repeating implementation. Reauthorize the issue and program, validate the exact candidate and lease, consume recovery evidence once, and rerun required gates and independent review.
+- Stop execution safely when lease ownership is lost instead of allowing heartbeat exceptions to escape the worker.
+- Use the same approved story for staging preparation and read-only completion. Reject ambiguous authorization rather than selecting the first matching plan.
+- Preserve failure budgets and fall back to normal implementation when authorized candidate evidence is stale. Interrupted recovery before candidate consumption may still repeat model work; it cannot reuse a passing result.
+
 ## [1.0.0-rc.62] - 2026-10-09
 
 - Honor `update --dry-run` so an update preview cannot install files, relink the CLI, change registration, or restart the worker.

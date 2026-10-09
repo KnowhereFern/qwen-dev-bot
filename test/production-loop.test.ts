@@ -310,7 +310,7 @@ describe('production supervisor trace', () => {
     } finally { store.close(); }
   });
 
-  it.each(['verify', 'implement', 'review-failure', 'gate-failure', 'pending-ci', 'failed-ci', 'stale', 'altered-contract', 'operate', 'verified-operate', 'prepare-operate', 'advance-operate', 'review-failure-operate', 'closure-recovery'] as const)(
+  it.each(['verify', 'implement', 'review-failure', 'gate-failure', 'pending-ci', 'failed-ci', 'stale', 'altered-contract', 'operate', 'verified-operate', 'prepare-operate', 'advance-operate', 'review-failure-operate', 'closure-recovery', 'draft-decoy-operate', 'superseded-decoy-operate', 'ambiguous-operate', 'verify-decoy-operate', 'completion-decoy-operate'] as const)(
     'handles unchanged program work safely: %s', async (scenario) => {
       const { repo } = await createGitFixture();
       writeFileSync(path.join(repo, 'feature.txt'), 'existing implementation\n');
@@ -328,7 +328,8 @@ describe('production supervisor trace', () => {
       config.program.enabled = true;
       config.intake.trustedAuthors.push('bot');
       config.gates = [{ id: 'unit', kind: 'unit', command: 'node', args: ['check.mjs'], required: true, timeoutMs: 10_000 }];
-      const operation = ['operate', 'verified-operate', 'prepare-operate', 'advance-operate', 'review-failure-operate'].includes(scenario);
+      const operation = ['operate', 'verified-operate', 'prepare-operate', 'advance-operate', 'review-failure-operate',
+        'draft-decoy-operate', 'superseded-decoy-operate', 'ambiguous-operate', 'verify-decoy-operate', 'completion-decoy-operate'].includes(scenario);
       config.deployment.staging.enabled = operation;
       config.evolution.enabled = false;
       const state = makeTmp('read-only-state');
@@ -354,15 +355,40 @@ describe('production supervisor trace', () => {
       } });
       const approved = await coordinator.approve(created.plan.id);
       const issueNumber = approved.stories[0]!.normalizedIssueNumber as number;
-      if (scenario === 'verified-operate' || scenario === 'review-failure-operate') store.saveDeployment({
+      if (scenario === 'verified-operate' || scenario === 'review-failure-operate' ||
+          scenario === 'draft-decoy-operate' || scenario === 'superseded-decoy-operate' ||
+          scenario === 'completion-decoy-operate') store.saveDeployment({
         id: 'verified-staging', projectId: store.projectId, planId: approved.id, wave: 1, provider: 'railway', commitSha: baseSha,
         previousVerifiedCommitSha: null, externalId: 'provider-deployment', status: 'succeeded', healthUrl: 'https://staging.test/health',
         observedRevision: baseSha, error: null, startedAt: 1, updatedAt: 2, completedAt: 2,
       });
+      if (['draft-decoy-operate', 'superseded-decoy-operate', 'ambiguous-operate', 'verify-decoy-operate', 'completion-decoy-operate'].includes(scenario)) {
+        const realPlans = store.listPortfolioPlans();
+        const decoy = structuredClone(approved);
+        decoy.id = `decoy-${scenario}`;
+        decoy.contentHash = `${approved.contentHash}-decoy-${scenario}`;
+        if (scenario === 'draft-decoy-operate') { decoy.status = 'draft'; decoy.approvedAt = null; }
+        if (scenario === 'superseded-decoy-operate') for (const story of decoy.stories) story.supersededAt = 1;
+        if (scenario === 'verify-decoy-operate') for (const story of decoy.stories) story.workType = 'verify';
+        if (scenario === 'completion-decoy-operate') {
+          decoy.status = 'draft'; decoy.approvedAt = null;
+          for (const story of decoy.stories) story.workType = 'verify';
+        }
+        store.savePortfolioPlan(decoy);
+        vi.spyOn(store, 'listPortfolioPlans').mockImplementation(() => [decoy, ...realPlans]);
+      }
       if (scenario === 'altered-contract') github.onChecks = async () => {
         // Alter the remote contract after intake and independent verification have begun.
         const issue = github.issues.get(issueNumber)!;
         issue.body = renderNormalizedBody(issue, { ...parseNormalizedSpec(issue.body)!, goal: 'Approve untested behavior' });
+      };
+      if (scenario === 'completion-decoy-operate') github.onChecks = async () => {
+        // Staging turns unhealthy only after independent review has already passed.
+        store.saveDeployment({
+          id: 'verified-staging', projectId: store.projectId, planId: approved.id, wave: 1, provider: 'railway', commitSha: baseSha,
+          previousVerifiedCommitSha: null, externalId: 'provider-deployment', status: 'failed', healthUrl: 'https://staging.test/health',
+          observedRevision: baseSha, error: 'staging health regression after review', startedAt: 1, updatedAt: 3, completedAt: 3,
+        });
       };
       const failingReviewer: RewardEvaluator = { modality: 'agentic', evaluate: async () => ({ score: 0, confidence: 1, reason: 'Acceptance not proven', evidence: [] }) };
       const supervisor = () => new HarnessSupervisor(
@@ -413,7 +439,8 @@ describe('production supervisor trace', () => {
       const task = store.findByIssue(issueNumber)!;
       expect(github.prs.size).toBe(0);
       expect(await git(['ls-remote', '--heads', 'origin', task.branch as string])).toBe('');
-      if (scenario === 'verify' || scenario === 'verified-operate' || scenario === 'prepare-operate' || scenario === 'advance-operate' || scenario === 'closure-recovery') {
+      if (scenario === 'verify' || scenario === 'verified-operate' || scenario === 'prepare-operate' || scenario === 'advance-operate' ||
+          scenario === 'closure-recovery' || scenario === 'draft-decoy-operate' || scenario === 'superseded-decoy-operate') {
         expect(task).toMatchObject({ state: 'done', commitSha: baseSha, mergeSha: baseSha, attempts: 0 });
         expect(store.listEvents('task.read_only_verified')).toHaveLength(1);
         if (scenario === 'closure-recovery') {
@@ -423,13 +450,25 @@ describe('production supervisor trace', () => {
         }
         expect(github.closedIssues.has(issueNumber)).toBe(true);
         expect(store.listEvents('task.read_only_closed')).toHaveLength(1);
-      } else if (scenario === 'pending-ci' || scenario === 'operate') {
+      } else if (scenario === 'pending-ci' || scenario === 'operate' || scenario === 'completion-decoy-operate') {
         expect(task).toMatchObject({ state: 'waiting', attempts: 0, waitKind: 'provider' });
         expect(github.closedIssues.has(issueNumber)).toBe(false);
       } else {
         expect(task).toMatchObject({ state: 'ready', attempts: 1 });
         expect(github.closedIssues.has(issueNumber)).toBe(false);
         expect(store.listEvents('task.read_only_verified')).toHaveLength(0);
+      }
+      if (scenario === 'ambiguous-operate' || scenario === 'verify-decoy-operate') {
+        expect(task?.lastError).toContain('Ambiguous read-only program authorization');
+        expect(task?.lastError).toContain(`decoy-${scenario}/S1`);
+        expect(task?.lastError).toContain(`${approved.id}/S1`);
+        expect(task?.qwenSessionId).toBeNull();
+        expect(store.listScorecards()).toHaveLength(0);
+      }
+      if (scenario === 'completion-decoy-operate') {
+        expect(task?.lastError).toContain('Waiting for controller-owned staging verification of this exact commit');
+        expect(store.listEvents('task.read_only_verified')).toHaveLength(0);
+        expect(store.listScorecards()[0]?.passed).toBe(true);
       }
       store.close();
     }, 30_000,
@@ -605,14 +644,257 @@ describe('production supervisor trace', () => {
     const controller = new AbortController();
     const tick = supervisor.tick(controller.signal);
     await gates.started;
+    const beforeTask = store.findByIssue(2);
+    expect(beforeTask).toBeDefined();
+    const taskId = beforeTask!.id;
+    const readyEvents = store.listEvents('task.candidate_ready').filter((event) => event.taskId === taskId);
+    expect(readyEvents).toHaveLength(1);
+    const candidate = readyEvents[0]!;
+    expect(candidate.payload).toEqual(expect.objectContaining({
+      commitSha: beforeTask!.commitSha,
+      baseSha: beforeTask!.baseSha,
+      branch: beforeTask!.branch,
+      attempts: 0,
+      readOnly: false,
+    }));
+    const decoy = store.recordEvent('task.candidate_ready', taskId, candidate.payload, 'decoy-candidate-marker');
+    expect(decoy.id).not.toBe(candidate.id);
     controller.abort();
     await tick;
+
+    const interrupted = store.listEvents('task.interrupted').find((event) => event.taskId === taskId);
+    expect(interrupted).toBeDefined();
+    expect(interrupted!.payload.candidateReadyEventId).toBe(candidate.id);
+    expect(interrupted!.payload.candidateReadyEventId).not.toBe(decoy.id);
 
     const task = store.findByIssue(2);
     expect(task).toMatchObject({ state: 'ready', attempts: 0, leaseOwner: null, leaseExpiresAt: null });
     expect(task?.commitSha).toMatch(/^[0-9a-f]{40}$/);
     expect(task?.lastError).toContain('Worker shutdown interrupted');
     store.close();
+  }, 30_000);
+
+  it.each(['pass', 'fail'] as const)('recovers an interrupted exact candidate by rerunning verification without Qwen: %s', async (outcome) => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    config.worker.autoMerge = true;
+    config.gates = [{ id: 'unit', kind: 'unit', command: process.execPath, args: ['check.mjs'], required: true, timeoutMs: 10_000 }];
+    const state = makeTmp('candidate-recovery-state');
+    const store = new PersistentTaskStore('candidate-recovery-project', state);
+    try {
+      const github = new MockGitHub();
+      const git = new GitWorkspace(repo, state, config);
+      const qwen = new MockQwenExecutor();
+      const execute = vi.spyOn(qwen, 'execute');
+      const reviewer = new PassingEvaluator('agentic');
+      const evaluate = vi.spyOn(reviewer, 'evaluate');
+      const rewards = new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), reviewer]);
+      const gates = new BlockingGateRunner();
+      const controller = new AbortController();
+      const firstTick = new HarnessSupervisor(config, store, github, git, qwen, new MockNormalizer(), gates, rewards, silentLogger, 'worker-recovery-abort').tick(controller.signal);
+      await gates.started;
+      controller.abort();
+      await firstTick;
+      const afterAbort = store.findByIssue(2)!;
+      expect(afterAbort).toMatchObject({ state: 'ready', attempts: 0 });
+      const marker = store.listEvents('task.candidate_ready').at(-1)!;
+      const originalSha = afterAbort.commitSha as string;
+      const originalSession = afterAbort.qwenSessionId as string;
+      const realGates = new GateRunner();
+      const runAll = vi.spyOn(realGates, 'runAll');
+      if (outcome === 'fail') {
+        runAll.mockResolvedValueOnce([{
+          id: 'unit', kind: 'unit', required: true, applicable: true, ok: false, exitCode: 1,
+          stdout: '', stderr: 'forced failure', durationMs: 1, command: [], evidenceHash: 'failure',
+        }]);
+      }
+      const supervisor = new HarnessSupervisor(config, store, github, git, qwen, new MockNormalizer(), realGates, rewards, silentLogger, 'worker-recovery-verify');
+      await supervisor.tick();
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(runAll).toHaveBeenCalled();
+      const consumptions = store.listEvents('task.candidate_recovery_consumed');
+      expect(consumptions).toHaveLength(1);
+      expect(consumptions[0]!.payload).toEqual({ markerId: marker.id, eligible: true, consumerId: expect.any(String) });
+      expect(store.findByIssue(2)).toMatchObject({ commitSha: originalSha, qwenSessionId: originalSession });
+      if (outcome === 'pass') {
+        expect(store.findByIssue(2)).toMatchObject({ state: 'done' });
+        expect(github.prs.size).toBe(1);
+        expect(evaluate).toHaveBeenCalled();
+      } else {
+        expect(store.findByIssue(2)).toMatchObject({ state: 'ready', attempts: 1 });
+        expect(github.prs.size).toBe(0);
+        expect(evaluate).not.toHaveBeenCalled();
+        await supervisor.tick();
+        expect(execute).toHaveBeenCalledTimes(2);
+        expect(store.findByIssue(2)).toMatchObject({ state: 'done' });
+        expect(github.prs.size).toBe(1);
+        expect(store.listEvents('task.candidate_recovery_consumed')).toHaveLength(1);
+        expect(store.listEvents('task.candidate_recovery_consumed')[0]!.payload).toEqual(expect.objectContaining({ markerId: marker.id }));
+      }
+    } finally {
+      store.close();
+    }
+  }, 30_000);
+
+  it.each(['dirty', 'untrusted', 'lost-lease'] as const)('guards interrupted candidate recovery against invalid evidence: %s', async (scenario) => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    config.worker.autoMerge = true;
+    config.gates = [{ id: 'unit', kind: 'unit', command: process.execPath, args: ['check.mjs'], required: true, timeoutMs: 10_000 }];
+    const state = makeTmp('candidate-guard-state');
+    const store = new PersistentTaskStore(`candidate-guard-${scenario}`, state);
+    let releaseUnhandledCapture: (() => void) | null = null;
+    try {
+      const github = new MockGitHub();
+      const git = new GitWorkspace(repo, state, config);
+      const qwen = new MockQwenExecutor();
+      const execute = vi.spyOn(qwen, 'execute');
+      const rewards = new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]);
+      const gates = new BlockingGateRunner();
+      const controller = new AbortController();
+      const firstTick = new HarnessSupervisor(config, store, github, git, qwen, new MockNormalizer(), gates, rewards, silentLogger, 'worker-guard-abort').tick(controller.signal);
+      await gates.started;
+      controller.abort();
+      await firstTick;
+      const afterAbort = store.findByIssue(2)!;
+      expect(afterAbort).toMatchObject({ state: 'ready', attempts: 0 });
+      const marker = store.listEvents('task.candidate_ready').at(-1)!;
+      if (scenario === 'dirty') writeFileSync(path.join(afterAbort.worktreePath!, 'extra.txt'), 'changed\n');
+      if (scenario === 'untrusted') (github.issues.get(2) as RemoteIssue).author = 'outsider';
+      const unhandled: unknown[] = [];
+      let foreignLeaseExpiresAt: number | null = null;
+      if (scenario === 'lost-lease') {
+        config.worker.leaseMs = 3_000;
+        const capture = (error: unknown): void => { unhandled.push(error); };
+        process.on('uncaughtException', capture);
+        process.on('unhandledRejection', capture);
+        releaseUnhandledCapture = () => {
+          process.off('uncaughtException', capture);
+          process.off('unhandledRejection', capture);
+        };
+        const realBaseSha = git.baseSha.bind(git);
+        vi.spyOn(git, 'baseSha').mockImplementation(async () => {
+          if (store.get(afterAbort.id).state === 'active') {
+            store.patch(afterAbort.id, { leaseOwner: 'other-worker', leaseExpiresAt: Date.now() + 60_000 });
+            foreignLeaseExpiresAt = store.get(afterAbort.id).leaseExpiresAt;
+            await new Promise((resolve) => setTimeout(resolve, 1_200));
+          }
+          return realBaseSha();
+        });
+      }
+      const realGates = new GateRunner();
+      const runAll = vi.spyOn(realGates, 'runAll');
+      const supervisor = new HarnessSupervisor(config, store, github, git, qwen, new MockNormalizer(), realGates, rewards, silentLogger, 'worker-guard-verify');
+      await supervisor.tick();
+      const consumptions = store.listEvents('task.candidate_recovery_consumed');
+      if (scenario === 'dirty') {
+        expect(execute).toHaveBeenCalledTimes(2);
+        expect(runAll).toHaveBeenCalled();
+        expect(consumptions).toHaveLength(1);
+        expect(consumptions[0]!.payload).toEqual({ markerId: marker.id, eligible: false, consumerId: expect.any(String) });
+        expect(store.findByIssue(2)).toMatchObject({ state: 'done' });
+        expect(github.prs.size).toBe(1);
+      } else if (scenario === 'untrusted') {
+        expect(execute).toHaveBeenCalledTimes(1);
+        expect(runAll).not.toHaveBeenCalled();
+        expect(github.prs.size).toBe(0);
+        expect(consumptions).toHaveLength(0);
+        expect(store.findByIssue(2)).toMatchObject({ state: 'ready', attempts: 1 });
+        expect(store.findByIssue(2)!.lastError).toContain('reauthorization');
+      } else {
+        expect(execute).toHaveBeenCalledTimes(1);
+        expect(runAll).not.toHaveBeenCalled();
+        expect(github.prs.size).toBe(0);
+        expect(consumptions).toHaveLength(0);
+        expect(store.findByIssue(2)).toMatchObject({ state: 'active', leaseOwner: 'other-worker', attempts: 0 });
+        expect(unhandled).toEqual([]);
+        expect(store.findByIssue(2)?.leaseExpiresAt).toBe(foreignLeaseExpiresAt);
+      }
+    } finally {
+      releaseUnhandledCapture?.();
+      store.close();
+    }
+  }, 30_000);
+
+  it('finishes read-only verification after two orderly interruptions without rerunning the model', async () => {
+    const { repo } = await createGitFixture();
+    writeFileSync(path.join(repo, 'feature.txt'), 'existing implementation\n');
+    const git = async (args: string[]) => {
+      const result = await runProcess({ command: 'git', args, cwd: repo, timeoutMs: 20_000 });
+      expect(result.exitCode, result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    await git(['add', 'feature.txt']);
+    await git(['commit', '-m', 'existing feature']);
+    await git(['push', 'origin', 'main']);
+    const baseSha = await git(['rev-parse', 'HEAD']);
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('bot');
+    config.gates = [{ id: 'unit', kind: 'unit', command: process.execPath, args: ['check.mjs'], required: true, timeoutMs: 10_000 }];
+    config.evolution.enabled = false;
+    const state = makeTmp('twice-interrupted-verify-state');
+    const store = new PersistentTaskStore('twice-interrupted-verify', state);
+    try {
+      const github = new MockGitHub();
+      github.issues.clear();
+      const coordinator = new PortfolioCoordinator(config, store, github);
+      const created = await coordinator.createDraft({ sourcePath: 'OBJECTIVE.md', content: 'Verify the existing feature.', draft: {
+        title: 'Existing feature', objective: 'Verify existing behavior', constraints: [], definitionOfDone: ['Independent verification passes'],
+        technologyDecisions: [], deploymentDecisions: [], stories: [{
+          key: 'S1', title: 'Verify existing feature', goal: 'Verify feature.txt and check.mjs', acceptanceCriteria: ['check.mjs passes'],
+          constraints: [], requiredGateIds: ['unit'], rewardCriterionIds: ['execution', 'acceptance', 'independent-review'], risk: 'low',
+          workType: 'verify', dependsOn: [], rollback: 'No repository change', technologyDecisionIds: [], deploymentDecisionIds: [],
+        }],
+      } });
+      const approved = await coordinator.approve(created.plan.id);
+      const issueNumber = approved.stories[0]!.normalizedIssueNumber as number;
+      const workspace = new GitWorkspace(repo, state, config);
+      const qwen = new ReadOnlyQwenExecutor();
+      const execute = vi.spyOn(qwen, 'execute');
+      const reviewer = new PassingEvaluator('agentic');
+      const evaluate = vi.spyOn(reviewer, 'evaluate');
+      const rewards = new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), reviewer]);
+      const markerIds: string[] = [];
+      for (const round of [1, 2]) {
+        const gates = new BlockingGateRunner();
+        const controller = new AbortController();
+        const tick = new HarnessSupervisor(config, store, github, workspace, qwen, new MockNormalizer(), gates, rewards, silentLogger, `worker-verify-interrupted-${round}`).tick(controller.signal);
+        await gates.started;
+        controller.abort();
+        await tick;
+        const interrupted = store.findByIssue(issueNumber)!;
+        expect(interrupted).toMatchObject({ state: 'ready', attempts: 0, commitSha: baseSha });
+        expect(execute).toHaveBeenCalledTimes(1);
+        markerIds.push(store.listEvents('task.candidate_ready').at(-1)!.id);
+        if (round === 2) {
+          expect(markerIds[1]).not.toBe(markerIds[0]);
+          const stop = store.listEvents('task.interrupted').filter((event) => event.taskId === interrupted.id).at(-1)!;
+          expect(stop.payload.candidateReadyEventId).toBe(markerIds[1]);
+          const first = store.listEvents('task.candidate_recovery_consumed');
+          expect(first).toHaveLength(1);
+          expect(first[0]!.payload).toEqual({ markerId: markerIds[0], eligible: true, consumerId: expect.any(String) });
+        }
+      }
+      const realGates = new GateRunner();
+      const runAll = vi.spyOn(realGates, 'runAll');
+      await new HarnessSupervisor(config, store, github, workspace, qwen, new MockNormalizer(), realGates, rewards, silentLogger, 'worker-verify-recovered').tick();
+      const done = store.findByIssue(issueNumber)!;
+      expect(done).toMatchObject({ state: 'done', attempts: 0, qwenSessionId: 'read-only-session', baseSha, commitSha: baseSha, mergeSha: baseSha });
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(runAll).toHaveBeenCalled();
+      expect(evaluate).toHaveBeenCalled();
+      expect(github.prs.size).toBe(0);
+      const consumptions = store.listEvents('task.candidate_recovery_consumed');
+      expect(consumptions).toHaveLength(2);
+      expect(consumptions[1]!.payload).toEqual({ markerId: markerIds[1], eligible: true, consumerId: expect.any(String) });
+      expect(consumptions[0]!.id).not.toBe(consumptions[1]!.id);
+      expect(consumptions[0]!.payload.consumerId).not.toBe(consumptions[1]!.payload.consumerId);
+    } finally {
+      store.close();
+    }
   }, 30_000);
 
   it('normalizes, leases, executes Qwen, gates, rewards, pushes, opens, merges, and post-merge verifies', async () => {
