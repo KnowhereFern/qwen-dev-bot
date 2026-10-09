@@ -326,6 +326,16 @@ export interface RepositoryAssessment {
   reviewCorrections?: Array<{ id: string; rationale: string; omitReason: 'separate_validation' | 'program_operating_record' | null }>;
 }
 
+export interface ApprovedProgramContract {
+  approvedRevision: number;
+  currentWave: number;
+  title: string;
+  constraints: string[];
+  definitionOfDone: string[];
+  technologyDecisions: TechnologyDecision[];
+  deploymentDecisions: DeploymentDecision[];
+}
+
 export interface ProgramRevision {
   number: number;
   assessmentId: string;
@@ -339,6 +349,10 @@ export interface ProgramRevision {
   objectiveContentHash?: string;
   objectiveSourceContent?: string;
   objectiveSourcePath?: string;
+  priorApprovedContract?: ApprovedProgramContract;
+  rejectedAt?: number;
+  rejection?: { operator: string; reason: string; provenance: string };
+  restoresRevision?: number;
 }
 
 export interface PortfolioStory {

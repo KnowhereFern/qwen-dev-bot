@@ -9,12 +9,48 @@ import { EvolutionSignalCollector } from '../src/evolution/signals.js';
 import type { CheckSummary, GitHubControl, RemoteIssue, RemotePullRequest } from '../src/github/control-plane.js';
 import { PortfolioPlanner, type PortfolioPlanningModel } from '../src/portfolio/planner.js';
 import { RecoveryLineageError } from '../src/portfolio/coordinator.js';
-import { ProgramController } from '../src/program/controller.js';
+import { materialRevision, preserveDecisionIdentities, ProgramController } from '../src/program/controller.js';
 import { AssessmentContractError, RepositoryAssessor } from '../src/program/repository-assessor.js';
 import { createGitFixture } from './fixtures/git.js';
 import { makeTmp } from './helpers.js';
 
 describe('ProgramController', () => {
+  it('never treats pending material decisions as approved reassessment inputs', async () => {
+    const fixture = recoveryFixture('quarantined', 3);
+    const plan = fixture.store.getPortfolioPlan('recovery')!;
+    await expect(fixture.controller.reassess({ ...plan, status: 'awaiting_material_approval' }))
+      .rejects.toThrow('proposed decisions are not approved');
+    fixture.store.close();
+  });
+  it('retains approved exceptions across reorderings and maps renamed references to frozen identities', () => {
+    const plan = { technologyDecisions: [
+      { id: 'OLD1', category: 'language', technology: 'TypeScript', source: 'exception', rationale: 'Approved' },
+      { id: 'OLD2', category: 'runtime', technology: 'Node', source: 'approved', rationale: 'Approved' },
+    ], deploymentDecisions: [{ id: 'DEP', component: 'web', provider: 'Railway', environment: 'staging', authority: 'staging', rationale: 'Approved' }] } as unknown as PortfolioPlan;
+    const draft = { technologyDecisions: [...plan.technologyDecisions].reverse().map((d, i) => ({ ...d, id: `NEW${i}`, rationale: 'Reworded' })),
+      deploymentDecisions: plan.deploymentDecisions.map((d) => ({ ...d, id: 'NEWDEP' })),
+      stories: [{ technologyDecisionIds: ['NEW1'], deploymentDecisionIds: ['NEWDEP'] }],
+    } as Awaited<ReturnType<PortfolioPlanner['plan']>>;
+    const original = structuredClone(plan);
+    expect(materialRevision(plan, draft)).toBe(false);
+    preserveDecisionIdentities(plan, draft);
+    expect(draft.technologyDecisions).toEqual(plan.technologyDecisions);
+    expect(draft.stories[0]?.technologyDecisionIds).toEqual(['OLD1']);
+    expect(draft.stories[0]?.deploymentDecisionIds).toEqual(['DEP']);
+    expect(plan).toEqual(original);
+    for (const change of [
+      (next: typeof draft) => { next.technologyDecisions[0]!.technology = 'Python'; },
+      (next: typeof draft) => { next.technologyDecisions[0]!.source = 'approved'; },
+      (next: typeof draft) => { next.deploymentDecisions[0]!.environment = 'production'; },
+      (next: typeof draft) => { next.deploymentDecisions[0]!.provider = 'Other'; },
+      (next: typeof draft) => { next.deploymentDecisions[0]!.authority = 'build-test-only'; },
+      (next: typeof draft) => { next.technologyDecisions.pop(); },
+    ]) {
+      const next = structuredClone(draft); change(next);
+      expect(materialRevision(plan, next)).toBe(true);
+      expect(() => preserveDecisionIdentities(plan, next)).toThrow(/material/);
+    }
+  });
   it.each(['failed', 'quarantined'] as const)('does not generate replacement budgets for exhausted %s work', async (state) => {
     const fixture = recoveryFixture(state, 5);
     const reassess = vi.spyOn(fixture.controller, 'reassess');

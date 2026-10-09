@@ -63,12 +63,17 @@ describe('portfolio planner validation', () => {
 
     await new PortfolioPlanner(config, model).plan(
       { sourcePath: 'OBJECTIVE.md', content: 'Build runner claims.' }, 5, assessment, 'Review evidence: pickup coverage is missing.',
+      { technologyDecisions: [{ id: 'TD6', category: 'storage', technology: 'SQLite', source: 'exception', rationale: 'Approved local persistence' }], deploymentDecisions: [], constraints: ['Retain durable storage'], definitionOfDone: ['Real restart passes'] },
     );
 
     expect(prompt).toContain('Mandatory coverage/action matrix: [{"id":"RUNNERS"');
     expect(prompt).toContain('"requiredAction":"implement"');
     expect(prompt).not.toContain('SHOULD_NOT_REACH_PLANNER');
     expect(prompt).toContain('<program-review-evidence>Review evidence: pickup coverage is missing.</program-review-evidence>');
+    expect(prompt).toContain('Frozen approved program decisions:');
+    expect(prompt).toContain('"technology":"SQLite","source":"exception"');
+    expect(prompt).toContain('Retain durable storage');
+    expect(prompt).toContain('Real restart passes');
   });
 
   it('corrects a rejected coverage contract using the exact validator error and original assessment', async () => {

@@ -125,6 +125,9 @@ export class ProgramController {
     repositorySha?: string,
     sourceSignalId?: string,
   ): Promise<ProgramTickResult> {
+    if (plan.status === 'awaiting_material_approval') {
+      throw new Error('Resolve the pending material revision before reassessing; its proposed decisions are not approved');
+    }
     const document = frozenRequirements(this.config.project.root, plan);
     const targetCommitSha = repositorySha ?? await this.remoteHead(signal);
     const deployment = plan.latestDeploymentId ? this.store.getDeployment(plan.latestDeploymentId) : null;
@@ -178,8 +181,14 @@ export class ProgramController {
       });
       return { action: 'reassessed', planId: plan.id, detail: 'Objective is externally blocked' };
     }
-    const draft = await this.planner.plan(document, undefined, assessment);
+    const draft = await this.planner.plan(document, undefined, assessment, undefined, {
+      technologyDecisions: structuredClone(plan.technologyDecisions),
+      deploymentDecisions: structuredClone(plan.deploymentDecisions),
+      constraints: [...plan.constraints],
+      definitionOfDone: [...plan.definitionOfDone],
+    });
     const material = materialRevision(plan, draft);
+    if (!material) preserveDecisionIdentities(plan, draft);
     const revised = await this.coordinator.revise({
       planId: plan.id,
       draft,
@@ -356,10 +365,33 @@ function frozenRequirements(root: string, plan: PortfolioPlan) {
   return document;
 }
 
-function materialRevision(plan: PortfolioPlan, draft: Awaited<ReturnType<PortfolioPlanner['plan']>>): boolean {
-  const frozenTechnologies = JSON.stringify(plan.technologyDecisions.map(({ id, category, technology, source }) => ({ id, category, technology, source })));
-  const nextTechnologies = JSON.stringify(draft.technologyDecisions.map(({ id, category, technology, source }) => ({ id, category, technology, source })));
-  const frozenDeployments = JSON.stringify(plan.deploymentDecisions.map(({ id, component, provider, environment, authority }) => ({ id, component, provider, environment, authority })));
-  const nextDeployments = JSON.stringify(draft.deploymentDecisions.map(({ id, component, provider, environment, authority }) => ({ id, component, provider, environment, authority })));
-  return frozenTechnologies !== nextTechnologies || frozenDeployments !== nextDeployments || draft.technologyDecisions.some((decision) => decision.source === 'exception');
+const technologyIdentity = ({ category, technology, source }: PortfolioPlan['technologyDecisions'][number]) => JSON.stringify([category, technology, source]);
+const deploymentIdentity = ({ component, provider, environment, authority }: PortfolioPlan['deploymentDecisions'][number]) => JSON.stringify([component, provider, environment, authority]);
+
+export function materialRevision(plan: PortfolioPlan, draft: Awaited<ReturnType<PortfolioPlanner['plan']>>): boolean {
+  const canonical = <T>(items: T[], identity: (item: T) => string) => JSON.stringify(items.map(identity).sort());
+  return canonical(plan.technologyDecisions, technologyIdentity) !== canonical(draft.technologyDecisions, technologyIdentity) ||
+    canonical(plan.deploymentDecisions, deploymentIdentity) !== canonical(draft.deploymentDecisions, deploymentIdentity);
+}
+
+export function preserveDecisionIdentities(plan: PortfolioPlan, draft: Awaited<ReturnType<PortfolioPlanner['plan']>>): void {
+  if (materialRevision(plan, draft)) throw new Error('Cannot preserve identities across material decision changes');
+  const technologies = new Map(draft.technologyDecisions.map((decision) => [decision.id,
+    plan.technologyDecisions.find((frozen) => technologyIdentity(frozen) === technologyIdentity(decision))!.id]));
+  const deployments = new Map(draft.deploymentDecisions.map((decision) => [decision.id,
+    plan.deploymentDecisions.find((frozen) => deploymentIdentity(frozen) === deploymentIdentity(decision))!.id]));
+  for (const story of draft.stories) {
+    story.technologyDecisionIds = story.technologyDecisionIds.map((id) => {
+      const frozen = technologies.get(id);
+      if (!frozen) throw new Error(`Unknown proposed technology decision ${id}`);
+      return frozen;
+    });
+    story.deploymentDecisionIds = story.deploymentDecisionIds.map((id) => {
+      const frozen = deployments.get(id);
+      if (!frozen) throw new Error(`Unknown proposed deployment decision ${id}`);
+      return frozen;
+    });
+  }
+  draft.technologyDecisions = structuredClone(plan.technologyDecisions);
+  draft.deploymentDecisions = structuredClone(plan.deploymentDecisions);
 }

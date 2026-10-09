@@ -82,6 +82,77 @@ function draft(): PortfolioDraft {
 }
 
 describe('PortfolioCoordinator', () => {
+  it.each(['snapshot', 'legacy', 'missing-proof', 'normalized', 'stale', 'concurrent'] as const)('rejects material revisions without losing approved history: %s', async (scenario) => {
+    const config = defaultProjectConfig(makeTmp('reject-root'), 'project', 'owner/project');
+    config.program.enabled = true; config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('reject-project', makeTmp('reject-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const assessment: RepositoryAssessment = { id: 'before', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false, detectedStacks: ['node'], files: [], analyses: [], coverage: [], createdAt: 1 };
+      store.saveRepositoryAssessment(assessment);
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: draft(), assessment });
+      const approved = await coordinator.approve(created.plan.id);
+      store.upsert({ issueNumber: approved.stories[0].normalizedIssueNumber!, title: 'done', state: 'done' });
+      const changed = draft(); changed.technologyDecisions = [{ ...changed.technologyDecisions[0], technology: 'Different hosting' }];
+      changed.constraints.push('New unapproved constraint'); changed.definitionOfDone.push('New unapproved criterion');
+      const nextAssessment = { ...assessment, id: 'after', commitSha: 'b'.repeat(40) }; store.saveRepositoryAssessment(nextAssessment);
+      let pending = await coordinator.revise({ planId: approved.id, draft: changed, assessment: nextAssessment, reason: 'wave-complete', material: true, summary: 'Unapproved scope change' });
+      const savedContract = pending.revisions!.at(-1)!.priorApprovedContract!;
+      expect(savedContract.technologyDecisions).toEqual(approved.technologyDecisions);
+      if (scenario === 'legacy' || scenario === 'missing-proof') {
+        pending = { ...pending, revisions: pending.revisions!.map((entry) => ({ ...entry, priorApprovedContract: undefined })) };
+        store.savePortfolioPlan(pending);
+      }
+      if (scenario === 'normalized') {
+        pending = { ...pending, stories: pending.stories.map((story) => story.revision === 2 ? { ...story, normalizedIssueNumber: 999 } : story) };
+        store.savePortfolioPlan(pending);
+      }
+      const issuesBefore = github.issues.size;
+      const request = { planId: pending.id, expected: { revision: scenario === 'stale' ? 1 : 2, contentHash: pending.contentHash }, operator: 'Test operator', reason: 'Preserve approved decisions',
+        ...(scenario === 'legacy' ? { legacyRecovery: { contract: savedContract, provenance: 'Verified master issue history at approved revision' } } : {}) };
+      if (scenario === 'concurrent') {
+        let release!: () => void;
+        let entered!: () => void;
+        const waiting = new Promise<void>((resolve) => { entered = resolve; });
+        const resume = new Promise<void>((resolve) => { release = resolve; });
+        github.listOpenIssues = async () => { entered(); await resume; return [...github.issues.values()]; };
+        const rejection = coordinator.rejectMaterialRevision(request);
+        await waiting;
+        const concurrentlyApproved = { ...pending, status: 'active' as const, updatedAt: pending.updatedAt + 1 };
+        store.savePortfolioPlan(concurrentlyApproved);
+        release();
+        await expect(rejection).rejects.toThrow('changed during rejection');
+        expect(store.getPortfolioPlan(pending.id)).toEqual(concurrentlyApproved);
+      } else if (['missing-proof', 'normalized', 'stale'].includes(scenario)) {
+        await expect(coordinator.rejectMaterialRevision(request)).rejects.toThrow();
+        expect(store.getPortfolioPlan(pending.id)).toEqual(pending);
+      } else {
+        const restored = await coordinator.rejectMaterialRevision(request);
+        expect(restored.revision).toBe(3); expect(restored.currentWave).toBe(1); expect(restored.status).toBe('assessing');
+        expect(restored.technologyDecisions).toEqual(approved.technologyDecisions);
+        expect(restored.constraints).toEqual(approved.constraints); expect(restored.definitionOfDone).toEqual(approved.definitionOfDone);
+        expect(restored.stories[0]).toEqual(approved.stories[0]);
+        expect(restored.stories[1].supersededAt).toBeNull();
+        expect(restored.stories.filter((story) => story.revision === 2).every((story) => story.supersededAt !== null)).toBe(true);
+        expect(restored.revisions![1].rejectedAt).toBeTypeOf('number');
+        expect(restored.revisions![2].restoresRevision).toBe(1);
+        expect(store.listEvents('program.material_revision_rejected')).toHaveLength(1);
+        expect(store.list()[0].state).toBe('done');
+        expect(github.issues.size).toBe(issuesBefore);
+        const remaining = draft(); remaining.stories = [{ ...remaining.stories[1], dependsOn: [] }];
+        const resumed = await coordinator.revise({ planId: restored.id, draft: remaining, assessment: nextAssessment, reason: 'wave-complete', material: false, summary: 'Continue approved work' });
+        const next = resumed.stories.find((story) => story.revision === 4)!;
+        expect(resumed.currentWave).toBe(2);
+        expect(next.dependsOn).toEqual([approved.stories[0].key]);
+        expect(next.normalizedIssueNumber).not.toBeNull();
+        expect(resumed.stories.find((story) => story.key === approved.stories[1].key)?.supersededAt).not.toBeNull();
+      }
+      if (!['snapshot', 'legacy'].includes(scenario)) expect(github.issues.size).toBe(issuesBefore);
+    } finally { store.close(); }
+  });
+
   it.each(['empty', 'optional', 'security'])('keeps a program draft unapproved without required product gates: %s', async (kind) => {
     const config = defaultProjectConfig(makeTmp('portfolio-gate-root'), 'project', 'owner/project');
     config.program.enabled = true;

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { PersistentTaskStore } from '../core/persistent-store.js';
 import type {
+  ApprovedProgramContract,
   PortfolioPlan,
   PortfolioStory,
   ProgramRevision,
@@ -336,6 +337,12 @@ export class PortfolioCoordinator {
       createdAt: now,
       approvedAt: input.material && !input.approvedMaterial ? null : now,
       sourceSignalId: input.sourceSignalId ?? null,
+      ...(input.material ? { priorApprovedContract: {
+        approvedRevision: [...(current.revisions ?? [])].reverse().find((entry) => entry.approvedAt !== null && !entry.rejectedAt)?.number ?? current.revision ?? 1,
+        currentWave: current.currentWave ?? 1,
+        title: current.title, constraints: [...current.constraints], definitionOfDone: [...current.definitionOfDone],
+        technologyDecisions: structuredClone(current.technologyDecisions), deploymentDecisions: structuredClone(current.deploymentDecisions),
+      } } : {}),
     };
     let plan = this.save({
       ...current,
@@ -364,6 +371,63 @@ export class PortfolioCoordinator {
     }, `program:revision:${plan.id}:${nextRevision}`);
     if (!input.material || input.approvedMaterial) plan = await this.activateWave(plan.id, plan.currentWave ?? 1);
     return plan;
+  }
+
+  async rejectMaterialRevision(input: {
+    planId: string;
+    expected: { revision: number; contentHash: string };
+    operator: string;
+    reason: string;
+    legacyRecovery?: { contract: ApprovedProgramContract; provenance: string };
+  }): Promise<PortfolioPlan> {
+    const current = this.requirePlan(input.planId);
+    if (!this.config.program.enabled || current.status !== 'awaiting_material_approval') throw new Error('Only a pending material program revision can be rejected');
+    if (current.revision !== input.expected.revision || current.contentHash !== input.expected.contentHash) throw new Error('The program changed since review');
+    if (!input.operator.trim() || !input.reason.trim()) throw new Error('Rejection requires an operator and reason');
+    const pending = current.revisions?.find((entry) => entry.number === current.revision);
+    if (!pending?.material || pending.approvedAt !== null || pending.rejectedAt) throw new Error('Revision is not an unapproved material proposal');
+    const actor = await this.github.currentUser();
+    if (!this.config.intake.trustedAuthors.includes(actor)) throw new Error(`GitHub user ${actor} is not in intake.trustedAuthors`);
+    const contract = pending.priorApprovedContract ?? input.legacyRecovery?.contract;
+    const provenance = pending.priorApprovedContract ? 'Saved prior approved contract' : input.legacyRecovery?.provenance;
+    if (!contract || !provenance?.trim()) throw new Error('Legacy revision needs the complete verified prior approved contract and recovery provenance');
+    if (!Number.isSafeInteger(contract.currentWave) || contract.currentWave < 1) throw new Error('Recovery requires the prior approved current wave');
+    const approved = current.revisions?.find((entry) => entry.number === contract.approvedRevision && entry.approvedAt !== null && !entry.rejectedAt);
+    const latestApproved = [...(current.revisions ?? [])].reverse().find((entry) => entry.number < pending.number && entry.approvedAt !== null && !entry.rejectedAt);
+    if (!approved || approved.number !== latestApproved?.number) throw new Error('Recovery must reference the latest earlier approved revision');
+    const assessment = this.store.getRepositoryAssessment(approved.assessmentId);
+    if (!assessment || assessment.projectId !== current.projectId) throw new Error('Prior approved assessment is unavailable');
+    const proposed = current.stories.filter((story) => story.revision === pending.number);
+    const remote = await this.github.listOpenIssues();
+    if (proposed.some((story) => story.normalizedIssueNumber !== null ||
+      this.store.list().some((task) => task.body.includes(`${NORMALIZED_STORY_MARKER} ${current.id}:${story.key} -->`)) ||
+      remote.some((issue) => issue.body.includes(`${NORMALIZED_STORY_MARKER} ${current.id}:${story.key} -->`)))) {
+      throw new Error('Pending revision has normalized execution work; reconcile it before rejection');
+    }
+    if (JSON.stringify(this.requirePlan(current.id)) !== JSON.stringify(current)) throw new Error('The program changed during rejection; review again');
+    const now = Date.now();
+    const nextRevision = pending.number + 1;
+    const restored: PortfolioPlan = {
+      ...current, title: contract.title, constraints: [...contract.constraints], definitionOfDone: [...contract.definitionOfDone],
+      technologyDecisions: structuredClone(contract.technologyDecisions), deploymentDecisions: structuredClone(contract.deploymentDecisions),
+      assessmentId: approved.assessmentId, repositorySha: approved.repositorySha, coverage: structuredClone(assessment.coverage),
+      revision: nextRevision, currentWave: contract.currentWave, status: 'assessing', updatedAt: now,
+      stories: current.stories.map((story) => story.revision === pending.number ? { ...story, supersededAt: now }
+        : story.normalizedIssueNumber === null && story.supersededAt === pending.createdAt ? { ...story, supersededAt: null } : story),
+      revisions: [...(current.revisions ?? []).map((entry) => entry.number === pending.number
+        ? { ...entry, priorApprovedContract: structuredClone(contract), rejectedAt: now, rejection: { operator: input.operator, reason: input.reason, provenance } } : entry), {
+        number: nextRevision, assessmentId: approved.assessmentId, repositorySha: approved.repositorySha,
+        reason: 'manual', material: false, summary: `Rejected revision ${pending.number}; restored approved revision ${approved.number}: ${input.reason}`,
+        createdAt: now, approvedAt: approved.approvedAt, restoresRevision: approved.number,
+      }],
+    };
+    this.save(restored);
+    this.store.recordEvent('program.material_revision_rejected', null, {
+      planId: current.id, rejectedRevision: pending.number, revision: nextRevision, restoredRevision: approved.number,
+      operator: input.operator, actor, reason: input.reason, provenance,
+    }, `program:rejected:${current.id}:${pending.number}`);
+    await this.updateEpic(restored);
+    return restored;
   }
 
   private recoveryOrigins(current: PortfolioPlan, draft: PortfolioDraft, assessment: RepositoryAssessment, material: boolean): Map<string, number> {
