@@ -61,6 +61,17 @@ export interface PortfolioPlanningModel {
   }): Promise<{ value: T }>;
 }
 
+export interface PortfolioPlanningProgress {
+  stage: 'draft-started' | 'validation-retry' | 'validated' | 'failed' | 'aborted';
+  attempt: number;
+  maxAttempts: number;
+}
+
+export interface PortfolioPlanningOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: PortfolioPlanningProgress) => void;
+}
+
 export class PortfolioPlanner {
   constructor(
     private readonly config: ProjectConfig,
@@ -73,6 +84,7 @@ export class PortfolioPlanner {
     assessment?: RepositoryAssessment,
     reviewFeedback?: string,
     frozenDecisions?: Pick<PortfolioPlan, 'technologyDecisions' | 'deploymentDecisions'> & Partial<Pick<PortfolioPlan, 'constraints' | 'definitionOfDone'>>,
+    options: PortfolioPlanningOptions = {},
   ): Promise<PortfolioDraft> {
     assertMaxStories(maxStories);
     const gateIds = this.config.gates.map((gate) => gate.id);
@@ -97,6 +109,7 @@ export class PortfolioPlanner {
       coverage: assessment.coverage,
     } : null;
     const request = {
+      signal: options.signal,
       reasoningEffort: this.config.qwen.triageReasoning,
       maxTokens: Math.min(32_768, 2_048 + maxStories * 750),
       jsonSchema: portfolioDraftSchema(maxStories),
@@ -142,38 +155,49 @@ export class PortfolioPlanner {
         '</requirements>',
       ].join('\n'),
     };
-    let response = await this.model.completeJson<unknown>(request);
+    let attempt = 0;
+    const report = (stage: PortfolioPlanningProgress['stage']) => options.onProgress?.({ stage, attempt, maxAttempts: MAX_PLANNING_ATTEMPTS });
     let draft: PortfolioDraft | null = null;
-    for (let attempt = 1; attempt <= MAX_PLANNING_ATTEMPTS; attempt += 1) {
-      try {
-        draft = validatePortfolioDraft(
-          response.value,
-          gateIds,
-          rewardIds,
-          maxStories,
-          this.config.technologyPolicy,
-          assessment?.coverage,
-        );
-        break;
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        if (attempt === MAX_PLANNING_ATTEMPTS) {
-          throw new Error(`Portfolio planning failed after ${MAX_PLANNING_ATTEMPTS} bounded attempts: ${detail}`);
-        }
-        response = await this.model.completeJson<unknown>({
-          ...request,
-          user: [
+    let user = request.user;
+    try {
+      options.signal?.throwIfAborted();
+      for (attempt = 1; attempt <= MAX_PLANNING_ATTEMPTS; attempt += 1) {
+        report(attempt === 1 ? 'draft-started' : 'validation-retry');
+        options.signal?.throwIfAborted();
+        const response = await this.model.completeJson<unknown>({ ...request, user });
+        options.signal?.throwIfAborted();
+        try {
+          draft = validatePortfolioDraft(
+            response.value,
+            gateIds,
+            rewardIds,
+            maxStories,
+            this.config.technologyPolicy,
+            assessment?.coverage,
+          );
+          break;
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          if (attempt === MAX_PLANNING_ATTEMPTS) {
+            throw new Error(`Portfolio planning failed after ${MAX_PLANNING_ATTEMPTS} bounded attempts: ${detail}`);
+          }
+          user = [
             request.user,
             `<validation-correction attempt="${attempt + 1}" maximum="${MAX_PLANNING_ATTEMPTS}">`,
             `Controller rejected the previous draft: ${detail}`,
             'Return a corrected complete program. Preserve the objective, frozen decisions, and all valid coverage. Do not weaken checks or relabel verification criteria as implementation.',
             `<rejected-draft>${JSON.stringify(response.value)}</rejected-draft>`,
             '</validation-correction>',
-          ].join('\n'),
-        });
+          ].join('\n');
+        }
       }
+      if (!draft) throw new Error('Portfolio planning did not produce a validated draft');
+      report('validated');
+      options.signal?.throwIfAborted();
+    } catch (error) {
+      report(options.signal?.aborted ? 'aborted' : 'failed');
+      throw error;
     }
-    if (!draft) throw new Error('Portfolio planning did not produce a validated draft');
     return {
       ...draft,
       deploymentDecisions: draft.deploymentDecisions.map((decision) => ({

@@ -89,6 +89,8 @@ export async function createProductionHarness(
       new RepositoryAssessor(config, qwenApi),
       planner,
       new EvolutionSignalCollector(config, store, github, qwenApi),
+      undefined,
+      options.logger,
     );
     const selfHosting = new ControllerReleaseManager(config, store);
     return { supervisor, program, selfHosting, store, github, close: () => store.close() };

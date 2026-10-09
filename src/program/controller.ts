@@ -4,6 +4,7 @@ import type { PortfolioPlan, ProgramRevision, ProjectConfig } from '../core/type
 import { StagingDeploymentController } from '../deployment/controller.js';
 import { EvolutionSignalCollector } from '../evolution/signals.js';
 import { REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from '../github/control-plane.js';
+import type { Logger } from '../logger.js';
 import { matchesPortfolioTaskContract, PortfolioCoordinator, RecoveryLineageError } from '../portfolio/coordinator.js';
 import { PortfolioPlanner, readRequirementsDocument } from '../portfolio/planner.js';
 import { runProcess } from '../runtime/safe-process.js';
@@ -27,6 +28,7 @@ export class ProgramController {
     private readonly planner: PortfolioPlanner,
     private readonly signals: EvolutionSignalCollector,
     deployer?: StagingDeploymentController,
+    private readonly logger?: Logger,
   ) {
     this.coordinator = new PortfolioCoordinator(config, store, github);
     this.deployer = deployer ?? new StagingDeploymentController(config, store);
@@ -125,6 +127,7 @@ export class ProgramController {
     repositorySha?: string,
     sourceSignalId?: string,
   ): Promise<ProgramTickResult> {
+    signal?.throwIfAborted();
     if (plan.status === 'awaiting_material_approval') {
       throw new Error('Resolve the pending material revision before reassessing; its proposed decisions are not approved');
     }
@@ -150,8 +153,10 @@ export class ProgramController {
       : [];
     const operationalEvidence = [...checkEvidence, ...deploymentEvidence];
     const assessment = await this.assessor.assess(document, signal, operationalEvidence, targetCommitSha, undefined, plan.coverage ?? []);
+    signal?.throwIfAborted();
     this.store.saveRepositoryAssessment(assessment);
     await this.recordExternalCommits(plan, assessment.commitSha, signal);
+    signal?.throwIfAborted();
     const auditComplete = assessment.coverage.length > 0 && assessment.coverage.every((entry) => entry.status === 'implemented');
     if (auditComplete) {
       const now = Date.now();
@@ -186,7 +191,15 @@ export class ProgramController {
       deploymentDecisions: structuredClone(plan.deploymentDecisions),
       constraints: [...plan.constraints],
       definitionOfDone: [...plan.definitionOfDone],
+    }, {
+      signal,
+      onProgress: (progress) => {
+        const payload = { planId: plan.id, revision: plan.revision ?? 1, assessmentId: assessment.id, ...progress };
+        this.store.recordEvent('program.planning_progress', null, payload);
+        this.logger?.info('program planning progress', payload);
+      },
     });
+    signal?.throwIfAborted();
     const material = materialRevision(plan, draft);
     if (!material) preserveDecisionIdentities(plan, draft);
     const revised = await this.coordinator.revise({

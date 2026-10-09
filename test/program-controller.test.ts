@@ -6,15 +6,48 @@ import { projectIdFor } from '../src/core/state-paths.js';
 import type { PortfolioPlan, TaskSpec } from '../src/core/types.js';
 import { StagingDeploymentController } from '../src/deployment/controller.js';
 import { EvolutionSignalCollector } from '../src/evolution/signals.js';
+import { Logger, type LogRecord } from '../src/logger.js';
 import type { CheckSummary, GitHubControl, RemoteIssue, RemotePullRequest } from '../src/github/control-plane.js';
 import { PortfolioPlanner, type PortfolioPlanningModel } from '../src/portfolio/planner.js';
-import { RecoveryLineageError } from '../src/portfolio/coordinator.js';
+import { PortfolioCoordinator, RecoveryLineageError } from '../src/portfolio/coordinator.js';
 import { materialRevision, preserveDecisionIdentities, ProgramController } from '../src/program/controller.js';
 import { AssessmentContractError, RepositoryAssessor } from '../src/program/repository-assessor.js';
 import { createGitFixture } from './fixtures/git.js';
 import { makeTmp } from './helpers.js';
 
 describe('ProgramController', () => {
+  it('records safe planning progress and refuses publication after cancellation', async () => {
+    const logs: LogRecord[] = [];
+    const fixture = recoveryFixture('quarantined', 3, undefined, new Logger({ sink: (record) => logs.push(record) }));
+    const plan = fixture.store.getPortfolioPlan('recovery')!;
+    const abort = new AbortController();
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue({
+      id: 'progress-assessment', projectId: fixture.store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+      files: [], analyses: [], detectedStacks: [], createdAt: 1,
+      coverage: [{ id: 'REQ1', requirement: 'Deliver', status: 'missing', requiredAction: 'implement', rationale: 'Missing', evidence: [] }],
+    });
+    const revise = vi.spyOn(PortfolioCoordinator.prototype, 'revise');
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockImplementation(async (...args) => {
+      expect(args[5]?.signal).toBe(abort.signal);
+      args[5]?.onProgress?.({ stage: 'draft-started', attempt: 1, maxAttempts: 3 });
+      abort.abort(new Error('cancelled before publication'));
+      return { title: 'Draft', objective: 'Deliver', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [], stories: [] };
+    });
+    try {
+      await expect(fixture.controller.reassess(plan, 'manual', abort.signal, false, 'a'.repeat(40)))
+        .rejects.toThrow('cancelled before publication');
+      expect(revise).not.toHaveBeenCalled();
+      expect(fixture.store.getPortfolioPlan(plan.id)).toEqual(plan);
+      expect(fixture.store.listEvents('program.planning_progress').map((event) => event.payload)).toEqual([
+        { planId: plan.id, revision: 1, assessmentId: 'progress-assessment', stage: 'draft-started', attempt: 1, maxAttempts: 3 },
+      ]);
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toMatchObject({ msg: 'program planning progress', planId: plan.id, stage: 'draft-started', attempt: 1 });
+    } finally {
+      assess.mockRestore(); revise.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
   it('never treats pending material decisions as approved reassessment inputs', async () => {
     const fixture = recoveryFixture('quarantined', 3);
     const plan = fixture.store.getPortfolioPlan('recovery')!;
@@ -202,7 +235,7 @@ describe('ProgramController', () => {
   });
 });
 
-function recoveryFixture(state: 'failed' | 'quarantined', failures: number, directory = makeTmp('recovery-budget-controller')) {
+function recoveryFixture(state: 'failed' | 'quarantined', failures: number, directory = makeTmp('recovery-budget-controller'), logger?: Logger) {
   const config = defaultProjectConfig(directory, 'fixture', 'owner/fixture');
   config.program.enabled = true; config.evolution.enabled = false;
   const store = new PersistentTaskStore(projectIdFor(config), directory);
@@ -220,7 +253,7 @@ function recoveryFixture(state: 'failed' | 'quarantined', failures: number, dire
   }
   const github = new EmptyGitHub();
   const model = new ImplementedAssessmentModel('unit');
-  const controller = new ProgramController(config, store, github, new RepositoryAssessor(config, model), new PortfolioPlanner(config, model), new EvolutionSignalCollector(config, store, github, model));
+  const controller = new ProgramController(config, store, github, new RepositoryAssessor(config, model), new PortfolioPlanner(config, model), new EvolutionSignalCollector(config, store, github, model), undefined, logger);
   return { controller, store, directory };
 }
 
