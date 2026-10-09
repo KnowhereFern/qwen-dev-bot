@@ -1,7 +1,7 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { CommunityCollector, CommunityScanResult } from './community/collector.js';
-import type { ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
+import type { GateResult, ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
 import { REQUIRED_GITHUB_CHECKS, REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
@@ -509,19 +509,6 @@ export class HarnessSupervisor {
         const current = this.store.get(task.id);
         if (signal?.aborted) {
           this.store.recordEvent('task.reconciliation_interrupted', task.id, { state: current.state });
-        } else if (current.state === 'post_merge') {
-          const message = error instanceof Error ? error.message : String(error);
-          const updated = this.store.recordPostMergeFailure(
-            task.id,
-            message,
-            this.config.worker.identicalFailureLimit,
-          );
-          this.logger.warn('post-merge verification retry scheduled', {
-            taskId: task.id,
-            state: updated.state,
-            attempts: updated.attempts,
-            error: message,
-          });
         } else {
           await this.failAttempt(task.id, error);
         }
@@ -615,6 +602,8 @@ export class HarnessSupervisor {
 
   private async runPostMerge(task: TaskRecord, signal?: AbortSignal): Promise<void> {
     if (!task.mergeSha) throw new Error('Post-merge verification requires mergeSha');
+    const runId = randomUUID();
+    const startedAt = Date.now();
     const verificationPath = await this.git.createDetachedWorktree(task.mergeSha, `postmerge-${task.issueNumber}`);
     let failure: string | null = null;
     try {
@@ -625,6 +614,16 @@ export class HarnessSupervisor {
       if (failed.length > 0) failure = failed.map((gate) => `${gate.id}: ${(gate.stderr || gate.stdout).slice(-700)}`).join('\n');
       const sideEffectFailure = await this.gateSideEffectFailure(verificationPath);
       if (!failure && sideEffectFailure) failure = sideEffectFailure;
+      throwIfAborted(signal);
+      this.store.recordEvent('postmerge.verification', task.id, {
+        runId,
+        mergeSha: task.mergeSha,
+        startedAt,
+        finishedAt: Date.now(),
+        passed: failure === null,
+        sideEffectFailure: sideEffectFailure !== null,
+        gates: results.map(safePostMergeGateMetadata),
+      }, `postmerge-verification:${runId}`);
     } finally {
       await this.git.removeOwnedWorktree(verificationPath, { allowDirty: true });
     }
@@ -726,6 +725,16 @@ export class HarnessSupervisor {
     const message = redactText(error instanceof Error ? error.message : String(error));
     const task = this.store.get(taskId);
     if (['done', 'failed', 'cancelled', 'quarantined'].includes(task.state)) return;
+    if (task.state === 'post_merge') {
+      const updated = this.store.recordPostMergeFailure(taskId, message, this.config.worker.identicalFailureLimit);
+      this.logger.warn('post-merge verification retry scheduled', {
+        taskId,
+        state: updated.state,
+        attempts: updated.attempts,
+        error: message,
+      });
+      return;
+    }
     const updated = this.store.recordFailure(taskId, message, this.config.worker.identicalFailureLimit);
     this.logger.warn('task attempt failed', { taskId, state: updated.state, attempts: updated.attempts, error: message });
     if (updated.prNumber) {
@@ -765,6 +774,19 @@ export class HarnessSupervisor {
     });
   }
 
+}
+
+function safePostMergeGateMetadata(gate: GateResult): Pick<GateResult, 'id' | 'kind' | 'required' | 'applicable' | 'ok' | 'exitCode' | 'durationMs' | 'evidenceHash'> {
+  return {
+    id: redactText(gate.id).slice(0, 200),
+    kind: gate.kind,
+    required: gate.required,
+    applicable: gate.applicable,
+    ok: gate.ok,
+    exitCode: gate.exitCode,
+    durationMs: gate.durationMs,
+    evidenceHash: redactText(gate.evidenceHash).slice(0, 128),
+  };
 }
 
 function repairLineage(body: string, store: PersistentTaskStore): Pick<TaskRecord, 'failureLineageId' | 'lineageFailures' | 'identicalFailures' | 'lastFailureFingerprint'> | null {

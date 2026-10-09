@@ -3,7 +3,7 @@ import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
 import { PersistentTaskStore } from '../src/core/persistent-store.js';
-import type { GateDefinition, GateResult, RewardCriterionConfig, TaskSpec } from '../src/core/types.js';
+import type { GateDefinition, GateResult, ProjectConfig, RewardCriterionConfig, TaskSpec } from '../src/core/types.js';
 import { GitWorkspace } from '../src/git/git-workspace.js';
 import type {
   CheckSummary,
@@ -235,6 +235,30 @@ class MockGitHub implements GitHubControl {
     pr.state = 'closed';
     pr.mergeCommitSha = expectedHeadSha;
     return { merged: true, sha: expectedHeadSha, message: 'merged' };
+  }
+}
+
+class AbortAfterSideEffectGitWorkspace extends GitWorkspace {
+  constructor(root: string, state: string, config: ProjectConfig, private readonly abort: () => void) {
+    super(root, state, config);
+  }
+
+  override async changedFiles(worktree: string): Promise<string[]> {
+    const files = await super.changedFiles(worktree);
+    if (worktree.includes('verify-postmerge-')) this.abort();
+    return files;
+  }
+}
+
+class PostmergeJournalFaultStore extends PersistentTaskStore {
+  private faulted = false;
+
+  override recordEvent(type: string, taskId: string | null, payload: Record<string, unknown>, idempotencyKey?: string) {
+    if (type === 'postmerge.verification' && !this.faulted) {
+      this.faulted = true;
+      throw new Error('event journal offline for post-merge verification');
+    }
+    return super.recordEvent(type, taskId, payload, idempotencyKey);
   }
 }
 
@@ -643,6 +667,25 @@ describe('production supervisor trace', () => {
     expect(remoteFeature.exitCode).toBe(0);
     expect(remoteFeature.stdout).toContain('implemented by Qwen');
     expect(trace.some((entry) => JSON.stringify(entry).includes('failed'))).toBe(false);
+    const verifications = store.listEvents('postmerge.verification');
+    expect(verifications).toHaveLength(1);
+    const verification = verifications[0];
+    expect(verification?.taskId).toBe(normalized?.id);
+    const payload = (verification?.payload ?? {}) as Record<string, unknown>;
+    expect(payload.mergeSha).toBe(normalized?.mergeSha);
+    expect(payload.runId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(payload.finishedAt as number).toBeGreaterThanOrEqual(payload.startedAt as number);
+    expect(payload.passed).toBe(true);
+    expect(payload.sideEffectFailure).toBe(false);
+    expect(payload.gates).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'unit', kind: 'unit', required: true, applicable: true, ok: true, exitCode: 0, evidenceHash: expect.any(String),
+      }),
+    ]));
+    const serialized = JSON.stringify(payload);
+    expect(serialized).not.toContain('"stdout"');
+    expect(serialized).not.toContain('"stderr"');
+    expect(serialized).not.toContain('"command"');
     store.close();
   }, 30_000);
 
@@ -738,6 +781,89 @@ describe('production supervisor trace', () => {
         }),
       ]),
     );
+    const verifications = store.listEvents('postmerge.verification');
+    expect(verifications).toHaveLength(1);
+    const verification = verifications[0];
+    expect(verification?.taskId).toBe(origin?.id);
+    const payload = (verification?.payload ?? {}) as Record<string, unknown>;
+    expect(payload.mergeSha).toBe(origin?.mergeSha);
+    expect(payload.runId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(payload.finishedAt as number).toBeGreaterThanOrEqual(payload.startedAt as number);
+    expect(payload.passed).toBe(false);
+    expect(payload.sideEffectFailure).toBe(false);
+    expect(payload.gates).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'postmerge-regression', kind: 'custom', required: true, applicable: true, ok: false, exitCode: 1, evidenceHash: 'postmerge-regression',
+      }),
+    ]));
+    const serialized = JSON.stringify(payload);
+    expect(serialized).not.toContain('"stdout"');
+    expect(serialized).not.toContain('"stderr"');
+    expect(serialized).not.toContain('regression reproduced');
+    store.close();
+  }, 30_000);
+
+  it('records no passing post-merge verification when worker shutdown lands after the side-effect scan', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    config.worker.autoMerge = true;
+    config.gates = [{ id: 'unit', kind: 'unit', command: process.execPath, args: ['check.mjs'], required: true, timeoutMs: 10_000 }];
+    const state = makeTmp('postmerge-abort-state');
+    const store = new PersistentTaskStore('postmerge-abort-project', state);
+    const github = new MockGitHub();
+    const controller = new AbortController();
+    const git = new AbortAfterSideEffectGitWorkspace(repo, state, config, () => controller.abort());
+    const cleanup = vi.spyOn(git, 'removeOwnedWorktree');
+    const supervisor = new HarnessSupervisor(
+      config, store, github, git, new MockQwenExecutor(), new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-postmerge-abort',
+    );
+    await supervisor.tick(controller.signal);
+    expect(store.listEvents('postmerge.verification')).toHaveLength(0);
+    const task = store.findByIssue(2);
+    expect(task).toMatchObject({ state: 'post_merge', attempts: 0, leaseOwner: null });
+    expect(task?.mergeSha).toMatch(/^[0-9a-f]{40}$/);
+    expect(github.prs.get(1)?.merged).toBe(true);
+    expect(cleanup.mock.calls.some(([worktree]) => String(worktree).includes('postmerge-'))).toBe(true);
+    store.close();
+  }, 30_000);
+
+  it('keeps a merged task retryable and cleaned up when only the post-merge verification journal write fails', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    config.worker.autoMerge = true;
+    config.gates = [{ id: 'unit', kind: 'unit', command: process.execPath, args: ['check.mjs'], required: true, timeoutMs: 10_000 }];
+    const state = makeTmp('postmerge-journal-state');
+    const store = new PostmergeJournalFaultStore('postmerge-journal-project', state);
+    const github = new MockGitHub();
+    const git = new GitWorkspace(repo, state, config);
+    const qwen = new MockQwenExecutor();
+    const execute = vi.spyOn(qwen, 'execute');
+    const cleanup = vi.spyOn(git, 'removeOwnedWorktree');
+    const supervisor = new HarnessSupervisor(
+      config, store, github, git, qwen, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-postmerge-journal',
+    );
+    await supervisor.tick();
+    expect(store.listEvents('postmerge.verification')).toHaveLength(0);
+    let task = store.findByIssue(2);
+    expect(task).toMatchObject({ state: 'post_merge', attempts: 1, prNumber: 1, leaseOwner: null, leaseExpiresAt: null });
+    expect(task?.lastError).toContain('event journal offline for post-merge verification');
+    expect(github.prs.get(1)?.merged).toBe(true);
+    expect([...github.issues.values()].some((issue) => issue.labels.includes('self-repair'))).toBe(false);
+    expect(github.comments.some((comment) => comment.number === 1 && comment.body.includes('routed for repair'))).toBe(false);
+    expect(cleanup.mock.calls.some(([worktree]) => String(worktree).includes('postmerge-'))).toBe(true);
+    await supervisor.tick();
+    task = store.findByIssue(2);
+    expect(task).toMatchObject({ state: 'done', attempts: 1, prNumber: 1, lastError: null });
+    expect(store.listEvents('postmerge.verification')).toHaveLength(1);
+    expect(store.listEvents('postmerge.retry_scheduled')).toHaveLength(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(github.prs.size).toBe(1);
     store.close();
   }, 30_000);
 });

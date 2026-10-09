@@ -53,3 +53,13 @@ The installed Qwen CLI reported `0.24.5`. Its headless `auto` setup denied shell
 - Packaged extension loading and the recorded implementer path have been exercised locally; upstream hook runtime failure behavior remains a limit.
 - Preserve existing failed/quarantined task history. Do not reset counters to make the run appear successful.
 - Cantina product-objective acceptance, staging acceptance and the observation period remain unproven.
+
+## RC61 post-merge evidence and retry-in-place
+
+- GLM `zai-coding-plan/glm-5.3` authored the implementation and regression-test drafts through the GLM delegation skill. Codex reviewed and integrated them. Qwen `qwen3.8-max`, using the saved provider configuration through the Qwen delegation skill, reviewed the evidence patch and authored the report-validation and gate-label refinements. Codex independently ran the checks below.
+- Post-merge gate records now retain the merge SHA, unique execution ID, timing, result, and per-gate evidence hashes. The security review kept command text, stdout, and stderr outside these records. Program exports retain distinct attempts and exclude unrelated tasks; completed legacy tasks receive no invented records.
+- A failed evidence write immediately after merge previously used the generic execution-failure route. The correction keeps the task in `post_merge`, preserves bounded failure accounting, and retries verification rather than implementation.
+- Independently executed regression tests verify journal failure followed by recovery to `done`, with one implementation call and one PR; shutdown after the side-effect scan creates no passing record. Focused checks: 29 passed. Full suite: 507 passed, one skipped across 40 files. Type checking and whitespace checks passed.
+- Malformed record identifiers, commit SHAs, timestamps, result flags, and missing gate arrays are excluded from the report. Optional and skipped gates are labeled; the report identifies these records as historical checks rather than current acceptance authority.
+- Final RC61 local validation passed type checking, 507 tests with one skipped, release checks, and packaged installation/version checks for both command aliases.
+- This is local harness evidence, not proof of deployment or full product acceptance. The live controller was not replaced or interrupted. CI and safe-boundary installation remain outstanding.

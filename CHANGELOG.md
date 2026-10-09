@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.61] - 2026-10-09
+
+- Retain post-merge gate results, exact merge commits, execution timing, and evidence hashes in durable events and program evidence exports without storing raw command output.
+- Retry verification in place when evidence persistence fails after a merge. Preserve failure budgets and avoid re-running implementation or opening another PR for an already-merged task.
+- Cover interrupted verification, evidence-write recovery, distinct attempts, program scoping, and legacy tasks without invented historical records.
+
 ## [1.0.0-rc.60] - 2026-10-09
 
 - Tell repository assessments to cite supplied exact-commit execution evidence alongside requirement-specific source or tests. Do not treat global passing CI as proof of every requirement.
