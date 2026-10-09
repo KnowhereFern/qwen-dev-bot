@@ -674,7 +674,7 @@ describe('production supervisor trace', () => {
     store.close();
   }, 30_000);
 
-  it.each(['pass', 'fail'] as const)('recovers an interrupted exact candidate by rerunning verification without Qwen: %s', async (outcome) => {
+  it.each(['pass', 'fail', 'recovery-abort'] as const)('recovers an interrupted exact candidate by rerunning verification without Qwen: %s', async (outcome) => {
     const { repo } = await createGitFixture();
     const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
     config.intake.trustedAuthors.push('bot');
@@ -701,6 +701,26 @@ describe('production supervisor trace', () => {
       const marker = store.listEvents('task.candidate_ready').at(-1)!;
       const originalSha = afterAbort.commitSha as string;
       const originalSession = afterAbort.qwenSessionId as string;
+      if (outcome === 'recovery-abort') {
+        const original = github.listOpenIssues.bind(github);
+        const middleAbort = new AbortController();
+        const spy = vi.spyOn(github, 'listOpenIssues').mockImplementation(async (...args: Parameters<typeof original>) => {
+          const issues = await original(...args);
+          if (store.get(afterAbort.id).state === 'active') middleAbort.abort();
+          return issues;
+        });
+        try {
+          const middle = new HarnessSupervisor(config, store, github, git, qwen, new MockNormalizer(), new GateRunner(), rewards, silentLogger, 'worker-recovery-middle');
+          await middle.tick(middleAbort.signal);
+        } finally {
+          spy.mockRestore();
+        }
+        const interrupted = store.listEvents('task.interrupted').filter((event) => event.taskId === afterAbort.id).at(-1);
+        expect(interrupted?.payload).toMatchObject({
+          from: 'active', candidateReadyEventId: marker.id, inheritedCandidateRecovery: true,
+        });
+        expect(store.listEvents('task.candidate_recovery_consumed')).toHaveLength(0);
+      }
       const realGates = new GateRunner();
       const runAll = vi.spyOn(realGates, 'runAll');
       if (outcome === 'fail') {
@@ -717,7 +737,7 @@ describe('production supervisor trace', () => {
       expect(consumptions).toHaveLength(1);
       expect(consumptions[0]!.payload).toEqual({ markerId: marker.id, eligible: true, consumerId: expect.any(String) });
       expect(store.findByIssue(2)).toMatchObject({ commitSha: originalSha, qwenSessionId: originalSession });
-      if (outcome === 'pass') {
+      if (outcome !== 'fail') {
         expect(store.findByIssue(2)).toMatchObject({ state: 'done' });
         expect(github.prs.size).toBe(1);
         expect(evaluate).toHaveBeenCalled();
@@ -737,7 +757,7 @@ describe('production supervisor trace', () => {
     }
   }, 30_000);
 
-  it.each(['dirty', 'untrusted', 'lost-lease'] as const)('guards interrupted candidate recovery against invalid evidence: %s', async (scenario) => {
+  it.each(['dirty', 'untrusted', 'lost-lease', 'dirty-abort', 'untrusted-abort'] as const)('guards interrupted candidate recovery against invalid evidence: %s', async (scenario) => {
     const { repo } = await createGitFixture();
     const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
     config.intake.trustedAuthors.push('bot');
@@ -761,8 +781,9 @@ describe('production supervisor trace', () => {
       const afterAbort = store.findByIssue(2)!;
       expect(afterAbort).toMatchObject({ state: 'ready', attempts: 0 });
       const marker = store.listEvents('task.candidate_ready').at(-1)!;
-      if (scenario === 'dirty') writeFileSync(path.join(afterAbort.worktreePath!, 'extra.txt'), 'changed\n');
-      if (scenario === 'untrusted') (github.issues.get(2) as RemoteIssue).author = 'outsider';
+      const abortMidRecovery = scenario === 'dirty-abort' || scenario === 'untrusted-abort';
+      if (scenario === 'dirty' || scenario === 'dirty-abort') writeFileSync(path.join(afterAbort.worktreePath!, 'extra.txt'), 'changed\n');
+      if (scenario === 'untrusted' || scenario === 'untrusted-abort') (github.issues.get(2) as RemoteIssue).author = 'outsider';
       const unhandled: unknown[] = [];
       let foreignLeaseExpiresAt: number | null = null;
       if (scenario === 'lost-lease') {
@@ -786,10 +807,29 @@ describe('production supervisor trace', () => {
       }
       const realGates = new GateRunner();
       const runAll = vi.spyOn(realGates, 'runAll');
+      const recoveryAbort = new AbortController();
+      const originalListIssues = github.listOpenIssues.bind(github);
+      const listIssuesSpy = abortMidRecovery
+        ? vi.spyOn(github, 'listOpenIssues').mockImplementation(async (...args: Parameters<typeof originalListIssues>) => {
+            const issues = await originalListIssues(...args);
+            if (store.get(afterAbort.id).state === 'active') recoveryAbort.abort();
+            return issues;
+          })
+        : null;
       const supervisor = new HarnessSupervisor(config, store, github, git, qwen, new MockNormalizer(), realGates, rewards, silentLogger, 'worker-guard-verify');
-      await supervisor.tick();
+      await supervisor.tick(recoveryAbort.signal);
+      listIssuesSpy?.mockRestore();
       const consumptions = store.listEvents('task.candidate_recovery_consumed');
-      if (scenario === 'dirty') {
+      if (abortMidRecovery) {
+        expect(execute).toHaveBeenCalledTimes(1);
+        expect(runAll).not.toHaveBeenCalled();
+        expect(github.prs.size).toBe(0);
+        expect(consumptions).toHaveLength(0);
+        expect(store.findByIssue(2)).toMatchObject({ state: 'ready', attempts: 0 });
+        const stop = store.listEvents('task.interrupted').filter((event) => event.taskId === afterAbort.id).at(-1)!;
+        expect(stop.payload).not.toHaveProperty('candidateReadyEventId');
+        expect(stop.payload).not.toHaveProperty('inheritedCandidateRecovery');
+      } else if (scenario === 'dirty') {
         expect(execute).toHaveBeenCalledTimes(2);
         expect(runAll).toHaveBeenCalled();
         expect(consumptions).toHaveLength(1);

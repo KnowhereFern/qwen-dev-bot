@@ -216,6 +216,10 @@ export class HarnessSupervisor {
     let task = claimed;
     let executionHeartbeatTimer: NodeJS.Timeout | null = null;
     let candidateReadyEventId: string | null = null;
+    let inheritedCandidateMarkerId: string | null = null;
+    const inheritedCandidateMarker = (markerId: string | null): void => {
+      inheritedCandidateMarkerId = markerId;
+    };
     const localAbort = new AbortController();
     const executionSignal = signal ? AbortSignal.any([signal, localAbort.signal]) : localAbort.signal;
     try {
@@ -287,11 +291,14 @@ export class HarnessSupervisor {
       const onCandidateReady = (eventId: string): void => {
         candidateReadyEventId = eventId;
       };
-      const recovery = await this.recoverInterruptedCandidate(task, worktree.path, executionSignal);
+      const recovery = await this.recoverInterruptedCandidate(
+        task, worktree.path, executionSignal, inheritedCandidateMarker,
+      );
       if (recovery.kind === 'lost-lease') return;
       const stored = this.store.get(task.id);
       if (stored.state !== 'active' || stored.leaseOwner !== this.workerId ||
           typeof stored.leaseExpiresAt !== 'number' || stored.leaseExpiresAt <= Date.now()) {
+        inheritedCandidateMarker(null);
         return;
       }
       task = stored;
@@ -373,7 +380,7 @@ export class HarnessSupervisor {
       const leaseHeld = current.leaseOwner === this.workerId &&
         typeof current.leaseExpiresAt === 'number' && current.leaseExpiresAt > Date.now();
       if (['leased', 'active', 'verifying'].includes(current.state) && !leaseHeld) return;
-      if (signal?.aborted) this.releaseInterruptedTask(task.id, candidateReadyEventId);
+      if (signal?.aborted) this.releaseInterruptedTask(task.id, candidateReadyEventId, inheritedCandidateMarkerId);
       else await this.failAttempt(task.id, error);
     } finally {
       if (executionHeartbeatTimer) clearInterval(executionHeartbeatTimer);
@@ -570,7 +577,9 @@ export class HarnessSupervisor {
     }
   }
 
-  private releaseInterruptedTask(taskId: string, markerId: string | null = null): void {
+  private releaseInterruptedTask(
+    taskId: string, markerId: string | null = null, inheritedMarkerId: string | null = null,
+  ): void {
     const current = this.store.get(taskId);
     if (!['leased', 'active', 'verifying'].includes(current.state)) return;
     const message = 'Worker shutdown interrupted the prior attempt; inspect and continue from the existing worktree. The controller selects the appropriate session for recovery.';
@@ -599,6 +608,26 @@ export class HarnessSupervisor {
         interruptedPayload.candidateReadyEventId = markerId;
       }
     }
+    if (current.state === 'active' && inheritedMarkerId !== null) {
+      const inherited = this.store.listEvents('task.candidate_ready').find(
+        (event) => event.id === inheritedMarkerId && event.taskId === taskId,
+      );
+      if (
+        inherited &&
+        !this.store.hasIdempotencyKey(`candidate-consumed:${inherited.id}`) &&
+        inherited.payload.commitSha === current.commitSha &&
+        inherited.payload.baseSha === current.baseSha &&
+        inherited.payload.branch === current.branch &&
+        inherited.payload.contractHash === sha256(JSON.stringify(current.spec)) &&
+        inherited.payload.attempts === current.attempts &&
+        inherited.payload.lineageFailures === (current.lineageFailures ?? current.attempts) &&
+        inherited.payload.qwenSessionId === current.qwenSessionId &&
+        inherited.payload.qwenWorkflowRunId === current.qwenWorkflowRunId
+      ) {
+        interruptedPayload.candidateReadyEventId = inheritedMarkerId;
+        interruptedPayload.inheritedCandidateRecovery = true;
+      }
+    }
     this.store.recordEvent('task.interrupted', taskId, interruptedPayload);
     this.logger.info('task released after worker shutdown', { taskId, from: current.state });
   }
@@ -607,12 +636,16 @@ export class HarnessSupervisor {
     task: TaskRecord,
     worktreePath: string,
     signal?: AbortSignal,
+    onInheritedMarker?: (markerId: string | null) => void,
   ): Promise<{ kind: 'none' } | { kind: 'lost-lease' } | { kind: 'candidate'; commitSha: string; summary: string }> {
     const ownsActiveLease = (record: TaskRecord, now = Date.now()): boolean =>
       record.state === 'active' && record.leaseOwner === this.workerId &&
       typeof record.leaseExpiresAt === 'number' && record.leaseExpiresAt > now;
     const interrupted = this.store.listEvents('task.interrupted').filter((event) => event.taskId === task.id).at(-1);
-    if (!interrupted || interrupted.payload.from !== 'verifying' || typeof interrupted.payload.candidateReadyEventId !== 'string') {
+    const inheritedActive = interrupted?.payload.from === 'active' &&
+      interrupted.payload.inheritedCandidateRecovery === true;
+    if (!interrupted || typeof interrupted.payload.candidateReadyEventId !== 'string' ||
+        (interrupted.payload.from !== 'verifying' && !inheritedActive)) {
       return { kind: 'none' };
     }
     const marker = this.store.listEvents('task.candidate_ready').find(
@@ -621,13 +654,17 @@ export class HarnessSupervisor {
     if (!marker || this.store.hasIdempotencyKey(`candidate-consumed:${marker.id}`)) return { kind: 'none' };
     const stored = this.store.get(task.id);
     if (!ownsActiveLease(stored)) return { kind: 'lost-lease' };
+    onInheritedMarker?.(marker.id);
     const issue = (await this.github.listOpenIssues()).find((candidate) => candidate.number === task.issueNumber) ?? null;
     const remoteSpec = issue ? parseNormalizedSpec(issue.body) : null;
     const headSha = await this.git.headSha(worktreePath);
     const dirtyFiles = await this.git.changedFiles(worktreePath);
     const currentBaseSha = await this.git.baseSha();
     const fresh = this.store.get(task.id);
-    if (!ownsActiveLease(fresh)) return { kind: 'lost-lease' };
+    if (!ownsActiveLease(fresh)) {
+      onInheritedMarker?.(null);
+      return { kind: 'lost-lease' };
+    }
     const issueAuthorized = issue !== null && remoteSpec !== null &&
       this.config.intake.trustedAuthors.includes(issue.author) &&
       issue.labels.includes(this.config.intake.normalizedLabel) &&
@@ -641,6 +678,7 @@ export class HarnessSupervisor {
       matchesPortfolioTaskContract(plan, story, fresh.spec as NonNullable<TaskRecord['spec']>),
     );
     if (!issueAuthorized || !programAuthorized) {
+      onInheritedMarker?.(null);
       throw new Error(`Interrupted candidate for task ${task.id} failed issue or program contract reauthorization`);
     }
     const commitSha = typeof marker.payload.commitSha === 'string' ? marker.payload.commitSha : null;
@@ -656,8 +694,10 @@ export class HarnessSupervisor {
       marker.payload.qwenSessionId === fresh.qwenSessionId &&
       marker.payload.qwenWorkflowRunId === fresh.qwenWorkflowRunId &&
       (cleanHead === fresh.baseSha && this.isReadOnlyProgramTask(fresh)) === marker.payload.readOnly;
+    if (!evidenceValid) onInheritedMarker?.(null);
     throwIfAborted(signal);
     const consumerId = randomUUID();
+    onInheritedMarker?.(null);
     const consumed = this.store.recordEvent('task.candidate_recovery_consumed', task.id,
       { markerId: marker.id, eligible: evidenceValid, consumerId }, `candidate-consumed:${marker.id}`);
     if (consumed.payload.consumerId !== consumerId) return { kind: 'lost-lease' };

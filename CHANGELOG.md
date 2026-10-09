@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.64] - 2026-10-09
+
+- Preserve the exact unconsumed candidate link when an orderly shutdown interrupts recovery itself, then rerun authorization and verification on restart without repeating implementation.
+- Discard inherited links after known stale evidence, rejected authorization, lost ownership, or consumption. Keep invocation markers separate and reject already-consumed evidence.
+- Test second-shutdown recovery and concurrent shutdown with dirty files or an untrusted issue author.
+
 ## [1.0.0-rc.63] - 2026-10-09
 
 - Resume an unchanged candidate after an orderly verification interruption without repeating implementation. Reauthorize the issue and program, validate the exact candidate and lease, consume recovery evidence once, and rerun required gates and independent review.
