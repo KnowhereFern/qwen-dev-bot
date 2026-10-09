@@ -4,6 +4,7 @@ import { redactText } from '../core/ledger.js';
 import { formatProcessFailure, runProcess } from '../runtime/safe-process.js';
 import { qwenWriterGuardEnvironment, WRITER_GUARD_FAILURE } from './writer-guard.js';
 import { createQwenModelSelection } from './model-selection.js';
+import { gateRunnerCommand, resolveInstalledGateRunner } from './gate-runner.js';
 import {
   qwenEnvironment,
   qwenImplementationToolArgs,
@@ -294,6 +295,7 @@ function hasMatchingAutomaticStop(task: TaskRecord): boolean {
 export function renderObjective(task: TaskRecord, feedback: string[], workflowPath?: string): string {
   const spec = task.spec ?? fallbackSpec(task);
   const automaticContinuation = feedback.length === 0 && hasMatchingAutomaticStop(task);
+  const runnerCommand = gateRunnerCommand(resolveInstalledGateRunner());
   return [
     'You are the delivery coordinator, not the implementation writer. Complete the LOCAL IMPLEMENTATION PHASE of the normalized GitHub task below through the saved workflow in the current isolated worktree.',
     'Goal boundary: this Qwen Goal is the local implementation handoff, not the end-to-end delivery objective or the task state machine. Its completion does not mark the GitHub task done.',
@@ -305,6 +307,8 @@ export function renderObjective(task: TaskRecord, feedback: string[], workflowPa
     'Stay within the repository, preserve unrelated work, and do not modify protected harness files. Delegate all shell commands, tests, and file mutations to the saved workflow implementer.',
     'As coordinator, never call run_shell_command, exec, edit, write_file, notebook_edit, or agent directly. Read-only inspection and saved-workflow coordination are your role; a denied tool call does not authorize a workaround.',
     `Invoke the saved Qwen workflow at ${workflowPath ?? '.qwen/workflows/harness-implement.js'} exactly once per execution or verifier-repair attempt using its scriptPath (never author an inline workflow) so reconnaissance and review stay read-only and only its harness-implementer agent mutates this worktree.`,
+    `Include this exact controller-owned localGateCommand and its verification instructions in the saved workflow args: ${JSON.stringify(runnerCommand)}. The sole saved-workflow implementer must execute it from the current candidate worktree after its final edits and any checks requested by the saved workflow. It executes this worktree's unchanged configured checks and saves their execution receipt under ignored harness state; those checks may produce their normal build and test artifacts. This installed runner is read-only harness code; do not copy it into the repository, edit it, or update tracked harness files.`,
+    'Include reviewer instructions in the same workflow args to read .qwen-harness/state/gate-receipt.json and check actual passing results and required-gate coverage. These instructions also apply when reusing an older saved workflow or project gate script that does not produce a receipt.',
     automaticContinuation
       ? 'Start the saved workflow once, fresh, without resumeFromRunId. The prior process has ended; inspect and continue its existing candidate, and rerun the required project checks before handoff.'
       : 'Continuing an interrupted attempt may resume its workflow with the same args and resumeFromRunId; do not start a duplicate writer. A new verifier-repair attempt must start a fresh workflow without resumeFromRunId and include all verifier feedback in its args, rather than replaying the prior completed result.',
@@ -335,7 +339,7 @@ export function renderObjective(task: TaskRecord, feedback: string[], workflowPa
     ...(feedback.length > 0 ? ['', 'Verifier feedback to repair:', ...feedback.map((item) => `- ${item}`)] : []),
     '',
     'Finish this local Goal only when the requested implementation is present, the saved workflow review passes, and the required project checks pass. Preserve every acceptance criterion: verify all locally testable criteria and explicitly identify any controller-owned verification still pending. A missing implementation, failed required check, failed workflow review, or genuine unavailable implementation dependency is not a successful handoff.',
-    'Before proposing local completion, use read_file to read .qwen-harness/state/gate-receipt.json produced by the saved workflow implementer running node .qwen-harness/scripts/run-gates.mjs after its final edits. Read all gate entries in bounded pages if needed so the actual receipt is present in your recent transcript. Verify that it is a completed passing run for this worktree and current candidate, covers every configured required gate, and has no timeout, failed, missing, or unexecuted required check. A path, test source, generated build file, or model-written test summary is not execution evidence. Never author, edit, or ask an agent to fabricate a receipt. If evidence is missing or stale, request a fresh runner execution through the saved workflow; do not weaken checks. This local receipt never replaces the supervisor\'s independent exact-commit verification.',
+    'Before proposing local completion, use read_file to read .qwen-harness/state/gate-receipt.json produced by the saved workflow implementer executing the exact installed localGateCommand above after its final edits. Read all gate entries in bounded pages if needed so the actual receipt is present in your recent transcript. Verify that it is a completed passing run for this worktree and current candidate, covers every configured required gate, and has no timeout, failed, missing, or unexecuted required check. A path, test source, generated build file, or model-written test summary is not execution evidence. Never author, edit, or ask an agent to fabricate a receipt. If evidence is missing or stale, request a fresh runner execution through the saved workflow; do not weaken checks. This local receipt never replaces the supervisor\'s independent exact-commit verification.',
     'Return a concise local handoff summary with changed files, actual test results, and pending controller steps. Do not claim that the task or overall delivery objective is done.',
   ].join('\n');
 }

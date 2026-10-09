@@ -41,6 +41,25 @@ afterEach(() => {
 });
 
 describe('deterministic gate execution receipts', () => {
+  it('runs installed gates against a legacy worktree without replacing its protected runner', () => {
+    const root = fixture();
+    const legacyRunner = path.join(root, '.qwen-harness/scripts/run-gates.mjs');
+    mkdirSync(path.dirname(legacyRunner), { recursive: true });
+    const legacySource = 'throw new Error("legacy runner must not execute");\n';
+    writeFileSync(legacyRunner, legacySource);
+    config(root, [gate('required-check')]);
+    execFileSync('git', ['add', '.qwen-harness'], { cwd: root });
+    execFileSync('git', ['-c', 'user.name=Gate Test', '-c', 'user.email=gate@example.invalid', 'commit', '-qm', 'legacy controls'], { cwd: root });
+    const before = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' });
+    const result = execute(root);
+    expect(result.status, result.stderr).toBe(0);
+    expect(readReceipt(root)).toMatchObject({ worktree: root, head: before.trim(), status: 'passed' });
+    expect(readReceipt(root).gates[0]).toMatchObject({ id: 'required-check', status: 'passed', exitCode: 0 });
+    expect(readFileSync(legacyRunner, 'utf8')).toBe(legacySource);
+    expect(execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' })).toBe('');
+    expect(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' })).toBe(before);
+  });
+
   it('records actual executions, applicable gates, hashes, and private permissions without capturing output', () => {
     const root = fixture();
     // The emitted secret is absent from argv as well as the receipt.
