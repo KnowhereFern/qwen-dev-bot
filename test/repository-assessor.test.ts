@@ -301,7 +301,7 @@ describe('RepositoryAssessor', () => {
     ])).assess({ sourcePath: 'PROJECT.md', content: 'Expose health.' });
 
     expect(assessment.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
-    expect(assessment.coverage[0]?.rationale).toContain('no passing test or deployment result');
+    expect(assessment.coverage[0]?.rationale).toContain('does not cite a supplied exact-commit passing test or deployment locator');
   });
 
   it('accepts implemented coverage with exact-commit test evidence supplied by the controller', async () => {
@@ -319,6 +319,78 @@ describe('RepositoryAssessor', () => {
     );
 
     expect(assessment.coverage[0]).toMatchObject({ status: 'implemented', requiredAction: 'none' });
+  });
+
+  it('instructs the synthesis model to cite supplied exact-commit execution locators', async () => {
+    const root = gitRepo();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.enabled = true;
+    const model = new AssessmentModel();
+
+    await new RepositoryAssessor(config, model).assess({ sourcePath: 'PROJECT.md', content: 'Expose health.' });
+
+    const prompt = model.prompts[model.prompts.length - 1] ?? '';
+    expect(prompt).toContain('exact-commit execution locator');
+    expect(prompt).toContain('Never infer that every requirement is proven by a global CI or whole-repository test run');
+    expect(prompt).toContain('Citing only a file is insufficient unless that exact file locator is itself supplied as verified execution evidence');
+  });
+
+  it('keeps a test-file-only citation unverified when only the global gate passed', async () => {
+    const root = gitRepo();
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.enabled = true;
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1000 }];
+
+    const assessment = await new RepositoryAssessor(config, new ImplementedCoverageModel([
+      { kind: 'test', locator: 'server.ts', summary: 'Health test file exists' },
+    ])).assess(
+      { sourcePath: 'PROJECT.md', content: 'Expose health.' },
+      undefined,
+      [{ kind: 'test', locator: 'test', summary: 'Required gate passed', commitSha: sha }],
+    );
+
+    expect(assessment.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+    expect(assessment.coverage[0]?.rationale).toContain('does not cite a supplied exact-commit passing test or deployment locator');
+  });
+
+  it('accepts implemented coverage citing the passing gate id plus requirement source evidence', async () => {
+    const root = gitRepo();
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.enabled = true;
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1000 }];
+
+    const assessment = await new RepositoryAssessor(config, new ImplementedCoverageModel([
+      { kind: 'file', locator: 'server.ts', summary: 'Health implementation exists' },
+      { kind: 'test', locator: 'test', summary: 'Required gate passed for this exact commit' },
+    ])).assess(
+      { sourcePath: 'PROJECT.md', content: 'Expose health.' },
+      undefined,
+      [{ kind: 'test', locator: 'test', summary: 'Passed', commitSha: sha }],
+    );
+
+    expect(assessment.coverage[0]).toMatchObject({ status: 'implemented', requiredAction: 'none' });
+  });
+
+  it('does not accept a gate result recorded for a stale commit', async () => {
+    const root = gitRepo();
+    const staleSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'Move past the recorded gate run'], { cwd: root });
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.enabled = true;
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1000 }];
+
+    const assessment = await new RepositoryAssessor(config, new ImplementedCoverageModel([
+      { kind: 'file', locator: 'server.ts', summary: 'Health implementation exists' },
+      { kind: 'test', locator: 'test', summary: 'Required gate passed for an earlier commit' },
+    ])).assess(
+      { sourcePath: 'PROJECT.md', content: 'Expose health.' },
+      undefined,
+      [{ kind: 'test', locator: 'test', summary: 'Passed', commitSha: staleSha }],
+    );
+
+    expect(assessment.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
   });
 
   it('derives implementation work for partial requirements instead of trusting a contradictory model action', async () => {

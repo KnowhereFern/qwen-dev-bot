@@ -193,6 +193,7 @@ export class RepositoryAssessor {
         'Return JSON only: {"coverage":[{"id":string,"requirement":string,"status":"implemented"|"partial"|"missing"|"unverified"|"externally_blocked","requiredAction":"none"|"implement"|"verify"|"operate"|"document"|"external","rationale":string,"evidence":[{"kind":"file"|"test"|"deployment"|"git"|"config","locator":string,"summary":string}]}]}.',
         'Every coverage id must be unique, 1-32 characters, start with an uppercase ASCII letter, and contain only uppercase ASCII letters, digits, underscores or hyphens. Use concise IDs such as PAYMENT-CONFIRM; put the full behavior description in requirement, not id.',
         'Use implemented only when evidence proves working behavior. Use partial only when required behavior is incomplete; partial always requires implementation. Use unverified when the complete behavior appears to exist but lacks executable or operational proof.',
+        'Mark a requirement implemented only when its evidence cites a relevant exact-commit execution locator copied from the supplied operational evidence - normally the passing gate id, a supplied deployment id, or an explicitly supplied test locator for that behavior - together with requirement-specific source or test evidence for that same requirement. Never infer that every requirement is proven by a global CI or whole-repository test run. Citing only a file is insufficient unless that exact file locator is itself supplied as verified execution evidence.',
         'Use requiredAction=none only for implemented coverage, implement for partial or missing product behavior, verify for existing behavior lacking executable proof, operate for deployment or live-environment proof, and external for required unavailable provider access. Missing product integration code and missing authorized access are distinct requirements: one needs implementation, the other needs resumable blocker documentation.',
         'Missing requirements may have an empty evidence array. Do not invent files, tests, deployments, or provider state.',
       ].join(' '),
@@ -488,7 +489,7 @@ function validateCoverage(value: unknown, context: EvidenceValidationContext): O
       status,
       requiredAction: validateCoverageAction(lacksExactCommitProof ? 'verify' : entry.requiredAction, status, id),
       rationale: lacksExactCommitProof
-        ? `${rationale} Controller classification: unverified because no passing test or deployment result was supplied for the exact commit.`
+        ? `${rationale} Controller classification: unverified because this coverage entry does not cite a supplied exact-commit passing test or deployment locator for this requirement.`
         : rationale,
       evidence,
     };
