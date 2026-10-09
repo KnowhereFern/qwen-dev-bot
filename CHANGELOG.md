@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.62] - 2026-10-09
+
+- Honor `update --dry-run` so an update preview cannot install files, relink the CLI, change registration, or restart the worker.
+- Add isolated CLI regressions for dry-run and ordinary update argument forwarding.
+
 ## [1.0.0-rc.61] - 2026-10-09
 
 - Retain post-merge gate results, exact merge commits, execution timing, and evidence hashes in durable events and program evidence exports without storing raw command output.

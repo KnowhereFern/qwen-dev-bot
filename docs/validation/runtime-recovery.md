@@ -62,4 +62,12 @@ The installed Qwen CLI reported `0.24.5`. Its headless `auto` setup denied shell
 - Independently executed regression tests verify journal failure followed by recovery to `done`, with one implementation call and one PR; shutdown after the side-effect scan creates no passing record. Focused checks: 29 passed. Full suite: 507 passed, one skipped across 40 files. Type checking and whitespace checks passed.
 - Malformed record identifiers, commit SHAs, timestamps, result flags, and missing gate arrays are excluded from the report. Optional and skipped gates are labeled; the report identifies these records as historical checks rather than current acceptance authority.
 - Final RC61 local validation passed type checking, 507 tests with one skipped, release checks, and packaged installation/version checks for both command aliases.
-- This is local harness evidence, not proof of deployment or full product acceptance. The live controller was not replaced or interrupted. CI and safe-boundary installation remain outstanding.
+- Commit `dcd42a3af41ec039db638705251c9fe02e0b5ecf` passed Ubuntu and macOS CI: https://github.com/KnowhereFern/qwen-dev-bot/actions/runs/37987819523.
+- Installation exposed a separate CLI defect: `update --dry-run` did not forward `dryRun` to the installer. The intended preview linked RC61, refreshed two installer-owned files, and interrupted task 152 during verification. This was an operator intervention, not an autonomous-delivery success.
+- The worker shut down cleanly and released task 152 without increasing its failure count. The generated-file changes were reversed, restoring a clean product checkout; the single RC61 service was restarted and task 152 resumed with preserved history. Installed supervisor and report file hashes matched the CI-tested source. The interruption is recorded in the program evidence ledger under `operator:rc61-dry-run-recovery:2026-10-09`.
+- RC61 local/CI checks and installation do not prove the product objective, observation period, or autonomous controller promotion.
+
+## RC62 update preview safety
+
+- GLM `zai-coding-plan/glm-5.3` authored the missing dry-run argument forwarding and two isolated CLI regression tests. Codex integrated the draft and independently ran the tests and type checker.
+- The real source CLI update preview then exited successfully with `would` messages. Before/after SHA-256 checks of the registry, launchd service definition, project config, and installation receipt were identical; the worker PIDs remained live and the product checkout stayed clean. No update was applied by this corrected preview.
