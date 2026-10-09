@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.59] - 2026-10-09
+
+- Run receipt-producing checks from the installed controller package so unfinished worktrees can retain their original protected harness scripts and task base.
+- Pass the trusted runner command through the saved workflow to its sole implementation writer; keep coordinator and reviewer execution read-only and preserve independent supervisor verification.
+- Reject missing, nonregular, or symlinked runner assets and safely quote runtime paths. Verify legacy worktree checks leave tracked controls and the candidate commit unchanged.
+
 ## [1.0.0-rc.58] - 2026-10-09
 
 - Persist session-bound automatic-stop provenance from actual process limits. Start a fresh local Goal after confirmed automatic limits so synthetic cancellation text cannot masquerade as a new human instruction.
