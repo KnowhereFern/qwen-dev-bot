@@ -27,6 +27,14 @@ export interface DoctorReport {
   checks: DoctorCheck[];
 }
 
+export function programGateChecks(config: ProjectConfig): DoctorCheck[] {
+  if (!config.program.enabled) return [];
+  const configured = config.gates.some((gate) => gate.required && gate.kind !== 'security' && gate.id !== 'harness-security');
+  return [check('program-product-gates', configured ? 'pass' : 'fail', configured
+    ? 'Required product checks are configured (passing behavior still requires execution)'
+    : 'Configure required product checks before program approval; an empty or security-only check list is not delivery verification')];
+}
+
 export async function runDoctor(config: ProjectConfig, options: { live?: boolean } = {}): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
   const root = config.project.root;
@@ -40,6 +48,7 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
     ),
   );
   checks.push(...(await projectDependencyChecks(config)));
+  checks.push(...programGateChecks(config));
   checks.push(
     check(
       'config',
@@ -154,12 +163,13 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
     checks.push(check('qwen-extension', harnessExtensionPresent ? 'pass' : 'warn', harnessExtensionPresent ? 'Harness extension installed' : 'Harness extension is not linked; run setup/update'));
   }
 
-  const harnessCli = await commandCheck(process.platform === 'win32' ? 'qwen-harness.cmd' : 'qwen-harness', ['--version'], root);
+  const primaryCli = await commandCheck(process.platform === 'win32' ? 'fern-harness.cmd' : 'fern-harness', ['--version'], root);
+  const harnessCli = primaryCli.ok ? primaryCli : await commandCheck(process.platform === 'win32' ? 'qwen-harness.cmd' : 'qwen-harness', ['--version'], root);
   checks.push(
     check(
       'harness-cli',
       harnessCli.ok ? 'pass' : 'warn',
-      harnessCli.ok ? `qwen-harness ${harnessCli.output}` : 'qwen-harness is not on PATH; use this checkout\'s npm run harness command or rerun setup with --install-cli',
+      harnessCli.ok ? `${primaryCli.ok ? 'fern-harness' : 'qwen-harness compatibility alias'} ${harnessCli.output}` : 'fern-harness is not on PATH; use this checkout\'s npm run harness command or rerun setup with --install-cli',
     ),
   );
 

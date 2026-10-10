@@ -1,10 +1,10 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { CommunityCollector, CommunityScanResult } from './community/collector.js';
-import type { ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
+import type { GateResult, ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
-import { REQUIRED_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
+import { REQUIRED_GITHUB_CHECKS, REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
 import { GitWorkspace, branchFor } from './git/git-workspace.js';
 import { parseNormalizedSpec, type TaskNormalizer } from './intake/normalizer.js';
 import { Logger } from './logger.js';
@@ -16,6 +16,9 @@ import { GateRunner } from './rewards/gates.js';
 import { prepareProjectCheckout } from './runtime/checkout-preflight.js';
 
 const RECONCILIATION_STATES = ['pr_open', 'waiting_ci', 'merge_ready', 'post_merge'] as const;
+
+type PortfolioPlanRecord = ReturnType<PersistentTaskStore['listPortfolioPlans']>[number];
+type PortfolioStoryRecord = PortfolioPlanRecord['stories'][number];
 
 export interface SupervisorTickResult {
   community: CommunityScanResult;
@@ -41,9 +44,16 @@ export class HarnessSupervisor {
   ) {}
 
   async tick(signal?: AbortSignal): Promise<SupervisorTickResult> {
+    if (this.requiresInitialProgramApproval()) {
+      return {
+        community: { checked: 0, changed: 0, created: 0, skipped: 0, failed: 0 },
+        ingested: 0, recovered: 0, processedTaskId: null, action: 'awaiting-program-approval',
+      };
+    }
     try {
       const recovered = await this.recoverExpiredLeases();
       this.resumeProviderWaits();
+      await this.reconcileReadOnlyClosures();
       const community = this.community
         ? await this.community.scan()
         : { checked: 0, changed: 0, created: 0, skipped: 0, failed: 0 };
@@ -93,6 +103,7 @@ export class HarnessSupervisor {
   }
 
   async syncIntake(): Promise<number> {
+    if (this.requiresInitialProgramApproval()) return 0;
     const issues = await this.github.listOpenIssues();
     let ingested = 0;
     for (const issue of issues) {
@@ -193,18 +204,60 @@ export class HarnessSupervisor {
     return ingested;
   }
 
+  private requiresInitialProgramApproval(): boolean {
+    // Labels and pre-existing tasks are not a substitute for the initial program approval.
+    // Legacy issue-driven projects retain their explicit program.disabled behavior.
+    return this.config.program.enabled && !this.store.listPortfolioPlans().some((plan) =>
+      typeof plan.approvedAt === 'number' && Number.isFinite(plan.approvedAt) && plan.approvedAt > 0,
+    );
+  }
+
   private async executeTask(claimed: TaskRecord, signal?: AbortSignal): Promise<void> {
     let task = claimed;
     let executionHeartbeatTimer: NodeJS.Timeout | null = null;
+    let candidateReadyEventId: string | null = null;
+    let inheritedCandidateMarkerId: string | null = null;
+    const inheritedCandidateMarker = (markerId: string | null): void => {
+      inheritedCandidateMarkerId = markerId;
+    };
+    const localAbort = new AbortController();
+    const executionSignal = signal ? AbortSignal.any([signal, localAbort.signal]) : localAbort.signal;
     try {
       const branch = task.branch ?? branchFor(task);
       const worktree = await this.git.createOrResume({ ...task, branch });
+      if (this.isReadOnlyProgramTask(task) && task.prNumber === null &&
+          (!task.commitSha || task.commitSha === worktree.baseSha) &&
+          (await this.git.changedFiles(worktree.path)).length === 0) {
+        const currentSha = await this.git.baseSha();
+        const head = await this.git.headSha(worktree.path);
+        const interrupted = this.store.listEvents('task.read_only_base_advance_requested').filter((event) => event.taskId === task.id).at(-1);
+        if (currentSha !== worktree.baseSha && [worktree.baseSha, currentSha, interrupted?.payload.commitSha].includes(head)) {
+          this.store.recordEvent('task.read_only_base_advance_requested', task.id, { previousSha: worktree.baseSha, commitSha: currentSha }, `read-only-base-request:${task.id}:${currentSha}`);
+          await this.git.advanceReadOnlyBase(worktree.path, head, currentSha);
+          this.store.recordEvent('task.read_only_base_advanced', task.id, { previousSha: worktree.baseSha, commitSha: currentSha }, `read-only-base-advanced:${task.id}:${currentSha}`);
+          worktree.baseSha = currentSha;
+          task = this.store.patch(task.id, { baseSha: currentSha, commitSha: null, rewardRunId: null });
+        }
+      }
       task = this.store.transition(task.id, 'active', {
         branch,
         baseSha: worktree.baseSha,
         worktreePath: worktree.path,
       });
       this.checkpoint(task, { reusedWorktree: worktree.reused });
+      const stagingLink = this.readOnlyProgramLink(task);
+      if (stagingLink?.story.workType === 'operate' && this.config.deployment.staging.enabled &&
+          await this.git.headSha(worktree.path) === task.baseSha && (await this.git.changedFiles(worktree.path)).length === 0) {
+        const deployment = this.store.listDeployments(stagingLink.plan.id)[0];
+        if (deployment?.status !== 'succeeded' || deployment.commitSha !== task.baseSha || deployment.observedRevision !== task.baseSha) {
+          this.store.transition(task.id, 'waiting', {
+            commitSha: task.baseSha, waitKind: 'provider', resumeAfter: Date.now() + Math.max(this.config.worker.pollIntervalMs, 30_000),
+            leaseOwner: null, leaseExpiresAt: null, lastError: 'Waiting for controller-owned staging preparation before operations acceptance',
+          });
+          this.store.recordEvent('task.staging_preparation_requested', task.id, { commitSha: task.baseSha });
+          return;
+        }
+      }
 
       let lastHeartbeat = 0;
       const heartbeatInterval = Math.max(1_000, Math.min(30_000, Math.floor(this.config.worker.leaseMs / 3)));
@@ -212,24 +265,64 @@ export class HarnessSupervisor {
         const now = Date.now();
         if (now - lastHeartbeat < Math.max(500, Math.floor(heartbeatInterval / 2))) return;
         lastHeartbeat = now;
-        this.store.heartbeat(task.id, this.workerId, this.config.worker.leaseMs, now);
+        try {
+          const current = this.store.get(task.id);
+          if (!['active', 'verifying'].includes(current.state) ||
+              current.leaseOwner !== this.workerId ||
+              typeof current.leaseExpiresAt !== 'number' || current.leaseExpiresAt <= now) {
+            stopHeartbeat();
+            localAbort.abort();
+            return;
+          }
+          this.store.heartbeat(task.id, this.workerId, this.config.worker.leaseMs, now);
+        } catch {
+          stopHeartbeat();
+          localAbort.abort();
+        }
       };
       executionHeartbeatTimer = setInterval(heartbeat, heartbeatInterval);
       executionHeartbeatTimer.unref();
-      await prepareProjectCheckout(worktree.path, signal);
+      const stopHeartbeat = (): void => {
+        if (executionHeartbeatTimer !== null) {
+          clearInterval(executionHeartbeatTimer);
+          executionHeartbeatTimer = null;
+        }
+      };
+      const onCandidateReady = (eventId: string): void => {
+        candidateReadyEventId = eventId;
+      };
+      const recovery = await this.recoverInterruptedCandidate(
+        task, worktree.path, executionSignal, inheritedCandidateMarker,
+      );
+      if (recovery.kind === 'lost-lease') return;
+      const stored = this.store.get(task.id);
+      if (stored.state !== 'active' || stored.leaseOwner !== this.workerId ||
+          typeof stored.leaseExpiresAt !== 'number' || stored.leaseExpiresAt <= Date.now()) {
+        inheritedCandidateMarker(null);
+        return;
+      }
+      task = stored;
+      if (recovery.kind === 'candidate') {
+        await this.verifyCandidate(task, worktree.path, recovery.summary, executionSignal, stopHeartbeat, onCandidateReady, recovery.commitSha);
+        return;
+      }
+      await prepareProjectCheckout(worktree.path, executionSignal);
       const qwenResult = await this.qwen.execute({
         task,
         worktree: worktree.path,
         feedback: task.lastError ? [task.lastError] : [],
         onHeartbeat: heartbeat,
         onSession: (sessionId) => {
-          if (this.store.get(task.id).qwenSessionId !== sessionId) this.store.patch(task.id, { qwenSessionId: sessionId });
+          if (this.store.get(task.id).qwenSessionId !== sessionId) {
+            this.store.patch(task.id, { qwenSessionId: sessionId, qwenWorkflowRunId: null, qwenAutomaticStop: null });
+          }
         },
-        signal,
+        signal: executionSignal,
       });
       task = this.store.patch(task.id, {
         qwenSessionId: qwenResult.sessionId,
         qwenWorkflowRunId: qwenResult.workflowRunId,
+        qwenAutomaticStop: qwenResult.needsContinuation ? qwenResult.automaticStop ?? null : null,
       });
       if (qwenResult.needsContinuation) {
         const continuations = (task.continuations ?? 0) + 1;
@@ -238,18 +331,22 @@ export class HarnessSupervisor {
           goalReason: qwenResult.goalReason,
           usage: qwenResult.usage,
           continuations,
+          automaticStop: task.qwenAutomaticStop ?? null,
         });
         if (qwenResult.continuationKind === 'provider') {
           const resumeAfter = Date.now() + Math.max(this.config.worker.pollIntervalMs, 30_000);
+          const providerReason = qwenResult.goalReason ?? 'Qwen provider is temporarily unavailable';
           this.store.transition(task.id, 'waiting', {
             continuations,
             waitKind: 'provider',
             resumeAfter,
             leaseOwner: null,
             leaseExpiresAt: null,
-            lastError: qwenResult.goalReason ?? 'Qwen provider is temporarily unavailable',
+            // A provider wait is not repair feedback: preserving it here would
+            // start a fresh Qwen session instead of resuming the saved one.
+            lastError: null,
           });
-          this.store.recordEvent('task.provider_wait', task.id, { continuations, resumeAfter, reason: qwenResult.goalReason });
+          this.store.recordEvent('task.provider_wait', task.id, { continuations, resumeAfter, reason: providerReason });
         } else if (continuations >= this.config.worker.maxContinuations) {
           this.store.patch(task.id, { continuations });
           this.store.recordFailure(
@@ -270,89 +367,345 @@ export class HarnessSupervisor {
         return;
       }
 
-      task = this.store.transition(task.id, 'verifying');
-      const changedBeforeCommit = await this.git.changedFiles(worktree.path);
-      this.git.assertNoProtectedChanges(changedBeforeCommit);
-      const commitSha = await this.git.commitCandidate(worktree.path, task, qwenResult.summary);
-      task = this.store.patch(task.id, { commitSha });
-      const changedFiles = await this.git.filesChangedBetween(worktree.path, task.baseSha as string, commitSha);
-      this.git.assertNoProtectedChanges(changedFiles);
-      const diff = await this.git.diff(worktree.path, task.baseSha as string, commitSha);
-      const verificationPath = await this.git.createDetachedWorktree(
-        commitSha,
-        `candidate-${task.issueNumber}-${commitSha.slice(0, 12)}`,
+      await this.verifyCandidate(
+        task,
+        worktree.path,
+        qwenResult.summary,
+        executionSignal,
+        stopHeartbeat,
+        onCandidateReady,
       );
-      let scorecard: RewardScorecard;
-      try {
-        await prepareProjectCheckout(verificationPath, signal);
-        const gateResults = await this.gates.runAll(this.config.gates, verificationPath, changedFiles, signal);
-        const failedGate = gateResults.find((gate) => gate.required && gate.applicable && !gate.ok);
-        if (failedGate) {
-          throw new Error(`Gate ${failedGate.id} failed: ${(failedGate.stderr || failedGate.stdout).slice(-1_500)}`);
-        }
-        const sideEffectFailure = await this.gateSideEffectFailure(verificationPath);
-        if (sideEffectFailure) throw new Error(sideEffectFailure);
-        scorecard = await this.rewards.evaluate({
-          config: this.config,
-          task,
-          worktree: verificationPath,
-          commitSha,
-          changedFiles,
-          diff,
-          gateResults,
-          signal,
-        });
-      } finally {
-        await this.git.removeOwnedWorktree(verificationPath, { allowDirty: true });
-      }
-      this.store.saveScorecard(scorecard);
-      if (!scorecard.passed) {
-        throw new Error(`Reward verification failed: ${scorecard.blockingReasons.join('; ')}`);
-      }
-      throwIfAborted(signal);
-      await this.git.pushCandidate(worktree.path, task.branch as string, commitSha);
-      await this.publishRewardCheck(scorecard);
-
-      throwIfAborted(signal);
-      const pr = await this.github.createPullRequest({
-        title: `[harness] ${task.title}`,
-        body: renderPullRequestBody(task, qwenResult.summary, scorecard),
-        head: task.branch as string,
-        headSha: task.commitSha as string,
-        base: this.config.project.defaultBranch,
-      });
-      task = this.store.transition(task.id, 'pr_open', {
-        prNumber: pr.number,
-        prUrl: pr.url,
-        leaseOwner: this.workerId,
-        leaseExpiresAt: Date.now() + this.config.worker.leaseMs,
-      });
-      clearInterval(executionHeartbeatTimer);
-      executionHeartbeatTimer = null;
-      this.checkpoint(task, { prNumber: pr.number, commitSha });
-      await this.reconcileWithLease(task, signal);
     } catch (error) {
-      if (signal?.aborted) this.releaseInterruptedTask(task.id);
+      const current = this.store.get(task.id);
+      if (current.leaseOwner !== null && current.leaseOwner !== this.workerId) {
+        return;
+      }
+      const leaseHeld = current.leaseOwner === this.workerId &&
+        typeof current.leaseExpiresAt === 'number' && current.leaseExpiresAt > Date.now();
+      if (['leased', 'active', 'verifying'].includes(current.state) && !leaseHeld) return;
+      if (signal?.aborted) this.releaseInterruptedTask(task.id, candidateReadyEventId, inheritedCandidateMarkerId);
       else await this.failAttempt(task.id, error);
     } finally {
       if (executionHeartbeatTimer) clearInterval(executionHeartbeatTimer);
     }
   }
 
-  private releaseInterruptedTask(taskId: string): void {
+  private async verifyCandidate(
+    task: TaskRecord,
+    worktreePath: string,
+    summary: string,
+    signal: AbortSignal | undefined,
+    stopHeartbeat: () => void,
+    onCandidateReady: (eventId: string) => void,
+    recoveredCommitSha?: string,
+  ): Promise<void> {
+    task = this.store.transition(task.id, 'verifying');
+    const changedBeforeCommit = await this.git.changedFiles(worktreePath);
+    this.git.assertNoProtectedChanges(changedBeforeCommit);
+    const readOnly = changedBeforeCommit.length === 0 &&
+      await this.git.headSha(worktreePath) === task.baseSha && this.isReadOnlyProgramTask(task);
+    let commitSha: string;
+    if (recoveredCommitSha === undefined) {
+      commitSha = readOnly
+        ? task.baseSha as string
+        : await this.git.commitCandidate(worktreePath, task, summary);
+    } else {
+      if (changedBeforeCommit.length !== 0 ||
+          (await this.git.headSha(worktreePath)) !== recoveredCommitSha ||
+          task.commitSha !== recoveredCommitSha) {
+        throw new Error('Recovered candidate no longer matches the clean worktree HEAD or stored commit');
+      }
+      commitSha = recoveredCommitSha;
+    }
+    task = this.store.patch(task.id, { commitSha });
+    const candidateReadyEvent = this.store.recordEvent('task.candidate_ready', task.id, {
+      commitSha,
+      baseSha: task.baseSha,
+      branch: task.branch,
+      contractHash: sha256(JSON.stringify(task.spec)),
+      attempts: task.attempts,
+      lineageFailures: task.lineageFailures ?? task.attempts,
+      readOnly,
+      summary: summary.slice(0, 12_000),
+      qwenSessionId: task.qwenSessionId,
+      qwenWorkflowRunId: task.qwenWorkflowRunId,
+    }, randomUUID());
+    onCandidateReady(candidateReadyEvent.id);
+    const changedFiles = await this.git.filesChangedBetween(worktreePath, task.baseSha as string, commitSha);
+    this.git.assertNoProtectedChanges(changedFiles);
+    const diff = await this.git.diff(worktreePath, task.baseSha as string, commitSha);
+    const verificationPath = await this.git.createDetachedWorktree(
+      commitSha,
+      `candidate-${task.issueNumber}-${commitSha.slice(0, 12)}`,
+    );
+    let scorecard: RewardScorecard;
+    try {
+      await prepareProjectCheckout(verificationPath, signal);
+      const gateResults = await this.gates.runAll(this.config.gates, verificationPath, changedFiles, signal);
+      const failedGate = gateResults.find((gate) => gate.required && gate.applicable && !gate.ok);
+      if (failedGate) {
+        throw new Error(`Gate ${failedGate.id} failed: ${(failedGate.stderr || failedGate.stdout).slice(-1_500)}`);
+      }
+      const sideEffectFailure = await this.gateSideEffectFailure(verificationPath);
+      if (sideEffectFailure) throw new Error(sideEffectFailure);
+      scorecard = await this.rewards.evaluate({
+        config: this.config,
+        task,
+        worktree: verificationPath,
+        commitSha,
+        changedFiles,
+        diff,
+        gateResults,
+        signal,
+      });
+    } finally {
+      await this.git.removeOwnedWorktree(verificationPath, { allowDirty: true });
+    }
+    this.store.saveScorecard(scorecard);
+    if (!scorecard.passed) {
+      throw new Error(`Reward verification failed: ${scorecard.blockingReasons.join('; ')}`);
+    }
+    throwIfAborted(signal);
+    if (readOnly) {
+      await this.finishReadOnlyTask(task, scorecard, signal);
+      return;
+    }
+    await this.git.pushCandidate(worktreePath, task.branch as string, commitSha);
+    await this.publishRewardCheck(scorecard);
+
+    throwIfAborted(signal);
+    const pr = await this.github.createPullRequest({
+      title: `[harness] ${task.title}`,
+      body: renderPullRequestBody(task, summary, scorecard),
+      head: task.branch as string,
+      headSha: task.commitSha as string,
+      base: this.config.project.defaultBranch,
+    });
+    task = this.store.transition(task.id, 'pr_open', {
+      prNumber: pr.number,
+      prUrl: pr.url,
+      leaseOwner: this.workerId,
+      leaseExpiresAt: Date.now() + this.config.worker.leaseMs,
+    });
+    stopHeartbeat();
+    this.checkpoint(task, { prNumber: pr.number, commitSha });
+    await this.reconcileWithLease(task, signal);
+  }
+
+  private readOnlyProgramLink(task: TaskRecord): { plan: PortfolioPlanRecord; story: PortfolioStoryRecord } | undefined {
+    if (!this.config.program.enabled || !task.spec) return undefined;
+    const spec = task.spec as NonNullable<TaskRecord['spec']>;
+    const eligible = this.store.listPortfolioPlans().flatMap((plan) =>
+      plan.stories
+        .filter((story) =>
+          plan.approvedAt !== null && ['active', 'blocked'].includes(plan.status) &&
+          !story.supersededAt && story.normalizedIssueNumber === task.issueNumber &&
+          (story.wave ?? 1) <= (plan.currentWave ?? 1) &&
+          ['verify', 'operate'].includes(story.workType ?? '') &&
+          matchesPortfolioTaskContract(plan, story, spec),
+        )
+        .map((story) => ({ plan, story })),
+    );
+    if (eligible.length > 1) {
+      const links = eligible.map((link) => `${link.plan.id}/${link.story.key}`).join(', ');
+      throw new Error(`Ambiguous read-only program authorization for task ${task.id}: ${links}`);
+    }
+    return eligible[0];
+  }
+
+  private isReadOnlyProgramTask(task: TaskRecord): boolean {
+    return Boolean(this.readOnlyProgramLink(task));
+  }
+
+  private async finishReadOnlyTask(task: TaskRecord, scorecard: RewardScorecard, signal?: AbortSignal): Promise<void> {
+    const checks = await this.github.checksForRef(scorecard.commitSha, [...REQUIRED_POST_MERGE_GITHUB_CHECKS]);
+    if (checks.failed.length) throw new Error(`GitHub checks failed: ${checks.failed.join(', ')}`);
+    const issue = await this.github.getIssue(task.issueNumber);
+    const remoteSpec = parseNormalizedSpec(issue.body);
+    const link = this.readOnlyProgramLink(task);
+    if (!link) throw new Error('Read-only program contract changed during verification');
+    if (!remoteSpec || !this.config.intake.trustedAuthors.includes(issue.author) ||
+        !issue.labels.includes(this.config.intake.normalizedLabel) ||
+        !matchesPortfolioTaskContract(link.plan, link.story, remoteSpec)) {
+      throw new Error('Read-only issue contract changed during verification');
+    }
+    const needsDeployment = link.story.workType === 'operate' && this.config.deployment.staging.enabled;
+    const deployment = this.store.listDeployments(link.plan.id)[0];
+    const verifiedDeployment = !needsDeployment || (deployment?.status === 'succeeded' &&
+      deployment.commitSha === scorecard.commitSha && deployment.observedRevision === scorecard.commitSha);
+    if (!checks.complete || !checks.successful || !verifiedDeployment) {
+      const reason = !verifiedDeployment ? 'Waiting for controller-owned staging verification of this exact commit'
+        : `Waiting for required GitHub checks: ${checks.pending.join(', ') || 'not successful'}`;
+      this.store.transition(task.id, 'waiting', {
+        waitKind: 'provider', resumeAfter: Date.now() + Math.max(this.config.worker.pollIntervalMs, 30_000),
+        leaseOwner: null, leaseExpiresAt: null, lastError: reason,
+      });
+      this.store.recordEvent('task.verification_wait', task.id, { commitSha: scorecard.commitSha, reason });
+      return;
+    }
+    // Required checks and independent review describe the current merged commit, not an obsolete snapshot.
+    await this.git.verifyRemoteHead(this.config.project.defaultBranch, scorecard.commitSha);
+    if (await this.git.headSha(task.worktreePath as string) !== scorecard.commitSha ||
+        (await this.git.changedFiles(task.worktreePath as string)).length > 0) {
+      throw new Error('Read-only task worktree changed during verification');
+    }
+    throwIfAborted(signal);
+    this.store.recordEvent('task.read_only_verified', task.id, {
+      commitSha: scorecard.commitSha, scorecardId: scorecard.id, issueNumber: task.issueNumber,
+    }, `read-only-verified:${task.id}:${scorecard.commitSha}`);
+    this.store.transition(task.id, 'done', {
+      mergeSha: scorecard.commitSha, leaseOwner: null, leaseExpiresAt: null, lastError: null,
+    });
+    await this.reconcileReadOnlyClosures();
+    try {
+      await this.git.removeOwnedWorktree(task.worktreePath as string);
+    } catch (error) {
+      this.logger.warn('worktree cleanup deferred', { taskId: task.id, error: String(error) });
+    }
+  }
+
+  private async reconcileReadOnlyClosures(): Promise<void> {
+    for (const event of this.store.listEvents('task.read_only_verified')) {
+      if (!event.taskId) continue;
+      const task = this.store.get(event.taskId);
+      const key = `read-only-closed:${task.id}`;
+      if (task.state !== 'done' || this.store.hasIdempotencyKey(key)) continue;
+      try {
+        // Absolute PATCH is idempotent; the durable receipt survives interruption or provider failure.
+        await this.github.updateIssue(task.issueNumber, { state: 'closed' });
+        this.store.recordEvent('task.read_only_closed', task.id, { issueNumber: task.issueNumber }, key);
+      } catch (error) {
+        this.logger.warn('verified task issue closure deferred', { taskId: task.id, error: String(error) });
+      }
+    }
+  }
+
+  private releaseInterruptedTask(
+    taskId: string, markerId: string | null = null, inheritedMarkerId: string | null = null,
+  ): void {
     const current = this.store.get(taskId);
     if (!['leased', 'active', 'verifying'].includes(current.state)) return;
-    const message = 'Worker shutdown interrupted the prior attempt; inspect the existing worktree and continue from its saved Qwen session.';
+    const message = 'Worker shutdown interrupted the prior attempt; inspect and continue from the existing worktree. The controller selects the appropriate session for recovery.';
     const released = this.store.transition(taskId, 'ready', {
       leaseOwner: null,
       leaseExpiresAt: null,
       lastError: message,
     });
-    this.store.recordEvent('task.interrupted', taskId, {
+    const interruptedPayload: Record<string, unknown> = {
       from: current.state,
       qwenSessionId: released.qwenSessionId,
-    });
+    };
+    if (current.state === 'verifying' && markerId !== null) {
+      const marker = this.store.listEvents('task.candidate_ready').find(
+        (event) => event.id === markerId && event.taskId === taskId,
+      );
+      if (
+        marker &&
+        marker.payload.commitSha === current.commitSha &&
+        marker.payload.baseSha === current.baseSha &&
+        marker.payload.branch === current.branch &&
+        marker.payload.contractHash === sha256(JSON.stringify(current.spec)) &&
+        marker.payload.attempts === current.attempts &&
+        marker.payload.lineageFailures === (current.lineageFailures ?? current.attempts)
+      ) {
+        interruptedPayload.candidateReadyEventId = markerId;
+      }
+    }
+    if (current.state === 'active' && inheritedMarkerId !== null) {
+      const inherited = this.store.listEvents('task.candidate_ready').find(
+        (event) => event.id === inheritedMarkerId && event.taskId === taskId,
+      );
+      if (
+        inherited &&
+        !this.store.hasIdempotencyKey(`candidate-consumed:${inherited.id}`) &&
+        inherited.payload.commitSha === current.commitSha &&
+        inherited.payload.baseSha === current.baseSha &&
+        inherited.payload.branch === current.branch &&
+        inherited.payload.contractHash === sha256(JSON.stringify(current.spec)) &&
+        inherited.payload.attempts === current.attempts &&
+        inherited.payload.lineageFailures === (current.lineageFailures ?? current.attempts) &&
+        inherited.payload.qwenSessionId === current.qwenSessionId &&
+        inherited.payload.qwenWorkflowRunId === current.qwenWorkflowRunId
+      ) {
+        interruptedPayload.candidateReadyEventId = inheritedMarkerId;
+        interruptedPayload.inheritedCandidateRecovery = true;
+      }
+    }
+    this.store.recordEvent('task.interrupted', taskId, interruptedPayload);
     this.logger.info('task released after worker shutdown', { taskId, from: current.state });
+  }
+
+  private async recoverInterruptedCandidate(
+    task: TaskRecord,
+    worktreePath: string,
+    signal?: AbortSignal,
+    onInheritedMarker?: (markerId: string | null) => void,
+  ): Promise<{ kind: 'none' } | { kind: 'lost-lease' } | { kind: 'candidate'; commitSha: string; summary: string }> {
+    const ownsActiveLease = (record: TaskRecord, now = Date.now()): boolean =>
+      record.state === 'active' && record.leaseOwner === this.workerId &&
+      typeof record.leaseExpiresAt === 'number' && record.leaseExpiresAt > now;
+    const interrupted = this.store.listEvents('task.interrupted').filter((event) => event.taskId === task.id).at(-1);
+    const inheritedActive = interrupted?.payload.from === 'active' &&
+      interrupted.payload.inheritedCandidateRecovery === true;
+    if (!interrupted || typeof interrupted.payload.candidateReadyEventId !== 'string' ||
+        (interrupted.payload.from !== 'verifying' && !inheritedActive)) {
+      return { kind: 'none' };
+    }
+    const marker = this.store.listEvents('task.candidate_ready').find(
+      (event) => event.id === interrupted.payload.candidateReadyEventId && event.taskId === task.id,
+    );
+    if (!marker || this.store.hasIdempotencyKey(`candidate-consumed:${marker.id}`)) return { kind: 'none' };
+    const stored = this.store.get(task.id);
+    if (!ownsActiveLease(stored)) return { kind: 'lost-lease' };
+    onInheritedMarker?.(marker.id);
+    const issue = (await this.github.listOpenIssues()).find((candidate) => candidate.number === task.issueNumber) ?? null;
+    const remoteSpec = issue ? parseNormalizedSpec(issue.body) : null;
+    const headSha = await this.git.headSha(worktreePath);
+    const dirtyFiles = await this.git.changedFiles(worktreePath);
+    const currentBaseSha = await this.git.baseSha();
+    const fresh = this.store.get(task.id);
+    if (!ownsActiveLease(fresh)) {
+      onInheritedMarker?.(null);
+      return { kind: 'lost-lease' };
+    }
+    const issueAuthorized = issue !== null && remoteSpec !== null &&
+      this.config.intake.trustedAuthors.includes(issue.author) &&
+      issue.labels.includes(this.config.intake.normalizedLabel) &&
+      sha256(JSON.stringify(remoteSpec)) === sha256(JSON.stringify(fresh.spec));
+    const links = this.store.listPortfolioPlans().flatMap((plan) => plan.stories
+      .filter((story) => story.normalizedIssueNumber === task.issueNumber).map((story) => ({ plan, story })));
+    const programAuthorized = links.length === 0 || links.some(({ plan, story }) =>
+      typeof plan.approvedAt === 'number' && Number.isFinite(plan.approvedAt) && plan.approvedAt > 0 &&
+      ['active', 'blocked'].includes(plan.status) && !story.supersededAt &&
+      (story.wave ?? 1) <= (plan.currentWave ?? 1) && fresh.spec !== null &&
+      matchesPortfolioTaskContract(plan, story, fresh.spec as NonNullable<TaskRecord['spec']>),
+    );
+    if (!issueAuthorized || !programAuthorized) {
+      onInheritedMarker?.(null);
+      throw new Error(`Interrupted candidate for task ${task.id} failed issue or program contract reauthorization`);
+    }
+    const commitSha = typeof marker.payload.commitSha === 'string' ? marker.payload.commitSha : null;
+    const summary = typeof marker.payload.summary === 'string' && marker.payload.summary.trim().length > 0
+      ? marker.payload.summary : null;
+    const cleanHead = dirtyFiles.length === 0 ? headSha : null;
+    const evidenceValid = commitSha !== null && summary !== null && /^[0-9a-f]{40}$/.test(commitSha) &&
+      marker.payload.commitSha === fresh.commitSha && marker.payload.baseSha === fresh.baseSha &&
+      marker.payload.baseSha === currentBaseSha && cleanHead === commitSha &&
+      marker.payload.branch === fresh.branch && marker.payload.contractHash === sha256(JSON.stringify(fresh.spec)) &&
+      marker.payload.attempts === fresh.attempts &&
+      marker.payload.lineageFailures === (fresh.lineageFailures ?? fresh.attempts) &&
+      marker.payload.qwenSessionId === fresh.qwenSessionId &&
+      marker.payload.qwenWorkflowRunId === fresh.qwenWorkflowRunId &&
+      (cleanHead === fresh.baseSha && this.isReadOnlyProgramTask(fresh)) === marker.payload.readOnly;
+    if (!evidenceValid) onInheritedMarker?.(null);
+    throwIfAborted(signal);
+    const consumerId = randomUUID();
+    onInheritedMarker?.(null);
+    const consumed = this.store.recordEvent('task.candidate_recovery_consumed', task.id,
+      { markerId: marker.id, eligible: evidenceValid, consumerId }, `candidate-consumed:${marker.id}`);
+    if (consumed.payload.consumerId !== consumerId) return { kind: 'lost-lease' };
+    if (!evidenceValid || commitSha === null || summary === null) return { kind: 'none' };
+    return { kind: 'candidate', commitSha, summary };
   }
 
   private async reconcilePending(signal?: AbortSignal): Promise<TaskRecord[]> {
@@ -374,19 +727,6 @@ export class HarnessSupervisor {
         const current = this.store.get(task.id);
         if (signal?.aborted) {
           this.store.recordEvent('task.reconciliation_interrupted', task.id, { state: current.state });
-        } else if (current.state === 'post_merge') {
-          const message = error instanceof Error ? error.message : String(error);
-          const updated = this.store.recordPostMergeFailure(
-            task.id,
-            message,
-            this.config.worker.identicalFailureLimit,
-          );
-          this.logger.warn('post-merge verification retry scheduled', {
-            taskId: task.id,
-            state: updated.state,
-            attempts: updated.attempts,
-            error: message,
-          });
         } else {
           await this.failAttempt(task.id, error);
         }
@@ -480,6 +820,8 @@ export class HarnessSupervisor {
 
   private async runPostMerge(task: TaskRecord, signal?: AbortSignal): Promise<void> {
     if (!task.mergeSha) throw new Error('Post-merge verification requires mergeSha');
+    const runId = randomUUID();
+    const startedAt = Date.now();
     const verificationPath = await this.git.createDetachedWorktree(task.mergeSha, `postmerge-${task.issueNumber}`);
     let failure: string | null = null;
     try {
@@ -490,6 +832,16 @@ export class HarnessSupervisor {
       if (failed.length > 0) failure = failed.map((gate) => `${gate.id}: ${(gate.stderr || gate.stdout).slice(-700)}`).join('\n');
       const sideEffectFailure = await this.gateSideEffectFailure(verificationPath);
       if (!failure && sideEffectFailure) failure = sideEffectFailure;
+      throwIfAborted(signal);
+      this.store.recordEvent('postmerge.verification', task.id, {
+        runId,
+        mergeSha: task.mergeSha,
+        startedAt,
+        finishedAt: Date.now(),
+        passed: failure === null,
+        sideEffectFailure: sideEffectFailure !== null,
+        gates: results.map(safePostMergeGateMetadata),
+      }, `postmerge-verification:${runId}`);
     } finally {
       await this.git.removeOwnedWorktree(verificationPath, { allowDirty: true });
     }
@@ -591,6 +943,16 @@ export class HarnessSupervisor {
     const message = redactText(error instanceof Error ? error.message : String(error));
     const task = this.store.get(taskId);
     if (['done', 'failed', 'cancelled', 'quarantined'].includes(task.state)) return;
+    if (task.state === 'post_merge') {
+      const updated = this.store.recordPostMergeFailure(taskId, message, this.config.worker.identicalFailureLimit);
+      this.logger.warn('post-merge verification retry scheduled', {
+        taskId,
+        state: updated.state,
+        attempts: updated.attempts,
+        error: message,
+      });
+      return;
+    }
     const updated = this.store.recordFailure(taskId, message, this.config.worker.identicalFailureLimit);
     this.logger.warn('task attempt failed', { taskId, state: updated.state, attempts: updated.attempts, error: message });
     if (updated.prNumber) {
@@ -630,6 +992,19 @@ export class HarnessSupervisor {
     });
   }
 
+}
+
+function safePostMergeGateMetadata(gate: GateResult): Pick<GateResult, 'id' | 'kind' | 'required' | 'applicable' | 'ok' | 'exitCode' | 'durationMs' | 'evidenceHash'> {
+  return {
+    id: redactText(gate.id).slice(0, 200),
+    kind: gate.kind,
+    required: gate.required,
+    applicable: gate.applicable,
+    ok: gate.ok,
+    exitCode: gate.exitCode,
+    durationMs: gate.durationMs,
+    evidenceHash: redactText(gate.evidenceHash).slice(0, 128),
+  };
 }
 
 function repairLineage(body: string, store: PersistentTaskStore): Pick<TaskRecord, 'failureLineageId' | 'lineageFailures' | 'identicalFailures' | 'lastFailureFingerprint'> | null {

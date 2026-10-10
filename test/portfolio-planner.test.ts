@@ -6,7 +6,7 @@ import {
   readRequirementsDocument,
   validatePortfolioDraft,
 } from '../src/portfolio/planner.js';
-import type { PortfolioPlanningModel } from '../src/portfolio/planner.js';
+import type { PortfolioPlanningModel, PortfolioPlanningProgress } from '../src/portfolio/planner.js';
 import type { RepositoryAssessment } from '../src/core/types.js';
 import { defaultProjectConfig } from '../src/core/config.js';
 import { makeTmp } from './helpers.js';
@@ -30,6 +30,54 @@ function story(key: string, dependsOn: string[] = []): Record<string, unknown> {
 }
 
 describe('portfolio planner validation', () => {
+  it.each([0, 1, 2])('honors cancellation at request %s even when the provider returns a result', async (abortAt) => {
+    const abort = new AbortController();
+    const progress: PortfolioPlanningProgress[] = [];
+    let calls = 0;
+    const model: PortfolioPlanningModel = {
+      async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]): Promise<{ value: T }> {
+        expect(input.signal).toBe(abort.signal);
+        calls += 1;
+        if (calls === abortAt) abort.abort(new Error('operator cancelled'));
+        return { value: coverageDraft(calls === 1 ? 'verify' : 'implement') as T };
+      },
+    };
+    if (abortAt === 0) abort.abort(new Error('operator cancelled'));
+    const config = defaultProjectConfig(makeTmp('planner-cancel'), 'fixture', 'owner/fixture');
+    await expect(new PortfolioPlanner(config, model).plan(
+      { sourcePath: 'OBJECTIVE.md', content: 'Build runner claims.' }, 5, runnerAssessment(), undefined, undefined,
+      { signal: abort.signal, onProgress: (value) => progress.push(value) },
+    )).rejects.toThrow('operator cancelled');
+    expect(calls).toBe(abortAt);
+    expect(progress.at(-1)).toEqual({ stage: 'aborted', attempt: abortAt, maxAttempts: 3 });
+    expect(progress.some((value) => value.stage === 'validated')).toBe(false);
+  });
+
+  it.each([true, false])('reports bounded safe progress for validation success=%s', async (success) => {
+    const progress: PortfolioPlanningProgress[] = [];
+    let calls = 0;
+    const model: PortfolioPlanningModel = {
+      async completeJson<T>(): Promise<{ value: T }> {
+        calls += 1;
+        return { value: coverageDraft(success && calls > 1 ? 'implement' : 'verify') as T };
+      },
+    };
+    const config = defaultProjectConfig(makeTmp('planner-progress'), 'fixture', 'owner/fixture');
+    const result = new PortfolioPlanner(config, model).plan(
+      { sourcePath: 'OBJECTIVE.md', content: 'PRIVATE input' }, 5, runnerAssessment(), undefined, undefined,
+      { onProgress: (value) => progress.push(value) },
+    );
+    if (success) await result;
+    else await expect(result).rejects.toThrow('failed after 3 bounded attempts');
+    expect(progress).toEqual([
+      { stage: 'draft-started', attempt: 1, maxAttempts: 3 },
+      { stage: 'validation-retry', attempt: 2, maxAttempts: 3 },
+      ...success ? [] : [{ stage: 'validation-retry', attempt: 3, maxAttempts: 3 }],
+      { stage: success ? 'validated' : 'failed', attempt: success ? 2 : 3, maxAttempts: 3 },
+    ]);
+    expect(JSON.stringify(progress)).not.toMatch(/PRIVATE|RUNNERS|Controller rejected/);
+  });
+
   it('puts a compact mandatory action matrix ahead of summarized assessment evidence', async () => {
     let prompt = '';
     const model: PortfolioPlanningModel = {
@@ -63,12 +111,17 @@ describe('portfolio planner validation', () => {
 
     await new PortfolioPlanner(config, model).plan(
       { sourcePath: 'OBJECTIVE.md', content: 'Build runner claims.' }, 5, assessment, 'Review evidence: pickup coverage is missing.',
+      { technologyDecisions: [{ id: 'TD6', category: 'storage', technology: 'SQLite', source: 'exception', rationale: 'Approved local persistence' }], deploymentDecisions: [], constraints: ['Retain durable storage'], definitionOfDone: ['Real restart passes'] },
     );
 
     expect(prompt).toContain('Mandatory coverage/action matrix: [{"id":"RUNNERS"');
     expect(prompt).toContain('"requiredAction":"implement"');
     expect(prompt).not.toContain('SHOULD_NOT_REACH_PLANNER');
     expect(prompt).toContain('<program-review-evidence>Review evidence: pickup coverage is missing.</program-review-evidence>');
+    expect(prompt).toContain('Frozen approved program decisions:');
+    expect(prompt).toContain('"technology":"SQLite","source":"exception"');
+    expect(prompt).toContain('Retain durable storage');
+    expect(prompt).toContain('Real restart passes');
   });
 
   it('corrects a rejected coverage contract using the exact validator error and original assessment', async () => {

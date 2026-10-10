@@ -4,13 +4,14 @@ import type { PortfolioPlan, ProgramRevision, ProjectConfig } from '../core/type
 import { StagingDeploymentController } from '../deployment/controller.js';
 import { EvolutionSignalCollector } from '../evolution/signals.js';
 import { REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from '../github/control-plane.js';
-import { PortfolioCoordinator } from '../portfolio/coordinator.js';
+import type { Logger } from '../logger.js';
+import { matchesPortfolioTaskContract, PortfolioCoordinator, RecoveryLineageError } from '../portfolio/coordinator.js';
 import { PortfolioPlanner, readRequirementsDocument } from '../portfolio/planner.js';
 import { runProcess } from '../runtime/safe-process.js';
-import { RepositoryAssessor } from './repository-assessor.js';
+import { AssessmentContractError, RepositoryAssessor } from './repository-assessor.js';
 
 export interface ProgramTickResult {
-  action: 'disabled' | 'idle' | 'deployed' | 'deployment-failed' | 'reassessed' | 'awaiting-material-approval' | 'delivered' | 'maintaining';
+  action: 'disabled' | 'idle' | 'deployed' | 'deployment-failed' | 'reassessed' | 'recovery-blocked' | 'awaiting-material-approval' | 'delivered' | 'maintaining';
   planId: string | null;
   detail?: string;
 }
@@ -27,6 +28,7 @@ export class ProgramController {
     private readonly planner: PortfolioPlanner,
     private readonly signals: EvolutionSignalCollector,
     deployer?: StagingDeploymentController,
+    private readonly logger?: Logger,
   ) {
     this.coordinator = new PortfolioCoordinator(config, store, github);
     this.deployer = deployer ?? new StagingDeploymentController(config, store);
@@ -41,17 +43,48 @@ export class ProgramController {
     if (!plan) return { action: 'idle', planId: null };
 
     const quarantine = this.quarantinedWaveTask(plan);
+    if (plan.status === 'blocked') {
+      const exhausted = this.failedWaveTasks(plan).find((task) => {
+        const budget = this.store.retryBudget(task.id);
+        return budget.failures >= budget.limit;
+      });
+      if (exhausted) {
+        const budget = this.store.retryBudget(exhausted.id);
+        const detail = `Issue #${exhausted.issueNumber} exhausted its shared recovery budget (${budget.failures}/${budget.limit}). Automatic replacement work is blocked; review the failure evidence and explicitly authorize recovery before further attempts.`;
+        const key = `program:recovery-budget:${plan.id}:${exhausted.id}:${budget.failures}:${budget.limit}`;
+        if (!this.store.hasIdempotencyKey(key)) this.store.recordEvent('program.recovery_budget_exhausted', exhausted.id, { planId: plan.id, ...budget, detail }, key);
+        return { action: 'recovery-blocked', planId: plan.id, detail };
+      }
+    }
     if (plan.status === 'blocked' && quarantine) {
       const key = `program:quarantine:${plan.id}:${quarantine.id}:${quarantine.identicalFailures}`;
       if (!this.store.hasIdempotencyKey(key)) {
         this.store.recordEvent('program.reassessment_requested', quarantine.id, { planId: plan.id, reason: 'quarantine' });
-        const result = await this.reassess(plan, 'quarantine', signal);
+        let result: ProgramTickResult;
+        try {
+          result = await this.reassess(plan, 'quarantine', signal);
+        } catch (error) {
+          if (!(error instanceof RecoveryLineageError) && !(error instanceof AssessmentContractError)) throw error;
+          this.store.recordEvent('program.revision_rejected', quarantine.id, {
+            planId: plan.id,
+            ...(error instanceof RecoveryLineageError ? {
+              assessmentId: error.assessmentId, storyKeys: error.storyKeys,
+              originIssueNumbers: error.originIssueNumbers,
+            } : { classification: 'assessment-contract' }),
+            reason: error.message,
+          }, `${key}:rejected`);
+          result = { action: 'recovery-blocked', planId: plan.id, detail: error.message };
+        }
         this.store.recordEvent('program.quarantine_processed', quarantine.id, { planId: plan.id, result: result.action }, key);
         return result;
       }
     }
 
     if (plan.status === 'assessing') return this.finishWave(plan, signal);
+    if (plan.status === 'active') {
+      const verification = await this.verifyWaitingOperations(plan, signal);
+      if (verification) return verification;
+    }
     if (plan.status === 'delivered') {
       if (!this.config.program.maintenance) return { action: 'delivered', planId: plan.id };
       await this.coordinator.updateProgramState(plan.id, 'maintaining', { maintenanceStartedAt: plan.maintenanceStartedAt ?? Date.now() });
@@ -94,6 +127,10 @@ export class ProgramController {
     repositorySha?: string,
     sourceSignalId?: string,
   ): Promise<ProgramTickResult> {
+    signal?.throwIfAborted();
+    if (plan.status === 'awaiting_material_approval') {
+      throw new Error('Resolve the pending material revision before reassessing; its proposed decisions are not approved');
+    }
     const document = frozenRequirements(this.config.project.root, plan);
     const targetCommitSha = repositorySha ?? await this.remoteHead(signal);
     const deployment = plan.latestDeploymentId ? this.store.getDeployment(plan.latestDeploymentId) : null;
@@ -115,9 +152,11 @@ export class ProgramController {
         }]
       : [];
     const operationalEvidence = [...checkEvidence, ...deploymentEvidence];
-    const assessment = await this.assessor.assess(document, signal, operationalEvidence, targetCommitSha);
+    const assessment = await this.assessor.assess(document, signal, operationalEvidence, targetCommitSha, undefined, plan.coverage ?? []);
+    signal?.throwIfAborted();
     this.store.saveRepositoryAssessment(assessment);
     await this.recordExternalCommits(plan, assessment.commitSha, signal);
+    signal?.throwIfAborted();
     const auditComplete = assessment.coverage.length > 0 && assessment.coverage.every((entry) => entry.status === 'implemented');
     if (auditComplete) {
       const now = Date.now();
@@ -147,8 +186,22 @@ export class ProgramController {
       });
       return { action: 'reassessed', planId: plan.id, detail: 'Objective is externally blocked' };
     }
-    const draft = await this.planner.plan(document, undefined, assessment);
+    const draft = await this.planner.plan(document, undefined, assessment, undefined, {
+      technologyDecisions: structuredClone(plan.technologyDecisions),
+      deploymentDecisions: structuredClone(plan.deploymentDecisions),
+      constraints: [...plan.constraints],
+      definitionOfDone: [...plan.definitionOfDone],
+    }, {
+      signal,
+      onProgress: (progress) => {
+        const payload = { planId: plan.id, revision: plan.revision ?? 1, assessmentId: assessment.id, ...progress };
+        this.store.recordEvent('program.planning_progress', null, payload);
+        this.logger?.info('program planning progress', payload);
+      },
+    });
+    signal?.throwIfAborted();
     const material = materialRevision(plan, draft);
+    if (!material) preserveDecisionIdentities(plan, draft);
     const revised = await this.coordinator.revise({
       planId: plan.id,
       draft,
@@ -191,6 +244,38 @@ export class ProgramController {
     return result.action === 'reassessed' ? { ...result, action: 'deployed' } : result;
   }
 
+  private async verifyWaitingOperations(plan: PortfolioPlan, signal?: AbortSignal): Promise<ProgramTickResult | null> {
+    if (!this.config.deployment.staging.enabled || plan.approvedAt === null) return null;
+    const wave = plan.stories.filter((story) => !story.supersededAt && (story.wave ?? 1) === (plan.currentWave ?? 1));
+    const pending = wave.filter((story) => this.store.findByIssue(story.normalizedIssueNumber ?? -1)?.state !== 'done');
+    if (!pending.length || pending.some((story) => story.workType !== 'operate')) return null;
+    const commitSha = await this.remoteHead(signal);
+    const waiting = [...this.store.listEvents('task.verification_wait'), ...this.store.listEvents('task.staging_preparation_requested')];
+    for (const story of pending) {
+      const task = this.store.findByIssue(story.normalizedIssueNumber ?? -1);
+      if (!task || task.state !== 'waiting' || task.waitKind !== 'provider' || task.prNumber !== null ||
+          !task.spec || !matchesPortfolioTaskContract(plan, story, task.spec) ||
+          task.commitSha !== commitSha || task.baseSha !== commitSha || !waiting.some((event) =>
+            event.taskId === task.id && event.payload.commitSha === commitSha)) return null;
+    }
+    const checks = await this.github.checksForRef(commitSha, [...REQUIRED_POST_MERGE_GITHUB_CHECKS]);
+    if (!checks.complete || !checks.successful || checks.failed.length || await this.remoteHead(signal) !== commitSha) return null;
+    const deployment = this.store.listDeployments(plan.id).find((record) => record.wave === (plan.currentWave ?? 1) && record.commitSha === commitSha);
+    if (deployment?.status === 'failed' || deployment?.status === 'rolled_back') {
+      await this.ensureStagingRepair(plan, deployment.error ?? 'Staging verification failed', commitSha);
+      return { action: 'deployment-failed', planId: plan.id, detail: deployment.id };
+    }
+    const verified = deployment?.status === 'succeeded' ? deployment
+      : await this.deployer.deploy({ planId: plan.id, wave: plan.currentWave ?? 1, commitSha, signal });
+    await this.coordinator.updateProgramState(plan.id, 'active', { latestDeploymentId: verified.id });
+    if (verified.status !== 'succeeded') {
+      await this.ensureStagingRepair(plan, verified.error ?? 'Staging verification failed', commitSha);
+      return { action: 'deployment-failed', planId: plan.id, detail: verified.id };
+    }
+    // Preserve task contracts and their waiting state. Only the supervisor can complete their acceptance checks.
+    return { action: 'deployed', planId: plan.id, detail: verified.id };
+  }
+
   private async ensureStagingRepair(plan: PortfolioPlan, error: string, commitSha: string): Promise<void> {
     const key = `staging-repair:${plan.id}:${plan.currentWave ?? 1}:${commitSha}`;
     if (this.store.hasIdempotencyKey(key)) return;
@@ -213,10 +298,14 @@ export class ProgramController {
   }
 
   private quarantinedWaveTask(plan: PortfolioPlan) {
+    return this.failedWaveTasks(plan).find((task) => task.state === 'quarantined');
+  }
+
+  private failedWaveTasks(plan: PortfolioPlan) {
     const issueNumbers = new Set(plan.stories
       .filter((story) => !story.supersededAt && (story.wave ?? 1) === (plan.currentWave ?? 1))
       .flatMap((story) => story.normalizedIssueNumber === null ? [] : [story.normalizedIssueNumber]));
-    return this.store.list(['quarantined']).find((task) => issueNumbers.has(task.issueNumber));
+    return this.store.list(['failed', 'quarantined']).filter((task) => issueNumbers.has(task.issueNumber));
   }
 
   private async reconcileDeployments(signal?: AbortSignal): Promise<void> {
@@ -289,10 +378,33 @@ function frozenRequirements(root: string, plan: PortfolioPlan) {
   return document;
 }
 
-function materialRevision(plan: PortfolioPlan, draft: Awaited<ReturnType<PortfolioPlanner['plan']>>): boolean {
-  const frozenTechnologies = JSON.stringify(plan.technologyDecisions.map(({ id, category, technology, source }) => ({ id, category, technology, source })));
-  const nextTechnologies = JSON.stringify(draft.technologyDecisions.map(({ id, category, technology, source }) => ({ id, category, technology, source })));
-  const frozenDeployments = JSON.stringify(plan.deploymentDecisions.map(({ id, component, provider, environment, authority }) => ({ id, component, provider, environment, authority })));
-  const nextDeployments = JSON.stringify(draft.deploymentDecisions.map(({ id, component, provider, environment, authority }) => ({ id, component, provider, environment, authority })));
-  return frozenTechnologies !== nextTechnologies || frozenDeployments !== nextDeployments || draft.technologyDecisions.some((decision) => decision.source === 'exception');
+const technologyIdentity = ({ category, technology, source }: PortfolioPlan['technologyDecisions'][number]) => JSON.stringify([category, technology, source]);
+const deploymentIdentity = ({ component, provider, environment, authority }: PortfolioPlan['deploymentDecisions'][number]) => JSON.stringify([component, provider, environment, authority]);
+
+export function materialRevision(plan: PortfolioPlan, draft: Awaited<ReturnType<PortfolioPlanner['plan']>>): boolean {
+  const canonical = <T>(items: T[], identity: (item: T) => string) => JSON.stringify(items.map(identity).sort());
+  return canonical(plan.technologyDecisions, technologyIdentity) !== canonical(draft.technologyDecisions, technologyIdentity) ||
+    canonical(plan.deploymentDecisions, deploymentIdentity) !== canonical(draft.deploymentDecisions, deploymentIdentity);
+}
+
+export function preserveDecisionIdentities(plan: PortfolioPlan, draft: Awaited<ReturnType<PortfolioPlanner['plan']>>): void {
+  if (materialRevision(plan, draft)) throw new Error('Cannot preserve identities across material decision changes');
+  const technologies = new Map(draft.technologyDecisions.map((decision) => [decision.id,
+    plan.technologyDecisions.find((frozen) => technologyIdentity(frozen) === technologyIdentity(decision))!.id]));
+  const deployments = new Map(draft.deploymentDecisions.map((decision) => [decision.id,
+    plan.deploymentDecisions.find((frozen) => deploymentIdentity(frozen) === deploymentIdentity(decision))!.id]));
+  for (const story of draft.stories) {
+    story.technologyDecisionIds = story.technologyDecisionIds.map((id) => {
+      const frozen = technologies.get(id);
+      if (!frozen) throw new Error(`Unknown proposed technology decision ${id}`);
+      return frozen;
+    });
+    story.deploymentDecisionIds = story.deploymentDecisionIds.map((id) => {
+      const frozen = deployments.get(id);
+      if (!frozen) throw new Error(`Unknown proposed deployment decision ${id}`);
+      return frozen;
+    });
+  }
+  draft.technologyDecisions = structuredClone(plan.technologyDecisions);
+  draft.deploymentDecisions = structuredClone(plan.deploymentDecisions);
 }

@@ -250,6 +250,11 @@ export interface TaskRecord {
   commitSha: string | null;
   qwenSessionId: string | null;
   qwenWorkflowRunId: string | null;
+  qwenAutomaticStop?: {
+    sessionId: string;
+    workflowRunId: string | null;
+    kind: 'turn-limit' | 'budget-limit' | 'process-timeout';
+  } | null;
   prNumber: number | null;
   prUrl: string | null;
   mergeSha: string | null;
@@ -321,6 +326,19 @@ export interface RepositoryAssessment {
   analyses: RepositoryAnalysis[];
   coverage: ObjectiveCoverage[];
   createdAt: number;
+  objectiveContentHash?: string;
+  reviewedAssessmentId?: string;
+  reviewCorrections?: Array<{ id: string; rationale: string; omitReason: 'separate_validation' | 'program_operating_record' | null }>;
+}
+
+export interface ApprovedProgramContract {
+  approvedRevision: number;
+  currentWave: number;
+  title: string;
+  constraints: string[];
+  definitionOfDone: string[];
+  technologyDecisions: TechnologyDecision[];
+  deploymentDecisions: DeploymentDecision[];
 }
 
 export interface ProgramRevision {
@@ -333,6 +351,13 @@ export interface ProgramRevision {
   createdAt: number;
   approvedAt: number | null;
   sourceSignalId?: string | null;
+  objectiveContentHash?: string;
+  objectiveSourceContent?: string;
+  objectiveSourcePath?: string;
+  priorApprovedContract?: ApprovedProgramContract;
+  rejectedAt?: number;
+  rejection?: { operator: string; reason: string; provenance: string };
+  restoresRevision?: number;
 }
 
 export interface PortfolioStory {

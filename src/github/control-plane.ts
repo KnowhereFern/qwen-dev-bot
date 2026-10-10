@@ -44,7 +44,7 @@ export interface GitHubControl {
   listOpenIssues(): Promise<RemoteIssue[]>;
   getIssue(issueNumber: number): Promise<RemoteIssue>;
   createIssue(input: { title: string; body: string; labels: string[] }): Promise<RemoteIssue>;
-  updateIssue(issueNumber: number, input: { title?: string; body?: string }): Promise<RemoteIssue>;
+  updateIssue(issueNumber: number, input: { title?: string; body?: string; state?: 'open' | 'closed' }): Promise<RemoteIssue>;
   comment(issueNumber: number, body: string): Promise<void>;
   addLabels(issueNumber: number, labels: string[]): Promise<void>;
   removeLabel(issueNumber: number, label: string): Promise<void>;
@@ -120,7 +120,7 @@ export class OctokitControlPlane implements GitHubControl {
     return toIssue(data);
   }
 
-  async updateIssue(issueNumber: number, input: { title?: string; body?: string }): Promise<RemoteIssue> {
+  async updateIssue(issueNumber: number, input: { title?: string; body?: string; state?: 'open' | 'closed' }): Promise<RemoteIssue> {
     const { data } = await this.octokit.rest.issues.update({
       owner: this.owner,
       repo: this.repo,

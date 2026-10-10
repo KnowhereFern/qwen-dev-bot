@@ -46,6 +46,26 @@ export interface ProgramEvidenceReport {
   deployments: ReturnType<PersistentTaskStore['listDeployments']>;
   signals: ReturnType<PersistentTaskStore['listSignals']>;
   controllerReleases: ReturnType<PersistentTaskStore['listControllerReleases']>;
+  postMergeVerifications: Array<{
+    eventId: string;
+    taskId: string;
+    runId: string;
+    mergeSha: string;
+    startedAt: number;
+    finishedAt: number;
+    passed: boolean;
+    sideEffectFailure: boolean;
+    gates: Array<{
+      id: string;
+      kind: string;
+      required: boolean;
+      applicable: boolean;
+      ok: boolean;
+      exitCode: number | null;
+      durationMs: number;
+      evidenceHash: string;
+    }>;
+  }>;
 }
 
 export function buildEvidenceReport(store: PersistentTaskStore, plan: PortfolioPlan, now = Date.now()): ProgramEvidenceReport {
@@ -76,13 +96,18 @@ export function buildEvidenceReport(store: PersistentTaskStore, plan: PortfolioP
   const interventions = events.filter((event) =>
     [
       'program.approved',
+      'portfolio.redrafted',
       'program.external_commit_observed',
+      'program.manual_intervention_observed',
+      'task.recovery_authorized',
       'program.revised',
       'program.objective_accepted',
       'evolution.signal_decided',
       'controller.promoted',
       'controller.rolled_back',
-    ].includes(event.type),
+    ].includes(event.type) &&
+    (event.payload.planId === undefined || event.payload.planId === plan.id) &&
+    (event.taskId === null || taskIds.has(event.taskId)),
   );
   const controllerReleases = mergeControllerHistory(store.listControllerReleases(), readGlobalControllerHistory());
   const elapsedMs = Math.max(0, (plan.deliveredAt ?? now) - plan.createdAt);
@@ -130,6 +155,7 @@ export function buildEvidenceReport(store: PersistentTaskStore, plan: PortfolioP
     deployments: store.listDeployments(plan.id),
     signals: store.listSignals(),
     controllerReleases,
+    postMergeVerifications: postMergeVerificationRecords(events, taskIds),
   };
 }
 
@@ -165,10 +191,84 @@ export function formatEvidenceReport(report: ProgramEvidenceReport): string {
     '',
     ...report.deployments.map((deployment) => `- ${deployment.id}: ${deployment.status}; commit=${deployment.commitSha}; observed=${deployment.observedRevision ?? '-'}`),
     '',
+    '## Post-merge verification records',
+    '',
+    '> Historical post-merge checks captured at delivery time: they evidence which runs happened, and are not current acceptance authority.',
+    '',
+    ...(report.postMergeVerifications.length > 0
+      ? report.postMergeVerifications.map((record) => `- ${new Date(record.finishedAt).toISOString()} run=${record.runId}: task=${record.taskId}; merge=${record.mergeSha}; passed=${record.passed}; sideEffectFailure=${record.sideEffectFailure}; gates=${record.gates.map(formatGate).join(', ') || 'none'}`)
+      : ['- None recorded.']),
+    '',
     '## Human and governance interventions',
     '',
     ...(report.interventions.length ? report.interventions.map((event) => `- ${new Date(event.createdAt).toISOString()} ${event.type}: ${JSON.stringify(event.payload)}`) : ['- None recorded.']),
   ].join('\n');
+}
+
+const FULL_COMMIT_SHA = /^[0-9a-f]{40}$/i;
+
+type PostMergeVerificationGate = ProgramEvidenceReport['postMergeVerifications'][number]['gates'][number];
+
+function formatGate(gate: PostMergeVerificationGate): string {
+  const base = `${gate.id}=${gate.ok ? 'ok' : 'fail'}@${gate.evidenceHash}`;
+  if (gate.applicable && gate.required) return base;
+  if (!gate.applicable) return `${base} (${gate.required ? 'skipped-required' : 'skipped-optional'})`;
+  return `${base} (optional)`;
+}
+
+function postMergeVerificationRecords(
+  events: ReturnType<PersistentTaskStore['listEvents']>,
+  taskIds: Set<string>,
+): ProgramEvidenceReport['postMergeVerifications'] {
+  const records: ProgramEvidenceReport['postMergeVerifications'] = [];
+  for (const event of events) {
+    if (event.type !== 'postmerge.verification') continue;
+    const taskId = event.taskId;
+    if (taskId === null || !taskIds.has(taskId)) continue;
+    const record = parsePostMergeVerification(event.id, taskId, event.payload);
+    if (record !== null) records.push(record);
+  }
+  return records;
+}
+
+function parsePostMergeVerification(
+  eventId: string,
+  taskId: string,
+  rawPayload: unknown,
+): ProgramEvidenceReport['postMergeVerifications'][number] | null {
+  const payload = typeof rawPayload === 'object' && rawPayload !== null ? (rawPayload as Record<string, unknown>) : {};
+  const { runId, mergeSha, startedAt, finishedAt, passed, sideEffectFailure, gates } = payload;
+  if (typeof runId !== 'string' || runId.trim() === '') return null;
+  if (typeof mergeSha !== 'string' || !FULL_COMMIT_SHA.test(mergeSha)) return null;
+  if (!isPositiveTimestamp(startedAt) || !isPositiveTimestamp(finishedAt)) return null;
+  if (finishedAt < startedAt) return null;
+  if (typeof passed !== 'boolean' || !Array.isArray(gates)) return null;
+  return {
+    eventId,
+    taskId,
+    runId,
+    mergeSha,
+    startedAt,
+    finishedAt,
+    passed,
+    sideEffectFailure: sideEffectFailure === true,
+    gates: gates
+      .filter((gate): gate is Record<string, unknown> => typeof gate === 'object' && gate !== null)
+      .map((gate) => ({
+        id: typeof gate.id === 'string' ? gate.id : '',
+        kind: typeof gate.kind === 'string' ? gate.kind : '',
+        required: gate.required === true,
+        applicable: gate.applicable === true,
+        ok: gate.ok === true,
+        exitCode: typeof gate.exitCode === 'number' ? gate.exitCode : null,
+        durationMs: typeof gate.durationMs === 'number' ? gate.durationMs : 0,
+        evidenceHash: typeof gate.evidenceHash === 'string' ? gate.evidenceHash : '',
+      })),
+  };
+}
+
+function isPositiveTimestamp(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
 }
 
 function count<T>(values: T[], key: (value: T) => string): Record<string, number> {

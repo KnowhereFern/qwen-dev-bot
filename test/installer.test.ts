@@ -4,8 +4,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { githubBranchProtectionUnavailable, installProject, uninstallProject } from '../src/installer/installer.js';
 import { defaultProjectConfig, serializeProjectConfig } from '../src/core/config.js';
 import { templateAssetProblems } from '../src/doctor.js';
+import { projectIdFor } from '../src/core/state-paths.js';
+import { ProjectRegistry } from '../src/registry.js';
 import { runProcess } from '../src/runtime/safe-process.js';
 import { makeTmp } from './helpers.js';
+
+const harnessVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version as string;
 
 const priorState = process.env.QWEN_HARNESS_STATE_DIR;
 afterEach(() => {
@@ -76,6 +80,44 @@ describe('guided installer', () => {
     expect(result.config.qwen.billingPlan).toBe('token-plan-personal');
     expect(result.config.qwen.credentialEnvKey).toBe('BAILIAN_TOKEN_PLAN_API_KEY');
     expect(result.config.qwen.baseUrl).toBe('https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1');
+  });
+
+  it('preserves exact config formatting on no-op updates but persists semantic changes', async () => {
+    const root = makeTmp('installer-config-format');
+    process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-config-format-state');
+    const options = {
+      root, yes: true,
+      answers: {
+        projectName: 'fixture', githubRepo: 'owner/fixture', trustedAuthor: 'owner',
+        qwenBillingPlan: 'standard' as const, autoMerge: false,
+        installQwen: false, linkExtension: false, installService: false,
+        bootstrapDependencies: false, configureGitHub: false,
+      },
+    };
+    await installProject(options);
+    const configFile = path.join(root, '.qwen-harness', 'project.yml');
+    const config = JSON.parse(readFileSync(configFile, 'utf8'));
+    config.gates.push({
+      id: 'next-typegen', kind: 'custom', command: 'node',
+      args: ['node_modules/next/dist/bin/next', 'typegen'], required: true, timeoutMs: 1_000,
+    });
+    const formatted = `${JSON.stringify(config, null, 2).replace(
+      /"args": \[\s*"node_modules\/next\/dist\/bin\/next",\s*"typegen"\s*\]/,
+      '"args": ["node_modules/next/dist/bin/next", "typegen"]',
+    )}\n`;
+    expect(formatted).toContain('"args": ["node_modules/next/dist/bin/next", "typegen"]');
+    writeFileSync(configFile, formatted);
+
+    const unchanged = await installProject(options);
+    expect(readFileSync(configFile, 'utf8')).toBe(formatted);
+    expect(unchanged.summary).toContain('unchanged .qwen-harness/project.yml');
+
+    const changed = await installProject({ ...options, answers: { ...options.answers, autoMerge: true } });
+    expect(changed.config.worker.autoMerge).toBe(true);
+    const persisted = JSON.parse(readFileSync(configFile, 'utf8'));
+    expect(persisted.worker.autoMerge).toBe(true);
+    expect(persisted.gates).toEqual(config.gates);
+    expect(changed.summary).toContain('wrote .qwen-harness/project.yml');
   });
 
   it('installs idempotently and preserves modified files on uninstall', async () => {
@@ -229,6 +271,40 @@ describe('guided installer', () => {
     expect(updated.receipt.service).toEqual(receipt.service);
   });
 
+  it('keeps a disabled registration disabled when an update changes the project id', async () => {
+    const root = makeTmp('installer-disabled-registration');
+    process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-disabled-registration-state');
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'fixture' }));
+    const answers = {
+      githubRepo: 'owner/fixture',
+      trustedAuthor: 'owner',
+      installQwen: false,
+      linkExtension: false,
+      installService: false,
+      bootstrapDependencies: false,
+      configureGitHub: false,
+    } as const;
+    const first = await installProject({ root, yes: true, answers: { ...answers, projectName: 'fixture' } });
+    const registry = new ProjectRegistry();
+    const canonicalRoot = first.config.project.root;
+    const registered = registry.list().find((project) => path.resolve(project.root) === path.resolve(canonicalRoot));
+    expect(registered?.enabled).toBe(true);
+    registry.register({
+      id: registered!.id,
+      root: canonicalRoot,
+      configPath: registered!.configPath,
+      enabled: false,
+    });
+
+    const second = await installProject({ root, yes: true, answers: { ...answers, projectName: 'renamed-fixture' } });
+    expect(second.config.project.name).toBe('renamed-fixture');
+    const forRoot = registry.list().filter((project) => path.resolve(project.root) === path.resolve(canonicalRoot));
+    expect(forRoot).toHaveLength(1);
+    expect(forRoot[0]!.enabled).toBe(false);
+    expect(forRoot[0]!.id).not.toBe(projectIdFor(first.config));
+    expect(forRoot[0]!.id).toBe(projectIdFor(second.config));
+  });
+
   it('restores pre-existing Qwen settings while preserving later unrelated additions', async () => {
     const root = makeTmp('installer-existing-settings');
     process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-existing-settings-state');
@@ -293,7 +369,7 @@ describe('guided installer', () => {
       timeoutMs: 20_000,
     });
     expect(receipt.exitCode).toBe(0);
-    expect(receipt.stdout.trim()).toBe('1.0.0-rc.24');
+    expect(receipt.stdout.trim()).toBe(harnessVersion);
   });
 
   it.skipIf(process.platform === 'win32')('replaces a stale extension link with the immutable runtime', async () => {
@@ -341,7 +417,7 @@ exit 1
       },
     });
 
-    const immutableRuntime = path.join(state, 'controller', 'installed', '1.0.0-rc.24', 'node_modules', 'qwen-dev-bot');
+    const immutableRuntime = path.join(state, 'controller', 'installed', harnessVersion, 'node_modules', 'qwen-dev-bot');
     expect(readFileSync(linkedPath, 'utf8')).toBe(immutableRuntime);
     expect(installed.receipt.extensionLinked).toBe(true);
   }, 15_000);
@@ -388,9 +464,9 @@ exit 1
     ).rejects.toThrow('extension link failed');
 
     expect(existsSync(path.join(root, '.qwen-harness', 'install-receipt.json'))).toBe(true);
-    expect(existsSync(path.join(state, 'controller', 'installed', '1.0.0-rc.24', 'node_modules', 'qwen-dev-bot', 'bin', 'qwen-harness-launcher.mjs'))).toBe(true);
+    expect(existsSync(path.join(state, 'controller', 'installed', harnessVersion, 'node_modules', 'qwen-dev-bot', 'bin', 'qwen-harness-launcher.mjs'))).toBe(true);
     expect(await uninstallProject(root)).toContain('unregistered project');
-  });
+  }, 15_000); // Exercises immutable runtime installation before the intentional link failure.
 
   it.skipIf(process.platform === 'win32')('refuses managed-path symlinks before writing template files', async () => {
     const root = makeTmp('installer-symlink-root');
