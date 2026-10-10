@@ -369,11 +369,14 @@ export async function installProject(options: InstallOptions): Promise<{ config:
   }
 
   if (!options.dryRun) {
-    new ProjectRegistry().register({
-      id: projectIdFor(config),
+    const registry = new ProjectRegistry();
+    const projectId = projectIdFor(config);
+    const existing = registry.list().find((project) => project.id === projectId || path.resolve(project.root) === root);
+    registry.register({
+      id: projectId,
       root,
       configPath: configTarget,
-      enabled: true,
+      enabled: existing?.enabled ?? true,
     });
   }
   summary.push(`${options.dryRun ? 'would register' : 'registered'} project with qwen-harnessd`);

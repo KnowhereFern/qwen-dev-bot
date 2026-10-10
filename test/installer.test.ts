@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { githubBranchProtectionUnavailable, installProject, uninstallProject } from '../src/installer/installer.js';
 import { defaultProjectConfig, serializeProjectConfig } from '../src/core/config.js';
 import { templateAssetProblems } from '../src/doctor.js';
+import { projectIdFor } from '../src/core/state-paths.js';
+import { ProjectRegistry } from '../src/registry.js';
 import { runProcess } from '../src/runtime/safe-process.js';
 import { makeTmp } from './helpers.js';
 
@@ -267,6 +269,40 @@ describe('guided installer', () => {
     const updated = await installProject({ root, yes: true, answers });
     expect(updated.receipt.extensionLinked).toBe(true);
     expect(updated.receipt.service).toEqual(receipt.service);
+  });
+
+  it('keeps a disabled registration disabled when an update changes the project id', async () => {
+    const root = makeTmp('installer-disabled-registration');
+    process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-disabled-registration-state');
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'fixture' }));
+    const answers = {
+      githubRepo: 'owner/fixture',
+      trustedAuthor: 'owner',
+      installQwen: false,
+      linkExtension: false,
+      installService: false,
+      bootstrapDependencies: false,
+      configureGitHub: false,
+    } as const;
+    const first = await installProject({ root, yes: true, answers: { ...answers, projectName: 'fixture' } });
+    const registry = new ProjectRegistry();
+    const canonicalRoot = first.config.project.root;
+    const registered = registry.list().find((project) => path.resolve(project.root) === path.resolve(canonicalRoot));
+    expect(registered?.enabled).toBe(true);
+    registry.register({
+      id: registered!.id,
+      root: canonicalRoot,
+      configPath: registered!.configPath,
+      enabled: false,
+    });
+
+    const second = await installProject({ root, yes: true, answers: { ...answers, projectName: 'renamed-fixture' } });
+    expect(second.config.project.name).toBe('renamed-fixture');
+    const forRoot = registry.list().filter((project) => path.resolve(project.root) === path.resolve(canonicalRoot));
+    expect(forRoot).toHaveLength(1);
+    expect(forRoot[0]!.enabled).toBe(false);
+    expect(forRoot[0]!.id).not.toBe(projectIdFor(first.config));
+    expect(forRoot[0]!.id).toBe(projectIdFor(second.config));
   });
 
   it('restores pre-existing Qwen settings while preserving later unrelated additions', async () => {

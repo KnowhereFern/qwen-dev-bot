@@ -8,6 +8,7 @@ All notable changes to this project are documented here.
 
 - Treat an observed Qwen provider quota pause as a resumable wait when the process exits 1; other unexpected exits remain failures.
 - Preserve the Qwen session across provider waits by keeping the wait reason in durable events instead of repair feedback.
+- Preserve a deliberately disabled project registration during harness updates, including a project rename.
 - Add regression coverage for quota exits, unsafe lookalikes, and provider wait resumption.
 
 ## [1.0.0-rc.64] - 2026-10-09
