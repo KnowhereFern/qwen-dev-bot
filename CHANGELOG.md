@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.66] - 2026-10-10
+
+- Reconcile completed verification and documented external blockers before drafting a new delivery wave, without weakening the saved objective assessment.
+- Reject stories mapped only to already-satisfied planning actions; require exact-commit and task-diff evidence before suppressing repeat work.
+
 ## [1.0.0-rc.65] - 2026-10-09
 
 - Treat an observed Qwen provider quota pause as a resumable wait when the process exits 1; other unexpected exits remain failures.

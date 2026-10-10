@@ -1,9 +1,17 @@
 import { createHash } from 'node:crypto';
+import path from 'node:path';
 import type { PersistentTaskStore } from '../core/persistent-store.js';
-import type { PortfolioPlan, ProgramRevision, ProjectConfig } from '../core/types.js';
+import type {
+  ObjectiveCoverage,
+  PortfolioPlan,
+  ProgramRevision,
+  ProgramWorkType,
+  ProjectConfig,
+  RepositoryAssessment,
+} from '../core/types.js';
 import { StagingDeploymentController } from '../deployment/controller.js';
 import { EvolutionSignalCollector } from '../evolution/signals.js';
-import { REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from '../github/control-plane.js';
+import { REQUIRED_POST_MERGE_GITHUB_CHECKS, type CheckSummary, type GitHubControl } from '../github/control-plane.js';
 import type { Logger } from '../logger.js';
 import { matchesPortfolioTaskContract, PortfolioCoordinator, RecoveryLineageError } from '../portfolio/coordinator.js';
 import { PortfolioPlanner, readRequirementsDocument } from '../portfolio/planner.js';
@@ -186,7 +194,22 @@ export class ProgramController {
       });
       return { action: 'reassessed', planId: plan.id, detail: 'Objective is externally blocked' };
     }
-    const draft = await this.planner.plan(document, undefined, assessment, undefined, {
+    signal?.throwIfAborted();
+    const planningAssessment = await this.planningOnlyAssessment(plan, assessment, checks, signal);
+    signal?.throwIfAborted();
+    if (!planningAssessment.coverage.some((entry) => entry.requiredAction !== 'none')) {
+      await this.coordinator.updateProgramState(plan.id, 'blocked', {
+        assessmentId: assessment.id,
+        repositorySha: assessment.commitSha,
+        coverage: assessment.coverage,
+      });
+      return {
+        action: 'reassessed',
+        planId: plan.id,
+        detail: 'Objective has no plannable work after completed verification and blocker documentation',
+      };
+    }
+    const draft = await this.planner.plan(document, undefined, planningAssessment, undefined, {
       technologyDecisions: structuredClone(plan.technologyDecisions),
       deploymentDecisions: structuredClone(plan.deploymentDecisions),
       constraints: [...plan.constraints],
@@ -217,6 +240,64 @@ export class ProgramController {
       planId: revised.id,
       detail: `revision ${revised.revision ?? 1}`,
     };
+  }
+
+  private async planningOnlyAssessment(
+    plan: PortfolioPlan,
+    assessment: RepositoryAssessment,
+    checks: CheckSummary,
+    signal?: AbortSignal,
+  ): Promise<RepositoryAssessment> {
+    const coverage: ObjectiveCoverage[] = structuredClone(assessment.coverage);
+    const verifiedChecks = checks.complete && checks.successful && checks.failed.length === 0;
+    const doneStories = (entryId: string, workType: ProgramWorkType) => plan.stories.filter((story) =>
+      !story.supersededAt && story.workType === workType && story.coverageIds?.includes(entryId) &&
+      story.normalizedIssueNumber !== null && this.store.findByIssue(story.normalizedIssueNumber)?.state === 'done');
+    for (const entry of coverage) {
+      if (entry.status === 'externally_blocked') {
+        const citedFiles = entry.evidence.filter((item) => item.kind === 'file' && assessment.files.includes(item.locator));
+        let blockerDocumentExists = false;
+        for (const story of doneStories(entry.id, 'document')) {
+          const task = this.store.findByIssue(story.normalizedIssueNumber as number);
+          if (!task || !isCommitSha(task.baseSha) || !isCommitSha(task.commitSha)) continue;
+          const documentDiff = await runProcess({
+            command: 'git',
+            args: ['diff', '--name-only', `${task.baseSha}..${task.commitSha}`],
+            cwd: this.config.project.root,
+            timeoutMs: 30_000,
+            signal,
+          });
+          // Any unknown git result keeps the external requirement.
+          if (documentDiff.exitCode !== 0) continue;
+          const changedByDocumentTask = new Set(documentDiff.stdout.split('\n').map((value) => value.trim()).filter(Boolean));
+          for (const item of citedFiles) {
+            if (!changedByDocumentTask.has(item.locator)) continue;
+            if (await safeCommitFileExists(this.config.project.root, assessment.commitSha, item.locator, signal)) blockerDocumentExists = true;
+            if (blockerDocumentExists) break;
+          }
+          if (blockerDocumentExists) break;
+        }
+        if (blockerDocumentExists) entry.requiredAction = 'none';
+        continue;
+      }
+      if (entry.status !== 'unverified' || entry.requiredAction !== 'verify' || !verifiedChecks) continue;
+      const mergeSha = doneStories(entry.id, 'verify')
+        .map((story) => this.store.findByIssue(story.normalizedIssueNumber as number)?.mergeSha)
+        .find((sha): sha is string => /^[0-9a-f]{40}$/i.test(sha ?? ''));
+      if (!mergeSha) continue;
+      const diff = await runProcess({
+        command: 'git',
+        args: ['diff', '--name-only', `${mergeSha}..${assessment.commitSha}`],
+        cwd: this.config.project.root,
+        timeoutMs: 30_000,
+        signal,
+      });
+      // Any unknown git result keeps the verification requirement.
+      if (diff.exitCode !== 0) continue;
+      const changed = diff.stdout.split('\n').map((value) => value.trim()).filter(Boolean);
+      if (changed.every((file) => file.startsWith('docs/'))) entry.requiredAction = 'none';
+    }
+    return { ...assessment, coverage };
   }
 
   private async finishWave(plan: PortfolioPlan, signal?: AbortSignal): Promise<ProgramTickResult> {
@@ -366,6 +447,25 @@ export class ProgramController {
       }, `program:external-commit:${plan.id}:${commitSha}`);
     }
   }
+}
+
+function isCommitSha(sha: string | null): sha is string {
+  return typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha);
+}
+
+async function safeCommitFileExists(root: string, commitSha: string, relative: string, signal?: AbortSignal): Promise<boolean> {
+  if (!/^[0-9a-f]{40}$/i.test(commitSha)) return false;
+  if (!relative || path.posix.isAbsolute(relative) || relative.split('/').includes('..') ||
+      !/^[A-Za-z0-9._\-/]+$/.test(relative)) return false;
+  const result = await runProcess({
+    command: 'git',
+    args: ['cat-file', '-e', `${commitSha}:${relative}`],
+    cwd: root,
+    timeoutMs: 30_000,
+    signal,
+  });
+  // Any nonzero result (missing path or unknown git error) conservatively keeps the requirement.
+  return result.exitCode === 0;
 }
 
 function frozenRequirements(root: string, plan: PortfolioPlan) {

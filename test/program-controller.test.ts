@@ -1,9 +1,11 @@
 import { execFileSync } from 'node:child_process';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
 import { PersistentTaskStore } from '../src/core/persistent-store.js';
 import { projectIdFor } from '../src/core/state-paths.js';
-import type { PortfolioPlan, TaskSpec } from '../src/core/types.js';
+import type { ObjectiveCoverage, PortfolioPlan, PortfolioStory, RepositoryAssessment, TaskSpec } from '../src/core/types.js';
 import { StagingDeploymentController } from '../src/deployment/controller.js';
 import { EvolutionSignalCollector } from '../src/evolution/signals.js';
 import { Logger, type LogRecord } from '../src/logger.js';
@@ -233,7 +235,381 @@ describe('ProgramController', () => {
     expect(github.checkedNames).toEqual(['Fern Delivery Harness / CI']);
     store.close();
   });
+  it('planning coverage marks externally blocked work none only after a done blocker document story cites an existing file', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'BLK', requirement: 'Provider access', status: 'externally_blocked', requiredAction: 'external', rationale: 'Credentials unavailable', evidence: [{ kind: 'file', locator: 'docs/BLOCKER.md', summary: 'Blocker operating record', commitSha: repo.docsSha }] },
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Absent', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [
+        priorStory({ key: 'DOC1', workType: 'document', coverageIds: ['BLK'] }),
+      ],
+      doneTasks: [{ issueNumber: 10, baseSha: repo.baseSha, commitSha: repo.docsSha }],
+      files: ['docs/BLOCKER.md', 'docs/NOTE.md'],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, ['docs/BLOCKER.md', 'docs/NOTE.md']);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    let planned: RepositoryAssessment | undefined;
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockImplementation(async (...args) => {
+      planned = args[2] as RepositoryAssessment;
+      return gapDraft();
+    });
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(result.action).toBe('reassessed');
+      expect(planned?.coverage.find((entry) => entry.id === 'BLK')).toMatchObject({ status: 'externally_blocked', requiredAction: 'none' });
+      expect(planned?.coverage.find((entry) => entry.id === 'GAP')?.requiredAction).toBe('implement');
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage.find((entry) => entry.id === 'BLK')?.requiredAction).toBe('external');
+      expect(fixture.store.getPortfolioPlan('repeat_plan')?.coverage?.find((entry) => entry.id === 'BLK')?.requiredAction).toBe('external');
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('marks blocker work none when the document exists in the assessed commit but is absent from the local checkout', async () => {
+    const repo = await committedRepeatRepo();
+    rmSync(path.join(repo.repo, 'docs', 'BLOCKER.md'));
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'BLK', requirement: 'Provider access', status: 'externally_blocked', requiredAction: 'external', rationale: 'Credentials unavailable', evidence: [{ kind: 'file', locator: 'docs/BLOCKER.md', summary: 'Blocker operating record', commitSha: repo.docsSha }] },
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Absent', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'DOC1', workType: 'document', coverageIds: ['BLK'] })],
+      doneTasks: [{ issueNumber: 10, baseSha: repo.baseSha, commitSha: repo.docsSha }],
+      files: ['docs/BLOCKER.md', 'docs/NOTE.md'],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, ['docs/BLOCKER.md', 'docs/NOTE.md']);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    let planned: RepositoryAssessment | undefined;
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockImplementation(async (...args) => {
+      planned = args[2] as RepositoryAssessment;
+      return gapDraft();
+    });
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(result.action).toBe('reassessed');
+      expect(planned?.coverage.find((entry) => entry.id === 'BLK')).toMatchObject({ status: 'externally_blocked', requiredAction: 'none' });
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('keeps external action when the blocker document is missing from the assessed commit even though it existed earlier', async () => {
+    const repo = await committedRepeatRepo();
+    execFileSync('git', ['rm', '-q', 'docs/BLOCKER.md'], { cwd: repo.repo, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'remove blocker doc'], { cwd: repo.repo, stdio: 'ignore' });
+    const goneSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo.repo, encoding: 'utf8' }).trim();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'BLK', requirement: 'Provider access', status: 'externally_blocked', requiredAction: 'external', rationale: 'Credentials unavailable', evidence: [{ kind: 'file', locator: 'docs/BLOCKER.md', summary: 'Blocker operating record', commitSha: repo.docsSha }] },
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Absent', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: goneSha, coverage,
+      stories: [priorStory({ key: 'DOC1', workType: 'document', coverageIds: ['BLK'] })],
+      doneTasks: [{ issueNumber: 10, baseSha: repo.baseSha, commitSha: repo.docsSha }],
+      files: ['docs/BLOCKER.md', 'docs/NOTE.md'],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, goneSha, coverage, ['docs/BLOCKER.md', 'docs/NOTE.md']);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    let planned: RepositoryAssessment | undefined;
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockImplementation(async (...args) => {
+      planned = args[2] as RepositoryAssessment;
+      return gapDraft();
+    });
+    try {
+      await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, goneSha);
+      expect(planned?.coverage.find((entry) => entry.id === 'BLK')?.requiredAction).toBe('external');
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it.each([
+    { label: 'superseded document story', superseded: true, missingFile: false },
+    { label: 'deleted blocker document', superseded: false, missingFile: true },
+    { label: 'missing task commit evidence', superseded: false, missingFile: false, noTaskShas: true },
+  ] as const)('keeps external action when the blocker record is incomplete: $label', async ({ superseded, missingFile, noTaskShas }) => {
+    const repo = await committedRepeatRepo();
+    const locator = missingFile ? 'docs/GONE.md' : 'docs/BLOCKER.md';
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'BLK', requirement: 'Provider access', status: 'externally_blocked', requiredAction: 'external', rationale: 'Credentials unavailable', evidence: [{ kind: 'file', locator, summary: 'Blocker operating record', commitSha: repo.docsSha }] },
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Absent', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'DOC1', workType: 'document', coverageIds: ['BLK'], supersededAt: superseded ? 2 : null })],
+      doneTasks: [{ issueNumber: 10, baseSha: noTaskShas ? undefined : repo.baseSha, commitSha: noTaskShas ? undefined : repo.docsSha }],
+      files: missingFile ? [] : ['docs/BLOCKER.md'],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, missingFile ? [] : ['docs/BLOCKER.md']);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    let planned: RepositoryAssessment | undefined;
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockImplementation(async (...args) => {
+      planned = args[2] as RepositoryAssessment;
+      return gapDraft();
+    });
+    try {
+      await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(planned?.coverage.find((entry) => entry.id === 'BLK')?.requiredAction).toBe('external');
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it.each([
+    {
+      label: 'unrelated cited source file',
+      evidence: { locator: 'src/app.ts', commitSha: 'src' },
+      assessedSha: 'src',
+      taskDiff: ['base', 'docs'],
+      expected: 'external',
+    },
+    {
+      label: 'cited document unchanged by the document task',
+      evidence: { locator: 'docs/BLOCKER.md', commitSha: 'docs' },
+      assessedSha: 'src',
+      taskDiff: ['docs', 'src'],
+      expected: 'external',
+    },
+    {
+      label: 'matching document changed by the task and present at the assessed commit',
+      evidence: { locator: 'docs/BLOCKER.md', commitSha: 'docs' },
+      assessedSha: 'src',
+      taskDiff: ['base', 'docs'],
+      expected: 'none',
+    },
+  ] as const)('blocker suppression follows the done document task diff: $label', async ({ evidence, assessedSha, taskDiff, expected }) => {
+    const repo = await committedRepeatRepo();
+    const shaOf = (alias: 'base' | 'docs' | 'src') =>
+      alias === 'base' ? repo.baseSha : alias === 'docs' ? repo.docsSha : repo.srcSha;
+    const target = shaOf(assessedSha);
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'BLK', requirement: 'Provider access', status: 'externally_blocked', requiredAction: 'external', rationale: 'Credentials unavailable', evidence: [{ kind: 'file', locator: evidence.locator, summary: 'Blocker operating record', commitSha: shaOf(evidence.commitSha as 'base' | 'docs' | 'src') }] },
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Absent', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: target, coverage,
+      stories: [priorStory({ key: 'DOC1', workType: 'document', coverageIds: ['BLK'] })],
+      doneTasks: [{ issueNumber: 10, baseSha: shaOf(taskDiff[0] as 'base' | 'docs' | 'src'), commitSha: shaOf(taskDiff[1] as 'base' | 'docs' | 'src') }],
+      files: [evidence.locator],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, target, coverage, [evidence.locator]);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    let planned: RepositoryAssessment | undefined;
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockImplementation(async (...args) => {
+      planned = args[2] as RepositoryAssessment;
+      return gapDraft();
+    });
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, target);
+      expect(result.action).toBe('reassessed');
+      expect(planned?.coverage.find((entry) => entry.id === 'BLK')?.requiredAction).toBe(expected);
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('planning coverage marks unverified work none only with a merged done verify story, green checks, and docs-only drift', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'VER', requirement: 'Verified behavior', status: 'unverified', requiredAction: 'verify', rationale: 'Lacks proof', evidence: [] },
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Absent', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'VER1', workType: 'verify', coverageIds: ['VER'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha }],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    let planned: RepositoryAssessment | undefined;
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockImplementation(async (...args) => {
+      planned = args[2] as RepositoryAssessment;
+      return gapDraft();
+    });
+    try {
+      await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(planned?.coverage.find((entry) => entry.id === 'VER')).toMatchObject({ status: 'unverified', requiredAction: 'none' });
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage.find((entry) => entry.id === 'VER')?.requiredAction).toBe('verify');
+      expect(fixture.store.getPortfolioPlan('repeat_plan')?.coverage?.find((entry) => entry.id === 'VER')?.requiredAction).toBe('verify');
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it.each([
+    { label: 'product code changed since the merged verify task', commitSha: 'src', failingChecks: false },
+    { label: 'exact-commit checks are failing', commitSha: 'docs', failingChecks: true },
+    { label: 'verify task has no valid merge sha', commitSha: 'docs', failingChecks: false, noMergeSha: true },
+  ] as const)('keeps verify when prior proof does not hold: $label', async ({ commitSha, failingChecks, noMergeSha }) => {
+    const repo = await committedRepeatRepo();
+    const target = commitSha === 'src' ? repo.srcSha : repo.docsSha;
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'VER', requirement: 'Verified behavior', status: 'unverified', requiredAction: 'verify', rationale: 'Lacks proof', evidence: [] },
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Absent', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: target, coverage,
+      stories: [priorStory({ key: 'VER1', workType: 'verify', coverageIds: ['VER'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: noMergeSha ? undefined : repo.baseSha }],
+      checkSummary: failingChecks ? { complete: true, successful: false, pending: [], failed: ['CI'] } : undefined,
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, target, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    let planned: RepositoryAssessment | undefined;
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockImplementation(async (...args) => {
+      planned = args[2] as RepositoryAssessment;
+      return gapDraft();
+    });
+    try {
+      await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, target);
+      expect(planned?.coverage.find((entry) => entry.id === 'VER')?.requiredAction).toBe('verify');
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('reports no plannable work and blocks when every coverage entry is already satisfied', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'VER', requirement: 'Verified behavior', status: 'unverified', requiredAction: 'verify', rationale: 'Lacks proof', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'VER1', workType: 'verify', coverageIds: ['VER'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha }],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan');
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(planning).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ action: 'reassessed', planId: 'repeat_plan' });
+      expect(result.detail).toMatch(/no plannable work/);
+      const updated = fixture.store.getPortfolioPlan('repeat_plan');
+      expect(updated?.status).toBe('blocked');
+      expect(updated?.coverage?.[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]?.requiredAction).toBe('verify');
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
 });
+
+function gapDraft() {
+  return {
+    title: 'Next wave', objective: 'Deliver', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [],
+    stories: [{
+      key: 'S1', title: 'Close gap', goal: 'Implement gap', acceptanceCriteria: ['Works'], constraints: [], requiredGateIds: [],
+      rewardCriterionIds: [], risk: 'low' as const, workType: 'implement' as const, dependsOn: [], rollback: 'Revert',
+      technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['GAP'],
+    }],
+  };
+}
+
+function priorStory(overrides: Partial<PortfolioStory>): PortfolioStory {
+  return {
+    key: 'S1', title: 'Prior', goal: 'Prior', acceptanceCriteria: ['Done'], constraints: [], requiredGateIds: [], rewardCriterionIds: [],
+    risk: 'low', workType: 'verify', dependsOn: [], rollback: 'Revert', technologyDecisionIds: [], deploymentDecisionIds: [],
+    coverageIds: [], sourceIssueNumber: 1, sourceIssueUrl: 'https://github.test/issues/1',
+    normalizedIssueNumber: 10, normalizedIssueUrl: 'https://github.test/issues/10', wave: 1, revision: 1, supersededAt: null,
+    ...overrides,
+  };
+}
+
+function repeatAssessment(projectId: string, commitSha: string, coverage: ObjectiveCoverage[], files: string[]): RepositoryAssessment {
+  return {
+    id: 'repeat-assessment', projectId, commitSha, dirty: false, detectedStacks: ['node'], files,
+    analyses: [], coverage: structuredClone(coverage), createdAt: 1,
+  };
+}
+
+async function committedRepeatRepo() {
+  const { repo } = await createGitFixture();
+  const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+  mkdirSync(path.join(repo, 'docs'), { recursive: true });
+  writeFileSync(path.join(repo, 'docs', 'BLOCKER.md'), '# Blocker\nPrerequisites, owner, resume trigger.\n');
+  writeFileSync(path.join(repo, 'docs', 'NOTE.md'), 'Release note.\n');
+  execFileSync('git', ['add', '.'], { cwd: repo, stdio: 'ignore' });
+  execFileSync('git', ['commit', '-m', 'docs only'], { cwd: repo, stdio: 'ignore' });
+  const docsSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+  mkdirSync(path.join(repo, 'src'), { recursive: true });
+  writeFileSync(path.join(repo, 'src', 'app.ts'), 'export const app = 1;\n');
+  execFileSync('git', ['add', '.'], { cwd: repo, stdio: 'ignore' });
+  execFileSync('git', ['commit', '-m', 'product change'], { cwd: repo, stdio: 'ignore' });
+  const srcSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+  return { repo, baseSha, docsSha, srcSha };
+}
+
+function buildRepeatProgram(input: {
+  repo: string;
+  commitSha: string;
+  coverage: ObjectiveCoverage[];
+  stories: PortfolioStory[];
+  doneTasks: Array<{ issueNumber: number; mergeSha?: string; baseSha?: string; commitSha?: string }>;
+  files?: string[];
+  checkSummary?: CheckSummary;
+}) {
+  const config = defaultProjectConfig(input.repo, 'fixture', 'owner/fixture');
+  config.program.enabled = true;
+  config.evolution.enabled = false;
+  const store = new PersistentTaskStore(projectIdFor(config), makeTmp('repeat-coverage-state'));
+  const plan: PortfolioPlan = {
+    id: 'repeat_plan', projectId: store.projectId, sourcePath: 'OBJECTIVE.md', contentHash: 'frozen', sourceContent: 'Deliver the objective.',
+    title: 'Objective', objective: 'Deliver', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [],
+    status: 'assessing', epicIssueNumber: 1, epicIssueUrl: 'https://github.test/issues/1', stories: input.stories,
+    createdAt: 1, updatedAt: 1, approvedAt: 1, repositorySha: input.commitSha, assessmentId: 'prior', revision: 1, currentWave: 1,
+    coverage: structuredClone(input.coverage),
+    revisions: [{ number: 1, assessmentId: 'prior', repositorySha: input.commitSha, reason: 'initial', material: false, summary: 'Initial', createdAt: 1, approvedAt: 1 }],
+    latestDeploymentId: null, deliveredAt: null, maintenanceStartedAt: null,
+  };
+  store.savePortfolioPlan(plan);
+  for (const done of input.doneTasks) {
+    const task = store.upsert({ issueNumber: done.issueNumber, title: 'Prior', state: 'done' });
+    if (done.mergeSha) store.patch(task.id, { mergeSha: done.mergeSha });
+    if (done.baseSha || done.commitSha) store.patch(task.id, { baseSha: done.baseSha ?? null, commitSha: done.commitSha ?? null });
+  }
+  const github = new RecordingGitHub();
+  if (input.checkSummary) github.checkSummary = input.checkSummary;
+  const model = new ImplementedAssessmentModel('unit');
+  const controller = new ProgramController(
+    config, store, github, new RepositoryAssessor(config, model), new PortfolioPlanner(config, model),
+    new EvolutionSignalCollector(config, store, github, model),
+  );
+  return { config, store, plan, controller };
+}
+
+class RecordingGitHub implements GitHubControl {
+  readonly repoSlug = 'owner/fixture';
+  checkSummary: CheckSummary = { complete: true, successful: true, pending: [], failed: [] };
+  private next = 100;
+  async currentUser(): Promise<string> { return 'owner'; }
+  async listOpenIssues(): Promise<RemoteIssue[]> { return []; }
+  async getIssue(issueNumber: number): Promise<RemoteIssue> {
+    return { number: issueNumber, title: `Issue ${issueNumber}`, body: '', labels: [], author: 'owner', url: `https://github.test/issues/${issueNumber}` };
+  }
+  async createIssue(input: { title: string; body: string; labels: string[] }): Promise<RemoteIssue> {
+    const number = this.next;
+    this.next += 1;
+    return { number, title: input.title, body: input.body, labels: input.labels, author: 'owner', url: `https://github.test/issues/${number}` };
+  }
+  async updateIssue(issueNumber: number): Promise<RemoteIssue> {
+    return await this.getIssue(issueNumber);
+  }
+  async comment(): Promise<void> {}
+  async addLabels(): Promise<void> {}
+  async removeLabel(): Promise<void> {}
+  async findPullRequestByHead(): Promise<RemotePullRequest | null> { return null; }
+  async createPullRequest(): Promise<RemotePullRequest> { throw new Error('not used'); }
+  async getPullRequest(): Promise<RemotePullRequest> { throw new Error('not used'); }
+  async checksForRef(_sha: string, _requiredNames: string[]): Promise<CheckSummary> { return this.checkSummary; }
+  async publishCheck(): Promise<void> {}
+  async mergePullRequest(): Promise<{ merged: boolean; sha: string | null; message: string }> { throw new Error('not used'); }
+}
 
 function recoveryFixture(state: 'failed' | 'quarantined', failures: number, directory = makeTmp('recovery-budget-controller'), logger?: Logger) {
   const config = defaultProjectConfig(directory, 'fixture', 'owner/fixture');

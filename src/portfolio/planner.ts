@@ -132,6 +132,7 @@ export class PortfolioPlanner {
         'When repository coverage is supplied, create work only for non-implemented requirements and map every story to at least one coverage id.',
         'Every coverage item requiring implement must have an implementation story that delivers the missing behavior; verification-only work is insufficient.',
         'Before returning, audit the mandatory coverage/action matrix item by item. Every non-none action must have a story whose workType exactly matches it (external maps to document), and implementation acceptance criteria must change product behavior rather than merely test or describe it.',
+        'Coverage whose requiredAction is none is already satisfied (implemented, previously verified, or blocker-documented). Never propose a new story mapped exclusively to none-action coverage; repeating that completed work is a planning defect.',
         'Do not add periodic polling, background workers, keepalive traffic, or scheduled provider health checks unless the objective and repository evidence explicitly require them. Preserve documented sleep, wake, cost, and worker-idleness behavior; prefer request-time or on-demand recovery where compatible.',
         'Do not create file-oriented cleanup, speculative infrastructure, or stories for capabilities proven implemented.',
         'A story may reference only decision ids that it actually needs.',
@@ -441,6 +442,13 @@ function validateStory(
 }
 
 function assertCoverageActions(stories: PortfolioStoryDraft[], coverage: ObjectiveCoverage[]): void {
+  const noneAction = new Set(coverage.filter((entry) => entry.requiredAction === 'none').map((entry) => entry.id));
+  for (const story of stories) {
+    const mapped = story.coverageIds ?? [];
+    if (mapped.length > 0 && mapped.every((id) => noneAction.has(id))) {
+      throw new Error(`Story ${story.key} maps exclusively to satisfied (none-action) coverage: ${mapped.join(', ')}`);
+    }
+  }
   for (const entry of coverage) {
     if (entry.requiredAction === 'none') continue;
     const mapped = stories.filter((story) => story.coverageIds?.includes(entry.id));

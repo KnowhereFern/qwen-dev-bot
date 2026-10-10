@@ -163,6 +163,53 @@ describe('portfolio planner validation', () => {
     expect(calls).toBe(3);
   });
 
+  it('rejects stories mapped exclusively to satisfied none-action coverage', () => {
+    const coverage = [
+      { id: 'PAY', requirement: 'Payment settlement', status: 'implemented' as const, requiredAction: 'none' as const, rationale: 'Verified', evidence: [] },
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [] },
+    ];
+    const base = {
+      title: 'Repeat guard',
+      objective: 'Deliver without repeating work',
+      constraints: [],
+      definitionOfDone: ['Verified'],
+      technologyDecisions: [],
+      deploymentDecisions: [],
+    };
+    expect(() => validatePortfolioDraft(
+      { ...base, stories: [{ ...story('S1'), coverageIds: ['PAY'], workType: 'verify' }] },
+      ['test'],
+      ['execution'],
+      10,
+      undefined,
+      coverage,
+    )).toThrow(/none-action/);
+    const mixed = validatePortfolioDraft(
+      { ...base, stories: [{ ...story('S1'), coverageIds: ['PAY', 'GAP'], workType: 'implement' }] },
+      ['test'],
+      ['execution'],
+      10,
+      undefined,
+      coverage,
+    );
+    expect(mixed.stories[0]?.workType).toBe('implement');
+  });
+
+  it('instructs the model never to repeat satisfied none-action coverage', async () => {
+    let system = '';
+    const model: PortfolioPlanningModel = {
+      async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]): Promise<{ value: T }> {
+        system = input.system;
+        return { value: coverageDraft('implement') as T };
+      },
+    };
+    const config = defaultProjectConfig(makeTmp('planner-none-action'), 'fixture', 'owner/fixture');
+    await new PortfolioPlanner(config, model).plan(
+      { sourcePath: 'OBJECTIVE.md', content: 'Build runner claims.' }, 5, runnerAssessment(),
+    );
+    expect(system).toContain('Never propose a new story mapped exclusively to none-action coverage');
+  });
+
   it('normalizes a valid dependency graph into topological order', () => {
     const result = validatePortfolioDraft(
       {
