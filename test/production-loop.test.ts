@@ -550,21 +550,30 @@ describe('production supervisor trace', () => {
     config.intake.trustedAuthors.push('bot');
     const state = makeTmp('provider-wait-state');
     const store = new PersistentTaskStore('provider-wait-project', state);
+    const executor = new ProviderWaitingQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
     const supervisor = new HarnessSupervisor(
       config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
-      new ProviderWaitingQwenExecutor(), new MockNormalizer(), new GateRunner(),
+      executor, new MockNormalizer(), new GateRunner(),
       new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
       silentLogger, 'worker-provider-wait',
     );
 
     await supervisor.tick();
     let task = store.findByIssue(2);
-    expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0, continuations: 1, qwenAutomaticStop: null });
+    expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0, continuations: 1,
+      qwenAutomaticStop: null, qwenSessionId: 'qwen-session-provider-wait', lastError: null });
     store.patch(task?.id as string, { resumeAfter: Date.now() - 1 });
     await supervisor.tick();
     task = store.findByIssue(2);
-    expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0, continuations: 2 });
+    expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0, continuations: 2,
+      qwenSessionId: 'qwen-session-provider-wait' });
     expect(store.listEvents('task.provider_resumed')).toHaveLength(1);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(execute.mock.calls[0]![0].feedback).toEqual([]);
+    expect(execute.mock.calls[1]![0].feedback).toEqual([]);
+    const waitEvents = store.listEvents('task.provider_wait');
+    expect(waitEvents.map((event) => event.payload.reason)).toEqual(['provider temporarily overloaded', 'provider temporarily overloaded']);
     store.close();
   });
 

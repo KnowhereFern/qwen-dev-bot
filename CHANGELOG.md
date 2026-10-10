@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.65] - 2026-10-09
+
+- Treat an observed Qwen provider quota pause as a resumable wait when the process exits 1; other unexpected exits remain failures.
+- Preserve the Qwen session across provider waits by keeping the wait reason in durable events instead of repair feedback.
+- Add regression coverage for quota exits, unsafe lookalikes, and provider wait resumption.
+
 ## [1.0.0-rc.64] - 2026-10-09
 
 - Preserve the exact unconsumed candidate link when an orderly shutdown interrupts recovery itself, then rerun authorization and verification on restart without repeating implementation.

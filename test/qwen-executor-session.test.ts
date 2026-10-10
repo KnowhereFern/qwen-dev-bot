@@ -32,7 +32,7 @@ describe('Qwen execution session isolation', () => {
   function outcome(exitCode: number | null, state: string | null, options: { timedOut?: boolean; aborted?: boolean; reason?: string; newSession?: string } = {}) {
     vi.mocked(runProcess).mockImplementationOnce(async input => {
       if (options.newSession) input.onStdout?.(`${JSON.stringify({ type: 'system', session_id: options.newSession })}\n`);
-      if (state) input.onStdout?.(`${JSON.stringify({ event: { type: 'goal_state', goal_state: { goal: { status: state, lastReason: options.reason } } } })}\n`);
+      if (state || options.reason) input.onStdout?.(`${JSON.stringify({ event: { type: 'goal_state', goal_state: { goal: { status: state, lastReason: options.reason } } } })}\n`);
       return { command: input.command, args: input.args ?? [], cwd: input.cwd,
         exitCode, timedOut: options.timedOut ?? false, aborted: options.aborted ?? false, durationMs: 1, stdout: '', stderr: '' };
     });
@@ -176,5 +176,46 @@ describe('Qwen execution session isolation', () => {
     expect((await execute([], { ...task, qwenSessionId: null, qwenWorkflowRunId: null })).automaticStop).toBeNull();
     outcome(55, 'paused', { newSession: 'new-session' });
     expect((await execute([], { ...task, qwenSessionId: null, qwenWorkflowRunId: null })).automaticStop).toEqual({ sessionId: 'new-session', workflowRunId: null, kind: 'budget-limit' });
+  });
+
+  const quotaReason = 'The headless run stopped: Quota exhausted: Your token-plan 1-month quota has been exhausted.';
+
+  it.each([
+    { state: 'paused', reason: quotaReason },
+    { state: 'usage_limited', reason: 'provider quota exhausted' },
+    { state: 'waiting', reason: quotaReason },
+  ])('admits exit 1 only as a resumable provider wait with preserved sessions %j', async ({ state, reason }) => {
+    outcome(1, state, { reason });
+    const result = await execute([]);
+    expect(result).toMatchObject({
+      sessionId: 'prior-session',
+      workflowRunId: 'prior-workflow',
+      needsContinuation: true,
+      continuationKind: 'provider',
+      automaticStop: null,
+    });
+  });
+
+  it.each([
+    { state: 'paused', reason: 'Interrupted by the user. Run /goal resume to continue.' },
+    { state: 'failed', reason: quotaReason },
+    { state: 'complete', reason: quotaReason },
+    { state: null, reason: quotaReason },
+    { state: 'active', reason: quotaReason },
+    { state: 'running', reason: quotaReason },
+    { state: 'unknown', reason: quotaReason },
+    { state: 'paused', reason: 'unrecoverable crash' },
+  ])('keeps exit 1 a hard failure without an explicit resumable provider wait %j', async ({ state, reason }) => {
+    outcome(1, state, { reason });
+    await expect(execute([])).rejects.toThrow();
+  });
+
+  it.each([
+    { exitCode: 1, aborted: true },
+    { exitCode: 130, aborted: false },
+    { exitCode: 2, aborted: false },
+  ])('rejects aborts, signals, and other nonzero exits despite quota wording %j', async ({ exitCode, aborted }) => {
+    outcome(exitCode, 'paused', { reason: quotaReason, aborted });
+    await expect(execute([])).rejects.toThrow();
   });
 });

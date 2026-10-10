@@ -335,15 +335,18 @@ export class HarnessSupervisor {
         });
         if (qwenResult.continuationKind === 'provider') {
           const resumeAfter = Date.now() + Math.max(this.config.worker.pollIntervalMs, 30_000);
+          const providerReason = qwenResult.goalReason ?? 'Qwen provider is temporarily unavailable';
           this.store.transition(task.id, 'waiting', {
             continuations,
             waitKind: 'provider',
             resumeAfter,
             leaseOwner: null,
             leaseExpiresAt: null,
-            lastError: qwenResult.goalReason ?? 'Qwen provider is temporarily unavailable',
+            // A provider wait is not repair feedback: preserving it here would
+            // start a fresh Qwen session instead of resuming the saved one.
+            lastError: null,
           });
-          this.store.recordEvent('task.provider_wait', task.id, { continuations, resumeAfter, reason: qwenResult.goalReason });
+          this.store.recordEvent('task.provider_wait', task.id, { continuations, resumeAfter, reason: providerReason });
         } else if (continuations >= this.config.worker.maxContinuations) {
           this.store.patch(task.id, { continuations });
           this.store.recordFailure(

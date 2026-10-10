@@ -187,7 +187,13 @@ export class QwenCodeExecutor implements QwenExecutor {
 
     if (receipt.aborted) throw new Error(formatProcessFailure(receipt));
     const budgetExit = receipt.exitCode === 53 || receipt.exitCode === 55 || receipt.timedOut;
-    if (receipt.exitCode !== 0 && !budgetExit) throw new Error(formatProcessFailure(receipt));
+    // Exit 1 can represent a recorded provider wait. All other unexpected
+    // nonzero exits remain process failures, even when they mention quota.
+    const providerQuotaExit = receipt.exitCode === 1 &&
+      ['paused', 'waiting', 'usage_limited', 'rate_limited', 'provider_waiting', 'service_unavailable']
+        .includes(latest.goalState?.trim().toLowerCase() ?? '') &&
+      isProviderWaiting({ state: latest.goalState, reason: latest.goalReason, limitKind: latest.goalLimitKind });
+    if (receipt.exitCode !== 0 && !budgetExit && !providerQuotaExit) throw new Error(formatProcessFailure(receipt));
 
     const disposition = classifyGoalDisposition({
       budgetExit,
