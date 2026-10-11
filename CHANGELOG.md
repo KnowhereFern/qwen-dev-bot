@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.67] - 2026-10-11
+
+- Keep independent read-only reviewers on relative repository paths so incorrect absolute-path casing cannot deny source inspection; retain existing permission restrictions.
+
 ## [1.0.0-rc.66] - 2026-10-10
 
 - Reconcile completed verification and documented external blockers before drafting a new delivery wave, without weakening the saved objective assessment.

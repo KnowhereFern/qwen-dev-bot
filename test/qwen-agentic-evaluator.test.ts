@@ -50,6 +50,14 @@ describe('QwenAgenticEvaluator streamed verdict', () => {
     expect(options.args?.[options.args.indexOf('--approval-mode') + 1]).toBe('plan');
     expect(options.args).toContain('--sandbox');
     expect(options.args).toContain('--json-schema');
+    expect(options.args).not.toContain('--allowed-tools');
+    const prompt = options.args?.[options.args.indexOf('--prompt') + 1] ?? '';
+    expect(prompt).toContain(`Your working directory is the candidate worktree: ${options.cwd}`);
+    expect(prompt).toContain('Use relative paths from this directory for every read, grep, and glob.');
+    const excluded = options.args?.slice(options.args.indexOf('--exclude-tools') + 1, options.args.indexOf('--exclude-tools') + 3).join(',') ?? '';
+    for (const name of ['agent', 'workflow', 'run_shell_command', 'write_file', 'notebook_edit', 'web_fetch', 'web_search', 'exit_plan_mode']) {
+      expect(excluded).toContain(name);
+    }
   });
 
   it('accepts object verdicts', async () => {
