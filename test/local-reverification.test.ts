@@ -319,9 +319,26 @@ describe('local gate re-verification fail-closed hardening (RC76)', () => {
     };
   }
 
-  function receiptExpectation(): { worktree: string; expectedHead: string; startedMs: number; nowMs: number; gates: ReturnType<typeof unitGate>[] } {
+  function receiptExpectation(overrides: Partial<{
+    expectedConfigHash: string;
+    preContentHash: string;
+    postContentHash: string;
+  }> = {}): {
+    worktree: string;
+    expectedHead: string;
+    startedMs: number;
+    nowMs: number;
+    gates: ReturnType<typeof unitGate>[];
+    expectedConfigHash: string;
+    preContentHash: string;
+    postContentHash: string;
+  } {
     const now = Date.now();
-    return { worktree: '/wt', expectedHead: 'deadbeef', startedMs: now - 2_000, nowMs: now, gates: [unitGate()] };
+    return {
+      worktree: '/wt', expectedHead: 'deadbeef', startedMs: now - 2_000, nowMs: now,
+      gates: [unitGate()], expectedConfigHash: 'c'.repeat(64),
+      preContentHash: 'd'.repeat(64), postContentHash: 'd'.repeat(64), ...overrides,
+    };
   }
 
   it('rejects a receipt whose start timestamp is future-dated beyond clock skew', () => {
@@ -347,6 +364,24 @@ describe('local gate re-verification fail-closed hardening (RC76)', () => {
       head: 'deadbeef',
       gateCount: 1,
     });
+  });
+
+  it('rejects a self-consistent receipt for different controller-observed bytes', () => {
+    expect(() => validateReceipt(
+      receiptFixture(),
+      receiptExpectation({ preContentHash: 'e'.repeat(64) }),
+    )).toThrow(/receipt does not match controller-observed candidate content/);
+    expect(() => validateReceipt(
+      receiptFixture(),
+      receiptExpectation({ postContentHash: 'e'.repeat(64) }),
+    )).toThrow(/receipt does not match controller-observed candidate content/);
+  });
+
+  it('rejects a receipt for a different gate configuration', () => {
+    expect(() => validateReceipt(
+      receiptFixture(),
+      receiptExpectation({ expectedConfigHash: 'e'.repeat(64) }),
+    )).toThrow(/receipt does not match the controller-written gate configuration/);
   });
 
   it('fails closed without writing anything when .qwen-harness/state is a symlink', async () => {

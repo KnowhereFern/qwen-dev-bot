@@ -1,4 +1,6 @@
-import { closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, writeSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, readSync, realpathSync, rmSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { GateDefinition } from '../core/types.js';
@@ -112,7 +114,10 @@ export async function runLocalGateReverification(options: LocalGateReverificatio
     // created 0o600 (owner-only): only this controller and the gate runner
     // subprocess it spawns — both running as the same user — ever need to
     // read it, and the file is removed again in cleanup.
-    writeConfigNoFollow(configPath, Buffer.from(`${JSON.stringify({ gates: options.gates }, null, 2)}\n`, 'utf8'), 0o600);
+    const configBytes = Buffer.from(`${JSON.stringify({ gates: options.gates }, null, 2)}\n`, 'utf8');
+    writeConfigNoFollow(configPath, configBytes, 0o600);
+    const expectedConfigHash = sha256Hex(configBytes);
+    const preContentHash = controllerContentHash(worktree);
 
     const startedMs = Date.now();
     const timeoutMs = Math.max(30_000, options.gates.reduce((total, gate) => total + gate.timeoutMs, 0) + 60_000);
@@ -131,6 +136,7 @@ export async function runLocalGateReverification(options: LocalGateReverificatio
         }: ${redactText((result.stderr.trim() || result.stdout.trim()).slice(-1_200))}`,
       );
     }
+    const postContentHash = controllerContentHash(worktree);
 
     const receiptStat = safeLstat(receiptPath);
     if (receiptStat === null || receiptStat.isSymbolicLink() || !receiptStat.isFile()) {
@@ -156,6 +162,9 @@ export async function runLocalGateReverification(options: LocalGateReverificatio
       startedMs,
       nowMs,
       gates: options.gates,
+      expectedConfigHash,
+      preContentHash,
+      postContentHash,
     });
     return { runId: verified.runId, head: verified.head, gateCount: verified.gateCount };
   } catch (error) {
@@ -314,7 +323,16 @@ function writeAll(fd: number, data: Buffer): void {
 
 export function validateReceipt(
   receipt: unknown,
-  expected: { worktree: string; expectedHead: string; startedMs: number; nowMs: number; gates: GateDefinition[] },
+  expected: {
+    worktree: string;
+    expectedHead: string;
+    startedMs: number;
+    nowMs: number;
+    gates: GateDefinition[];
+    expectedConfigHash: string;
+    preContentHash: string;
+    postContentHash: string;
+  },
 ): { runId: string; head: string; gateCount: number } {
   if (typeof receipt !== 'object' || receipt === null || Array.isArray(receipt)) {
     throw new Error('Local gate re-verification failed: machine gate receipt is malformed');
@@ -354,9 +372,15 @@ export function validateReceipt(
   if (finishedAt > expected.nowMs + RECEIPT_CLOCK_SKEW_MS) {
     fail('machine gate receipt is future-dated: its completion timestamp is beyond the current time');
   }
+  if (record.configHash !== expected.expectedConfigHash) {
+    fail('machine gate receipt does not match the controller-written gate configuration');
+  }
   if (typeof record.contentHash !== 'string' || typeof record.finalContentHash !== 'string' ||
       record.contentHash.length === 0 || record.contentHash !== record.finalContentHash) {
     fail('input drift: candidate content changed between the gate run start and its end');
+  }
+  if (record.contentHash !== expected.preContentHash || record.finalContentHash !== expected.postContentHash) {
+    fail('input drift: machine gate receipt does not match controller-observed candidate content');
   }
   if (!Array.isArray(record.gates)) fail('machine gate receipt has no gate list');
   const gates = record.gates as Array<Record<string, unknown>>;
@@ -377,6 +401,82 @@ export function validateReceipt(
     }
   }
   return { runId: record.runId as string, head: record.head as string, gateCount: gates.length };
+}
+
+function sha256Hex(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+// Keep this byte-for-byte compatible with the immutable runner's contentHash().
+// The controller observes candidate bytes independently on both sides of the
+// subprocess, so a self-consistent receipt cannot attest different bytes at
+// those two boundaries. Exact committed bytes are still checked separately.
+function controllerContentHash(worktree: string): string {
+  const result = spawnSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], {
+    cwd: worktree,
+    shell: false,
+    timeout: 30_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error('Local gate re-verification failed: controller-side git evidence unavailable');
+  }
+  const names = [...new Set(result.stdout.toString('utf8').split('\0').filter(Boolean))].sort();
+  const digest = createHash('sha256');
+  for (const name of names) {
+    if (name.startsWith('.qwen-harness/state/')) continue;
+    const file = path.resolve(worktree, name);
+    if (!file.startsWith(worktree + path.sep)) {
+      throw new Error('Local gate re-verification failed: unsafe candidate path');
+    }
+    assertHashableParents(worktree, file);
+    let stat;
+    try {
+      stat = lstatSync(file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      digest.update(JSON.stringify([name, 'missing']));
+      continue;
+    }
+    if (stat.isSymbolicLink()) {
+      digest.update(JSON.stringify([name, 'symlink', readlinkSync(file)]));
+    } else if (stat.isFile()) {
+      const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const opened = fstatSync(fd);
+        if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+          throw new Error('Local gate re-verification failed: candidate source changed while hashing');
+        }
+        digest.update(JSON.stringify([name, opened.mode & 0o777, sha256Hex(readFileSync(fd))]));
+      } finally {
+        closeSync(fd);
+      }
+    } else {
+      throw new Error('Local gate re-verification failed: unsupported candidate source entry');
+    }
+  }
+  return digest.digest('hex');
+}
+
+function assertHashableParents(worktree: string, file: string): void {
+  const relative = path.relative(worktree, path.dirname(file));
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error('Local gate re-verification failed: unsafe candidate path');
+  }
+  let current = worktree;
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    let stat;
+    try {
+      stat = lstatSync(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error('Local gate re-verification failed: unsafe candidate parent');
+    }
+  }
 }
 
 function safeLstat(target: string) {
