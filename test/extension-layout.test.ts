@@ -118,8 +118,11 @@ describe('Qwen extension packaging', () => {
     );
     expect(prompts.map(item => item.agentType)).toEqual(['harness-implementer', 'harness-reviewer']);
     expect(prompts[0]!.prompt).toContain('focused continuation');
+    expect(prompts[0]!.prompt.startsWith('Next action from the coordinator: write missing acceptance tests')).toBe(true);
     expect(prompts[0]!.prompt).toContain('Next action from the coordinator: write missing acceptance tests');
     expect(prompts[0]!.prompt).toContain('skip redundant reconnaissance');
+    expect(prompts[0]!.prompt).toContain('at most five focused read-only tool calls');
+    expect(prompts[0]!.prompt).not.toContain('Reconnaissance: null');
     expect(prompts[0]!.prompt).toContain('After your final code edit, execute node .qwen-harness/scripts/run-gates.mjs');
     expect(prompts[0]!.prompt).toContain('never author or edit the receipt yourself');
     expect(prompts[0]!.prompt).toContain('"taskId":"fixture"');
