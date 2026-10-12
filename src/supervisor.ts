@@ -7,7 +7,7 @@ import type { GateResult, HarnessEvent, ProjectConfig, RewardScorecard, RunCheck
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
 import { REQUIRED_GITHUB_CHECKS, REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
-import { GitWorkspace, branchFor } from './git/git-workspace.js';
+import { GitWorkspace, branchFor, isOrdinaryTrackedModification, type TrackedCandidateDigest } from './git/git-workspace.js';
 import { parseNormalizedSpec, type TaskNormalizer } from './intake/normalizer.js';
 import { Logger } from './logger.js';
 import { matchesPortfolioTaskContract, PortfolioCoordinator } from './portfolio/coordinator.js';
@@ -778,10 +778,30 @@ export class HarnessSupervisor {
       }
       return null;
     }
-    const tracked = await this.git.trackedChanges(worktreePath);
-    if (tracked.length > 0) {
+    // Narrow tracked-candidate allowance: only disjoint ordinary unstaged
+    // modifications — porcelain ' M' —
+    // of already-tracked regular files may ride under the fast-forward.
+    // Staged or mixed modifications are untested in this flow and, like
+    // renames, copies, conflicts, typechanges, submodule or symlink edits,
+    // additions, and deletions, fail closed, as does any tracked path that
+    // overlaps the controller-managed remote diff.
+    const trackedCandidates = await this.git.trackedCandidates(worktreePath);
+    const tracked = trackedCandidates.map((entry) => entry.path).sort();
+    const unsupportedTracked = trackedCandidates.filter((entry) => !isOrdinaryTrackedModification(entry.status));
+    if (unsupportedTracked.length > 0) {
       if (reconciling) {
-        throw new Error(`Durable implementation base advance for task ${task.id} found tracked changes: ${tracked.join(', ')}`);
+        throw new Error(
+          `Durable implementation base advance for task ${task.id} found unsupported tracked changes: ${unsupportedTracked.map((entry) => `${entry.path} (${entry.status.trim() || 'index'})`).join(', ')}`,
+        );
+      }
+      return null;
+    }
+    const trackedOverlap = tracked.filter((file) => changed.includes(file));
+    if (trackedOverlap.length > 0) {
+      if (reconciling) {
+        throw new Error(
+          `Durable implementation base advance for task ${task.id} has tracked candidates overlapping managed base changes: ${trackedOverlap.join(', ')}`,
+        );
       }
       return null;
     }
@@ -793,7 +813,7 @@ export class HarnessSupervisor {
       return null;
     }
     if (reconciling) {
-      this.assertRecordedCandidateMatches(task, latest, savedBase, worktreePath, untracked);
+      this.assertRecordedCandidateMatches(task, latest, savedBase, worktreePath, untracked, trackedCandidates);
       this.store.recordEvent('task.implementation_base_advance_completed', task.id,
         { previousSha: savedBase, commitSha: head }, `implementation-base-completed:${task.id}:${head}`);
       return this.store.patch(task.id, { baseSha: head });
@@ -803,21 +823,51 @@ export class HarnessSupervisor {
       // never landed (HEAD is still savedBase). recordEvent is idempotent on
       // the request key, so this retry cannot refresh stale evidence; verify
       // the recorded candidate bytes against the current snapshot instead.
-      this.assertRecordedCandidateMatches(task, latest, savedBase, worktreePath, untracked);
+      this.assertRecordedCandidateMatches(task, latest, savedBase, worktreePath, untracked, trackedCandidates);
     }
     const digestSnapshot = this.git.untrackedDigestSnapshot(worktreePath, untracked);
+    const trackedSnapshot = this.git.trackedCandidateSnapshot(worktreePath, trackedCandidates);
     this.store.recordEvent('task.implementation_base_advance_requested', task.id,
-      { previousSha: savedBase, commitSha: target, untrackedFiles: untracked, untrackedDigests: digestSnapshot },
+      {
+        previousSha: savedBase, commitSha: target, untrackedFiles: untracked, untrackedDigests: digestSnapshot,
+        trackedFiles: tracked, trackedSnapshot,
+      },
       `implementation-base-request:${task.id}:${target}`);
-    await this.git.advanceImplementationBase(worktreePath, head, target, untracked);
+    await this.git.advanceImplementationBase(worktreePath, head, target, untracked, tracked);
     // The merge verified its own before/after bytes, but the durable request
-    // snapshot was taken before the event write; fail closed if the candidate
-    // drifted between that snapshot and the completed merge.
+    // snapshot was taken before the event write; fail closed if either the
+    // untracked or the tracked candidate drifted between that snapshot and
+    // the completed merge.
     const mergedDigests = this.git.untrackedDigestSnapshot(worktreePath, untracked);
     const mergedDrift = untracked.filter((file) => mergedDigests[file] !== digestSnapshot[file]);
     if (mergedDrift.length > 0) {
       throw new Error(
         `Implementation base advance for task ${task.id} found candidate byte drift between the request snapshot and the merge: ${mergedDrift.join(', ')}`,
+      );
+    }
+    const mergedTrackedCandidates = await this.git.trackedCandidates(worktreePath);
+    const mergedTrackedSnapshot = this.git.trackedCandidateSnapshot(worktreePath, mergedTrackedCandidates);
+    // Compare the full tracked path set, not only the expected path digests:
+    // any extra tracked path that appeared between the GitWorkspace return
+    // and this outer verification must fail closed before the completion
+    // event is written. (A disappeared path already fails via the digest
+    // comparison below, since its merged snapshot entry is undefined.)
+    const trackedSet = new Set(tracked);
+    const extraTracked = mergedTrackedCandidates
+      .map((entry) => entry.path)
+      .filter((file) => !trackedSet.has(file))
+      .sort();
+    if (extraTracked.length > 0) {
+      throw new Error(
+        `Implementation base advance for task ${task.id} found extra tracked paths after the merge: ${extraTracked.join(', ')}`,
+      );
+    }
+    const mergedTrackedDrift = tracked.filter((file) =>
+      !trackedSnapshotEntryEquals(mergedTrackedSnapshot[file], trackedSnapshot[file]),
+    );
+    if (mergedTrackedDrift.length > 0) {
+      throw new Error(
+        `Implementation base advance for task ${task.id} found tracked candidate byte drift between the request snapshot and the merge: ${mergedTrackedDrift.join(', ')}`,
       );
     }
     this.store.recordEvent('task.implementation_base_advance_completed', task.id,
@@ -827,8 +877,10 @@ export class HarnessSupervisor {
 
   /**
    * Fail closed unless the durable request evidence still describes the exact
-   * current untracked candidate: same saved base, same file set, and identical
-   * per-file byte (or symlink-target) digests. Malformed records fail closed.
+   * current candidates: same saved base, same tracked and untracked file sets,
+   * identical per-file byte (or symlink-target) digests for untracked files,
+   * and identical status, mode, and byte digests for tracked candidate edits.
+   * Malformed records fail closed.
    */
   private assertRecordedCandidateMatches(
     task: TaskRecord,
@@ -836,6 +888,7 @@ export class HarnessSupervisor {
     savedBase: string,
     worktreePath: string,
     untracked: string[],
+    trackedCandidates: Array<{ path: string; status: string }>,
   ): void {
     const recorded = Array.isArray(event?.payload.untrackedFiles)
       ? [...(event?.payload.untrackedFiles as string[])].sort()
@@ -855,6 +908,28 @@ export class HarnessSupervisor {
     const drifted = untracked.filter((file) => currentDigests[file] !== recordedDigests[file]);
     if (drifted.length > 0) {
       throw new Error(`Durable implementation base advance for task ${task.id} found candidate byte drift: ${drifted.join(', ')}`);
+    }
+    const tracked = trackedCandidates.map((entry) => entry.path).sort();
+    const recordedTracked = Array.isArray(event?.payload.trackedFiles)
+      ? [...(event?.payload.trackedFiles as string[])].sort()
+      : [];
+    if (recordedTracked.length !== tracked.length ||
+        recordedTracked.some((file, index) => file !== tracked[index])) {
+      throw new Error(`Durable implementation base advance for task ${task.id} no longer matches the recorded request evidence`);
+    }
+    if (tracked.length > 0) {
+      const recordedSnapshot = trackedSnapshotRecord(event?.payload.trackedSnapshot);
+      if (recordedSnapshot === null || Object.keys(recordedSnapshot).length !== tracked.length ||
+          tracked.some((file) => recordedSnapshot[file] === undefined)) {
+        throw new Error(`Durable implementation base advance for task ${task.id} lacks valid recorded tracked candidate snapshots`);
+      }
+      const currentSnapshot = this.git.trackedCandidateSnapshot(worktreePath, trackedCandidates);
+      const trackedDrift = tracked.filter((file) =>
+        !trackedSnapshotEntryEquals(recordedSnapshot[file], currentSnapshot[file]),
+      );
+      if (trackedDrift.length > 0) {
+        throw new Error(`Durable implementation base advance for task ${task.id} found tracked candidate byte drift: ${trackedDrift.join(', ')}`);
+      }
     }
   }
 
@@ -1220,6 +1295,38 @@ function untrackedDigestRecord(value: unknown): Record<string, string> | null {
     record[file] = digest;
   }
   return record;
+}
+
+/**
+ * Validate a persisted tracked-candidate snapshot from durable request
+ * evidence. Returns null unless the value is a plain object mapping
+ * repository-relative paths to valid { status, mode, sha256 } entries, so
+ * reconciliation fails closed on missing, malformed, or tampered records.
+ */
+function trackedSnapshotRecord(value: unknown): Record<string, TrackedCandidateDigest> | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const record: Record<string, TrackedCandidateDigest> = {};
+  for (const [file, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return null;
+    const candidate = entry as Record<string, unknown>;
+    if (typeof candidate.status !== 'string' || !isOrdinaryTrackedModification(candidate.status) ||
+        typeof candidate.mode !== 'number' || !Number.isFinite(candidate.mode) ||
+        typeof candidate.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(candidate.sha256)) {
+      return null;
+    }
+    record[file] = { status: candidate.status, mode: candidate.mode, sha256: candidate.sha256 };
+  }
+  return record;
+}
+
+function trackedSnapshotEntryEquals(
+  recorded: TrackedCandidateDigest | undefined,
+  current: TrackedCandidateDigest | undefined,
+): boolean {
+  return recorded !== undefined && current !== undefined &&
+    recorded.status === current.status &&
+    recorded.mode === current.mode &&
+    recorded.sha256 === current.sha256;
 }
 
 /**

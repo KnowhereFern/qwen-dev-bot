@@ -1230,7 +1230,7 @@ describe('production supervisor trace', () => {
     store.close();
   }, 30_000);
 
-  it.each(['advance', 'product-delta', 'tracked-dirty', 'collision', 'interrupted', 'byte-drift-crash', 'stale-pending-request', 'snapshot-drift', 'tampered-asset', 'deleted-asset', 'partial-upgrade'] as const)(
+  it.each(['advance', 'product-delta', 'tracked-dirty', 'tracked-doc-advance', 'tracked-overlap', 'collision', 'interrupted', 'byte-drift-crash', 'tracked-byte-drift-crash', 'stale-pending-request', 'tracked-stale-request', 'snapshot-drift', 'extra-tracked-drift', 'tampered-asset', 'deleted-asset', 'partial-upgrade'] as const)(
     'guards the controller-managed implementation base advance: %s', async (scenario) => {
       const { repo } = await createGitFixture();
       const gitCmd = async (args: string[]): Promise<string> => {
@@ -1265,6 +1265,24 @@ describe('production supervisor trace', () => {
         }
         await gitCmd(['add', '.']);
         await gitCmd(['commit', '-m', 'seed stale managed assets']);
+        await gitCmd(['push', 'origin', 'main']);
+      }
+      // Tracked-doc scenarios need a tracked documentation file in the saved base.
+      if (['tracked-doc-advance', 'tracked-byte-drift-crash', 'tracked-stale-request'].includes(scenario)) {
+        mkdirSync(path.join(repo, 'docs', 'blockers'), { recursive: true });
+        writeFileSync(path.join(repo, 'docs', 'blockers', 'genotype-store.md'), '# Genotype store blocker\n\nBase documentation.\n');
+        await gitCmd(['add', '.']);
+        await gitCmd(['commit', '-m', 'seed tracked blocker documentation']);
+        await gitCmd(['push', 'origin', 'main']);
+      }
+      // The overlap scenario needs a managed asset already tracked at the base
+      // so a local tracked edit can collide with the managed remote diff.
+      if (scenario === 'tracked-overlap') {
+        const overlapAsset = MANAGED_ASSET_PATHS[1];
+        mkdirSync(path.dirname(path.join(repo, overlapAsset)), { recursive: true });
+        writeFileSync(path.join(repo, overlapAsset), '// stale controller asset\n');
+        await gitCmd(['add', '.']);
+        await gitCmd(['commit', '-m', 'seed managed asset for overlap']);
         await gitCmd(['push', 'origin', 'main']);
       }
       const supervisor = new HarnessSupervisor(
@@ -1306,8 +1324,18 @@ describe('production supervisor trace', () => {
       await gitCmd(['push', 'origin', 'main']);
       const newBase = await gitCmd(['rev-parse', 'HEAD']);
 
+      const docPath = path.join(paused.worktreePath as string, 'docs', 'blockers', 'genotype-store.md');
+      if (['tracked-doc-advance', 'tracked-byte-drift-crash', 'tracked-stale-request'].includes(scenario)) {
+        // An ordinary tracked documentation edit rides under the advance.
+        writeFileSync(docPath, '# Genotype store blocker\n\nLocal candidate documentation.\n');
+      }
+      if (scenario === 'tracked-overlap') {
+        // A tracked edit on a path the managed remote diff also touches must refuse.
+        writeFileSync(path.join(paused.worktreePath as string, MANAGED_ASSET_PATHS[1]), '// locally edited managed workflow\n');
+      }
       if (scenario === 'tracked-dirty') {
-        writeFileSync(path.join(paused.worktreePath as string, 'README.md'), 'locally edited\n');
+        // A tracked deletion is not an ordinary modification and must refuse.
+        rmSync(path.join(paused.worktreePath as string, 'README.md'));
       }
       if (scenario === 'collision') {
         rmSync(path.join(paused.worktreePath as string, 'src', 'genotype-store.ts'));
@@ -1315,32 +1343,53 @@ describe('production supervisor trace', () => {
         mkdirSync(path.dirname(colliding), { recursive: true });
         writeFileSync(colliding, 'stale local workflow\n');
       }
-      if (scenario === 'interrupted' || scenario === 'byte-drift-crash') {
+      if (scenario === 'interrupted' || scenario === 'byte-drift-crash' || scenario === 'tracked-byte-drift-crash') {
         // Crash window: the durable request and the fast-forward landed, the task patch did not.
+        const crashTracked = scenario === 'tracked-byte-drift-crash'
+          ? await git.trackedCandidates(paused.worktreePath as string)
+          : [];
         store.recordEvent('task.implementation_base_advance_requested', paused.id,
           {
             previousSha: oldBase, commitSha: newBase, untrackedFiles: ['src/genotype-store.ts'],
             untrackedDigests: git.untrackedDigestSnapshot(paused.worktreePath as string, ['src/genotype-store.ts']),
+            trackedFiles: crashTracked.map((entry) => entry.path),
+            trackedSnapshot: git.trackedCandidateSnapshot(paused.worktreePath as string, crashTracked),
           },
           `implementation-base-request:${paused.id}:${newBase}`);
-        await git.advanceImplementationBase(paused.worktreePath as string, oldBase, newBase, ['src/genotype-store.ts']);
+        await git.advanceImplementationBase(
+          paused.worktreePath as string, oldBase, newBase, ['src/genotype-store.ts'],
+          crashTracked.map((entry) => entry.path),
+        );
         if (scenario === 'byte-drift-crash') {
           // Same file name, different bytes: reconciliation must fail closed on the digest drift.
           writeFileSync(path.join(paused.worktreePath as string, 'src', 'genotype-store.ts'), 'export const store = 2;\n');
         }
+        if (scenario === 'tracked-byte-drift-crash') {
+          // Same tracked file, different bytes: crash reconciliation must fail closed.
+          writeFileSync(docPath, '# Genotype store blocker\n\nDrifted documentation.\n');
+        }
       }
-      if (scenario === 'stale-pending-request') {
+      if (scenario === 'stale-pending-request' || scenario === 'tracked-stale-request') {
         // Crash window: the durable request landed but the merge did not, and
         // the candidate bytes changed before the retry. The idempotent
         // request event keeps the stale digests, so the retry must fail closed
         // instead of merging over different bytes.
+        const staleTracked = scenario === 'tracked-stale-request'
+          ? await git.trackedCandidates(paused.worktreePath as string)
+          : [];
         store.recordEvent('task.implementation_base_advance_requested', paused.id,
           {
             previousSha: oldBase, commitSha: newBase, untrackedFiles: ['src/genotype-store.ts'],
             untrackedDigests: git.untrackedDigestSnapshot(paused.worktreePath as string, ['src/genotype-store.ts']),
+            trackedFiles: staleTracked.map((entry) => entry.path),
+            trackedSnapshot: git.trackedCandidateSnapshot(paused.worktreePath as string, staleTracked),
           },
           `implementation-base-request:${paused.id}:${newBase}`);
-        writeFileSync(path.join(paused.worktreePath as string, 'src', 'genotype-store.ts'), 'export const store = 2;\n');
+        if (scenario === 'stale-pending-request') {
+          writeFileSync(path.join(paused.worktreePath as string, 'src', 'genotype-store.ts'), 'export const store = 2;\n');
+        } else {
+          writeFileSync(docPath, '# Genotype store blocker\n\nDrifted documentation.\n');
+        }
       }
       if (scenario === 'snapshot-drift') {
         // Byte drift between the durable request snapshot and the completed
@@ -1359,18 +1408,49 @@ describe('production supervisor trace', () => {
           return snapshot;
         };
       }
+      if (scenario === 'extra-tracked-drift') {
+        // An extra tracked path appearing between the GitWorkspace merge
+        // return and the supervisor's outer post-merge verification must
+        // fail closed even though every expected digest still matches:
+        // simulate it by editing a tracked file only after the merge lands.
+        const realAdvance = git.advanceImplementationBase.bind(git);
+        git.advanceImplementationBase = async (
+          worktree: string, previousSha: string, targetSha: string, expectedUntracked: string[], expectedTracked?: string[],
+        ) => {
+          await realAdvance(worktree, previousSha, targetSha, expectedUntracked, expectedTracked);
+          const readme = path.join(worktree, 'README.md');
+          writeFileSync(readme, `${readFileSync(readme, 'utf8')}\nextra tracked drift\n`);
+        };
+      }
 
       await supervisor.tick();
       const finished = store.findByIssue(2)!;
       const requested = store.listEvents('task.implementation_base_advance_requested');
       const completed = store.listEvents('task.implementation_base_advance_completed');
-      if (scenario === 'advance' || scenario === 'interrupted') {
+      if (scenario === 'advance' || scenario === 'interrupted' || scenario === 'tracked-doc-advance') {
         expect(requested).toHaveLength(1);
         expect(requested[0]!.payload).toMatchObject({ previousSha: oldBase, commitSha: newBase });
+        if (scenario === 'tracked-doc-advance') {
+          expect(requested[0]!.payload.trackedFiles).toEqual(['docs/blockers/genotype-store.md']);
+          expect(requested[0]!.payload.trackedSnapshot).toEqual({
+            'docs/blockers/genotype-store.md': { status: ' M', mode: expect.any(Number), sha256: expect.any(String) },
+          });
+        }
         expect(completed).toHaveLength(1);
         expect(completed[0]!.payload).toMatchObject({ previousSha: oldBase, commitSha: newBase });
         expect(finished).toMatchObject({ state: 'done', baseSha: newBase, attempts: 0 });
         expect(await gitCmd(['merge-base', finished.commitSha as string, newBase])).toBe(newBase);
+        if (scenario === 'tracked-doc-advance') {
+          // The tracked doc edit survives the advance intact and lands in the final candidate commit.
+          const doc = await runProcess({
+            command: 'git',
+            args: ['show', `${finished.commitSha}:docs/blockers/genotype-store.md`],
+            cwd: repo,
+            timeoutMs: 10_000,
+          });
+          expect(doc.exitCode, doc.stderr).toBe(0);
+          expect(doc.stdout).toContain('Local candidate documentation');
+        }
         const candidate = await runProcess({
           command: 'git',
           args: ['show', `${finished.commitSha}:src/genotype-store.ts`],
@@ -1380,24 +1460,31 @@ describe('production supervisor trace', () => {
         expect(candidate.exitCode, candidate.stderr).toBe(0);
         expect(candidate.stdout).toContain('export const store = 1');
         expect(execute).toHaveBeenCalledTimes(2);
-      } else if (scenario === 'byte-drift-crash') {
+      } else if (scenario === 'byte-drift-crash' || scenario === 'tracked-byte-drift-crash') {
         expect(requested).toHaveLength(1);
         expect(completed).toHaveLength(0);
         expect(finished).toMatchObject({ state: 'ready', attempts: 1, baseSha: oldBase });
         expect(finished.lastError).toContain('candidate byte drift');
         expect(execute).toHaveBeenCalledTimes(1);
-      } else if (scenario === 'stale-pending-request' || scenario === 'snapshot-drift') {
+      } else if (scenario === 'stale-pending-request' || scenario === 'tracked-stale-request' || scenario === 'snapshot-drift') {
         expect(requested).toHaveLength(1);
         expect(completed).toHaveLength(0);
         expect(finished).toMatchObject({ state: 'ready', attempts: 1 });
         expect(finished.baseSha).toBe(oldBase);
         expect(finished.lastError).toContain('candidate byte drift');
         expect(execute).toHaveBeenCalledTimes(1);
+      } else if (scenario === 'extra-tracked-drift') {
+        expect(requested).toHaveLength(1);
+        expect(completed).toHaveLength(0);
+        expect(finished).toMatchObject({ state: 'ready', attempts: 1 });
+        expect(finished.baseSha).toBe(oldBase);
+        expect(finished.lastError).toContain('extra tracked paths after the merge');
+        expect(execute).toHaveBeenCalledTimes(1);
       } else {
         expect(requested).toHaveLength(0);
         expect(completed).toHaveLength(0);
         expect(finished.baseSha).toBe(oldBase);
-        if (scenario === 'collision') {
+        if (scenario === 'collision' || scenario === 'tracked-overlap') {
           expect(finished).toMatchObject({ state: 'ready', attempts: 1 });
           expect(finished.lastError).toContain('protected governance paths');
         } else {

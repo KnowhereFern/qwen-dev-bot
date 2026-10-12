@@ -11,6 +11,22 @@ export interface WorktreeReceipt {
   reused: boolean;
 }
 
+/** Durable evidence for one tracked candidate edit: porcelain status, filesystem mode, and content hash. */
+export interface TrackedCandidateDigest {
+  status: string;
+  mode: number;
+  sha256: string;
+}
+
+/** The only tracked worktree status a base advance may carry: an ordinary
+ * unstaged modification (' M') of an already-tracked file. Staged ('M ') and
+ * mixed ('MM') modifications fail closed alongside every other status. */
+const ORDINARY_TRACKED_MODIFICATIONS = new Set([' M']);
+
+export function isOrdinaryTrackedModification(status: string): boolean {
+  return ORDINARY_TRACKED_MODIFICATIONS.has(status);
+}
+
 export class GitWorkspace {
   private readonly repoRoot: string;
   private readonly worktreesRoot: string;
@@ -135,17 +151,31 @@ export class GitWorkspace {
     return entries.filter((entry) => !entry.untracked).map((entry) => entry.path);
   }
 
+  /** Tracked worktree entries with their exact porcelain v1 status codes. */
+  async trackedCandidates(worktree: string): Promise<Array<{ path: string; status: string }>> {
+    const entries = await this.statusEntries(worktree);
+    return entries.filter((entry) => !entry.untracked)
+      .map((entry) => ({ path: entry.path, status: entry.status }));
+  }
+
   async untrackedFiles(worktree: string): Promise<string[]> {
     const entries = await this.statusEntries(worktree);
     return entries.filter((entry) => entry.untracked).map((entry) => entry.path);
   }
 
   /**
-   * Fast-forward a task-owned implementation worktree whose only content is an
-   * untracked candidate. The exact untracked set must be declared up front and is
+   * Fast-forward a task-owned implementation worktree whose local content is
+   * limited to an untracked candidate plus optionally a set of disjoint
+   * tracked candidate edits (ordinary unstaged modifications — porcelain
+   * ' M' — of already-tracked regular
+   * files). The exact untracked set must be declared up front and is
    * re-verified before and after the merge; every candidate byte (or symlink
-   * target) is hashed on both sides so no drift can slip through. Repository
-   * hooks are disabled for the merge via a verified nonexistent hooks path under
+   * target) is hashed on both sides so no drift can slip through. Tracked
+   * candidates are likewise snapshotted (status, mode, SHA-256 bytes) on both
+   * sides. Any other tracked status (staged or mixed modification, rename,
+   * copy, conflict, typechange, submodule, symlink, addition, deletion) fails
+   * closed. Repository hooks
+   * are disabled for the merge via a verified nonexistent hooks path under
    * the harness-owned state root, so a hook cannot mutate the candidate between
    * the two verifications. No backup, delete, or reset is performed.
    */
@@ -154,15 +184,25 @@ export class GitWorkspace {
     previousSha: string,
     targetSha: string,
     expectedUntracked: string[],
+    expectedTracked: string[] = [],
   ): Promise<void> {
     this.assertOwnedPath(worktree);
     if ((await this.headSha(worktree)) !== previousSha) {
       throw new Error(`Refusing implementation base advance: worktree HEAD moved away from ${previousSha}`);
     }
     const entries = await this.statusEntries(worktree);
-    const tracked = entries.filter((entry) => !entry.untracked).map((entry) => entry.path);
-    if (tracked.length > 0) {
-      throw new Error(`Refusing implementation base advance over tracked changes: ${tracked.join(', ')}`);
+    for (const entry of entries) {
+      if (!entry.untracked && !isOrdinaryTrackedModification(entry.status)) {
+        throw new Error(
+          `Refusing implementation base advance over unsupported tracked change ${entry.path} (${entry.status.trim() || 'index'})`,
+        );
+      }
+    }
+    const tracked = entries.filter((entry) => !entry.untracked).map((entry) => entry.path).sort();
+    const expectedTrackedList = [...expectedTracked].sort();
+    if (tracked.length !== expectedTrackedList.length ||
+        tracked.some((file, index) => file !== expectedTrackedList[index])) {
+      throw new Error('Tracked candidate set changed before the implementation base advance');
     }
     const before = entries.filter((entry) => entry.untracked).map((entry) => entry.path).sort();
     const expected = [...expectedUntracked].sort();
@@ -170,6 +210,10 @@ export class GitWorkspace {
       throw new Error('Untracked candidate set changed before the implementation base advance');
     }
     const beforeDigests = this.untrackedDigests(worktree, before);
+    const beforeTrackedDigests = this.trackedCandidateDigests(
+      worktree,
+      entries.filter((entry) => !entry.untracked),
+    );
     const disabledHooksPath = path.join(this.stateRoot, 'disabled-hooks');
     // lstat (not existsSync) so a dangling symlink at the path also fails
     // closed: git would still resolve core.hooksPath through it.
@@ -179,7 +223,12 @@ export class GitWorkspace {
       );
     }
     await this.git(['-c', `core.hooksPath=${disabledHooksPath}`, 'merge', '--ff-only', targetSha], worktree);
-    const after = (await this.statusEntries(worktree)).filter((entry) => entry.untracked).map((entry) => entry.path).sort();
+    const mergedHead = await this.headSha(worktree);
+    if (mergedHead !== targetSha) {
+      throw new Error(`Fast-forward verification failed: HEAD is ${mergedHead}, expected ${targetSha}`);
+    }
+    const afterEntries = await this.statusEntries(worktree);
+    const after = afterEntries.filter((entry) => entry.untracked).map((entry) => entry.path).sort();
     if (after.length !== before.length || after.some((file, index) => file !== before[index])) {
       throw new Error(`Fast-forward to ${targetSha} altered the untracked candidate set`);
     }
@@ -187,6 +236,31 @@ export class GitWorkspace {
     const drifted = after.filter((file) => afterDigests.get(file) !== beforeDigests.get(file));
     if (drifted.length > 0) {
       throw new Error(`Fast-forward to ${targetSha} altered untracked candidate bytes: ${drifted.join(', ')}`);
+    }
+    const afterTrackedEntries = afterEntries.filter((entry) => !entry.untracked);
+    for (const entry of afterTrackedEntries) {
+      if (!isOrdinaryTrackedModification(entry.status)) {
+        throw new Error(
+          `Fast-forward to ${targetSha} produced unsupported tracked change ${entry.path} (${entry.status.trim() || 'index'})`,
+        );
+      }
+    }
+    const afterTrackedSorted = afterTrackedEntries.map((entry) => entry.path).sort();
+    if (afterTrackedSorted.length !== tracked.length ||
+        afterTrackedSorted.some((file, index) => file !== tracked[index])) {
+      throw new Error(`Fast-forward to ${targetSha} altered the tracked candidate set`);
+    }
+    const afterTrackedDigests = this.trackedCandidateDigests(worktree, afterTrackedEntries);
+    const trackedDrift = tracked.filter((file) => {
+      const beforeEntry = beforeTrackedDigests.get(file);
+      const afterEntry = afterTrackedDigests.get(file);
+      return beforeEntry === undefined || afterEntry === undefined ||
+        beforeEntry.status !== afterEntry.status ||
+        beforeEntry.mode !== afterEntry.mode ||
+        beforeEntry.sha256 !== afterEntry.sha256;
+    });
+    if (trackedDrift.length > 0) {
+      throw new Error(`Fast-forward to ${targetSha} altered tracked candidate bytes: ${trackedDrift.join(', ')}`);
     }
   }
 
@@ -368,15 +442,61 @@ export class GitWorkspace {
     return Object.fromEntries(this.untrackedDigests(worktree, [...files].sort()));
   }
 
-  private async statusEntries(worktree: string): Promise<Array<{ untracked: boolean; path: string }>> {
+  /**
+   * Hash the porcelain status, filesystem mode, and exact bytes of each
+   * tracked candidate edit so byte-level, mode, or status drift fails closed.
+   * Only ordinary unstaged modifications of regular files are supported
+   * (' M'); anything else (staged or mixed modification, symlink,
+   * typechange, special file) is refused.
+   */
+  protected trackedCandidateDigests(
+    worktree: string,
+    entries: Array<{ path: string; status: string }>,
+  ): Map<string, TrackedCandidateDigest> {
+    const digests = new Map<string, TrackedCandidateDigest>();
+    for (const entry of entries) {
+      if (!isOrdinaryTrackedModification(entry.status)) {
+        throw new Error(
+          `Tracked candidate entry ${entry.path} is not an ordinary unstaged modification (${entry.status.trim() || 'index'})`,
+        );
+      }
+      const absolute = path.join(worktree, entry.path);
+      const stat = lstatSync(absolute);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error(`Tracked candidate entry ${entry.path} is not a regular file`);
+      }
+      digests.set(entry.path, {
+        status: entry.status,
+        mode: stat.mode,
+        sha256: createHash('sha256').update(readFileSync(absolute)).digest('hex'),
+      });
+    }
+    return digests;
+  }
+
+  /**
+   * Narrowly scoped public snapshot of the tracked candidate edits (status,
+   * mode, SHA-256 bytes), keyed by repository-relative path. Callers persist
+   * this in durable request evidence and fail closed if the reconciled
+   * status, mode, or bytes no longer match.
+   */
+  trackedCandidateSnapshot(
+    worktree: string,
+    entries: Array<{ path: string; status: string }>,
+  ): Record<string, TrackedCandidateDigest> {
+    const sorted = [...entries].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+    return Object.fromEntries(this.trackedCandidateDigests(worktree, sorted));
+  }
+
+  private async statusEntries(worktree: string): Promise<Array<{ untracked: boolean; path: string; status: string }>> {
     const receipt = await this.git(['status', '--porcelain=v1', '-z', '--untracked-files=all'], worktree);
     const tokens = receipt.stdout.split('\0');
-    const entries: Array<{ untracked: boolean; path: string }> = [];
+    const entries: Array<{ untracked: boolean; path: string; status: string }> = [];
     for (let index = 0; index < tokens.length; index += 1) {
       const token = tokens[index];
       if (!token) continue;
       const status = token.slice(0, 2);
-      entries.push({ untracked: status === '??', path: token.slice(3) });
+      entries.push({ untracked: status === '??', path: token.slice(3), status });
       if (status.includes('R') || status.includes('C')) index += 1;
     }
     return entries;

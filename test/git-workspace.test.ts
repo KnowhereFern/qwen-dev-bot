@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, readlinkSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
@@ -149,6 +149,152 @@ describe('real Git worktree delivery', () => {
     await expect(
       git.advanceImplementationBase(worktree.path, target, target, []),
     ).rejects.toThrow('Untracked candidate set changed');
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
+  });
+
+  it('advances over disjoint tracked and untracked candidates and preserves exact tracked bytes', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    const git = new GitWorkspace(repo, makeTmp('git-impl-tracked-state'), config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+    mkdirSync(path.join(worktree.path, 'src'), { recursive: true });
+    writeFileSync(path.join(worktree.path, 'src', 'genotype-store.ts'), 'export {};\n');
+    const readmePath = path.join(worktree.path, 'README.md');
+    writeFileSync(readmePath, `${readFileSync(readmePath, 'utf8')}local blocker note\n`);
+
+    mkdirSync(path.join(repo, '.qwen-harness', 'scripts'), { recursive: true });
+    writeFileSync(path.join(repo, '.qwen-harness', 'scripts', 'run-gates.mjs'), 'export const gates = 1;\n');
+    await command(['add', '.'], repo);
+    await command(['commit', '-m', 'controller asset update'], repo);
+    const target = await command(['rev-parse', 'HEAD'], repo);
+
+    const trackedBefore = await git.trackedCandidates(worktree.path);
+    expect(trackedBefore).toEqual([{ path: 'README.md', status: ' M' }]);
+    const snapshot = git.trackedCandidateSnapshot(worktree.path, trackedBefore);
+    expect(snapshot['README.md']).toMatchObject({ status: ' M' });
+    expect(snapshot['README.md']?.sha256).toMatch(/^[0-9a-f]{64}$/);
+
+    await git.advanceImplementationBase(worktree.path, task.baseSha, target, ['src/genotype-store.ts'], ['README.md']);
+
+    expect(await git.headSha(worktree.path)).toBe(target);
+    expect(await git.trackedCandidates(worktree.path)).toEqual([{ path: 'README.md', status: ' M' }]);
+    expect(git.trackedCandidateSnapshot(worktree.path, await git.trackedCandidates(worktree.path))).toEqual(snapshot);
+    expect(readFileSync(readmePath, 'utf8')).toContain('local blocker note');
+    expect(readFileSync(path.join(worktree.path, 'src', 'genotype-store.ts'), 'utf8')).toBe('export {};\n');
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
+  });
+
+  it('refuses unsupported tracked changes such as deletions and renames during a base advance', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    const git = new GitWorkspace(repo, makeTmp('git-impl-unsupported-state'), config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+    writeFileSync(path.join(worktree.path, 'candidate.ts'), 'export const original = 1;\n');
+
+    mkdirSync(path.join(repo, '.qwen-harness', 'scripts'), { recursive: true });
+    writeFileSync(path.join(repo, '.qwen-harness', 'scripts', 'run-gates.mjs'), 'export const gates = 1;\n');
+    await command(['add', '.'], repo);
+    await command(['commit', '-m', 'controller asset update'], repo);
+    const target = await command(['rev-parse', 'HEAD'], repo);
+
+    rmSync(path.join(worktree.path, 'README.md'));
+    await expect(
+      git.advanceImplementationBase(worktree.path, task.baseSha, target, ['candidate.ts'], ['README.md']),
+    ).rejects.toThrow('unsupported tracked change');
+    expect(await git.headSha(worktree.path)).toBe(task.baseSha);
+
+    await command(['checkout', '--', '.'], worktree.path);
+    renameSync(path.join(worktree.path, 'AUTONOMY.md'), path.join(worktree.path, 'moved-contract.md'));
+    await expect(
+      git.advanceImplementationBase(worktree.path, task.baseSha, target, ['candidate.ts'], ['AUTONOMY.md', 'moved-contract.md']),
+    ).rejects.toThrow('unsupported tracked change');
+    expect(await git.headSha(worktree.path)).toBe(task.baseSha);
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
+  });
+
+  it('refuses staged and mixed tracked modifications during a base advance', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    const git = new GitWorkspace(repo, makeTmp('git-impl-staged-state'), config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+    writeFileSync(path.join(worktree.path, 'candidate.ts'), 'export const original = 1;\n');
+    const readmePath = path.join(worktree.path, 'README.md');
+    const readmeBase = readFileSync(readmePath, 'utf8');
+
+    mkdirSync(path.join(repo, '.qwen-harness', 'scripts'), { recursive: true });
+    writeFileSync(path.join(repo, '.qwen-harness', 'scripts', 'run-gates.mjs'), 'export const gates = 1;\n');
+    await command(['add', '.'], repo);
+    await command(['commit', '-m', 'controller asset update'], repo);
+    const target = await command(['rev-parse', 'HEAD'], repo);
+
+    // A staged 'M ' modification is outside the supported base-advance
+    // state and must fail closed.
+    writeFileSync(readmePath, `${readmeBase}staged blocker note\n`);
+    await command(['add', 'README.md'], worktree.path);
+    expect(await git.trackedCandidates(worktree.path)).toEqual([{ path: 'README.md', status: 'M ' }]);
+    await expect(
+      git.advanceImplementationBase(worktree.path, task.baseSha, target, ['candidate.ts'], ['README.md']),
+    ).rejects.toThrow('unsupported tracked change');
+    expect(await git.headSha(worktree.path)).toBe(task.baseSha);
+
+    // A further unstaged edit on top ('MM') is still not the documented
+    // state and must likewise refuse.
+    writeFileSync(readmePath, `${readmeBase}staged blocker note\nplus unstaged drift\n`);
+    expect(await git.trackedCandidates(worktree.path)).toEqual([{ path: 'README.md', status: 'MM' }]);
+    await expect(
+      git.advanceImplementationBase(worktree.path, task.baseSha, target, ['candidate.ts'], ['README.md']),
+    ).rejects.toThrow('unsupported tracked change');
+    expect(await git.headSha(worktree.path)).toBe(task.baseSha);
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
+  });
+
+  it('fails closed when tracked candidate bytes drift across the fast-forward', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    class TrackedDriftWorkspace extends GitWorkspace {
+      private digestCalls = 0;
+
+      protected override trackedCandidateDigests(
+        worktree: string,
+        entries: Array<{ path: string; status: string }>,
+      ): Map<string, import('../src/git/git-workspace.js').TrackedCandidateDigest> {
+        this.digestCalls += 1;
+        const digests = super.trackedCandidateDigests(worktree, entries);
+        if (this.digestCalls === 2) {
+          // Simulate the tracked candidate being mutated while the merge runs.
+          const first = entries[0] as { path: string; status: string };
+          digests.set(first.path, { ...(digests.get(first.path) as import('../src/git/git-workspace.js').TrackedCandidateDigest), sha256: 'drifted-bytes' });
+        }
+        return digests;
+      }
+    }
+    const git = new TrackedDriftWorkspace(repo, makeTmp('git-impl-tracked-drift-state'), config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+    writeFileSync(path.join(worktree.path, 'candidate.ts'), 'export const original = 1;\n');
+    const readmePath = path.join(worktree.path, 'README.md');
+    writeFileSync(readmePath, `${readFileSync(readmePath, 'utf8')}local blocker note\n`);
+
+    mkdirSync(path.join(repo, '.qwen-harness', 'scripts'), { recursive: true });
+    writeFileSync(path.join(repo, '.qwen-harness', 'scripts', 'run-gates.mjs'), 'export const gates = 1;\n');
+    await command(['add', '.'], repo);
+    await command(['commit', '-m', 'controller asset update'], repo);
+    const target = await command(['rev-parse', 'HEAD'], repo);
+
+    await expect(
+      git.advanceImplementationBase(worktree.path, task.baseSha, target, ['candidate.ts'], ['README.md']),
+    ).rejects.toThrow('altered tracked candidate bytes');
     await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
   });
 

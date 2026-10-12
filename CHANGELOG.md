@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.73] - 2026-10-12
+
+- Preserve byte-identical unstaged tracked candidate edits alongside untracked work when advancing a paused task across disjoint controller-managed assets, with durable crash recovery and fail-closed collision checks.
+
 ## [1.0.0-rc.72] - 2026-10-12
 
 - Focus repair sessions with an existing task worktree on the candidate and verifier feedback before immediately invoking the saved workflow.
