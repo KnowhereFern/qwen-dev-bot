@@ -112,6 +112,10 @@ describe('Qwen execution session isolation', () => {
     expect(prompt).toContain('Keep the approved contract.');
     expect(prompt).toContain('attempt and continuation counters');
     expect(prompt).toContain('does not override genuine user instructions to stop');
+    expect(prompt).toContain('executionFocus field in the saved workflow args');
+    expect(prompt).toContain('missing acceptance test or next required edit');
+    expect(prompt).toContain('sole implementer');
+    expect(prompt).toContain('unchanged required gates and independent review');
     expect(prompt).toContain('fresh, without resumeFromRunId');
     expect(prompt).not.toContain('may resume its workflow');
     expect(prompt).not.toContain('new bounded repair attempt');
@@ -139,6 +143,7 @@ describe('Qwen execution session isolation', () => {
     expect(prompt).toContain('new bounded repair attempt');
     expect(prompt).toContain('Required test failed');
     expect(prompt).not.toContain('automatic budget continuation');
+    expect(prompt).not.toContain('executionFocus');
   });
 
   it.each([

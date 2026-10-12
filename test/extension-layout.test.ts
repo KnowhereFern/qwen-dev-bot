@@ -80,7 +80,7 @@ describe('Qwen extension packaging', () => {
           ? { passed: false, findings: ['missing receipt'] }
           : { summary: 'verbose report '.repeat(2000), changedFiles: [], tests: ['claimed pass'] };
       },
-      { taskId: 'fixture' },
+      { taskId: 'fixture', executionFocus: { nextAction: 'write missing acceptance tests' } },
       () => { throw new Error('Do not duplicate verbose reports in logs'); },
     );
     expect(JSON.stringify(result).slice(0,1000)).toContain('gateReceiptPath');
@@ -95,6 +95,7 @@ describe('Qwen extension packaging', () => {
     expect(prompts[2]!.prompt).toContain('add the tests before another broad survey');
     expect(prompts[2]!.prompt).toContain('run verification rather than re-planning it');
     expect(prompts[2]!.prompt).toContain('Preserve every acceptance criterion');
+    expect(prompts[2]!.prompt).toContain('"executionFocus":{"nextAction":"write missing acceptance tests"}');
     expect(prompts[3]!.prompt).toContain('A missing, incomplete, failed, stale, or wrong-worktree receipt is a blocker');
     expect(prompts[3]!.prompt).toContain('Do not edit files or attempt shell tools');
   });
