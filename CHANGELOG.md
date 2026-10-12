@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.75] - 2026-10-12
+
+- Re-run immutable, controller-configured gates on the final local candidate before committing; reject stale receipts, failed checks, and input drift while retaining exact-commit verification.
+
 ## [1.0.0-rc.74] - 2026-10-12
 
 - Normalize JSON-string workflow arguments before choosing the focused continuation path, preserving initial-run reconnaissance and required review/gates.

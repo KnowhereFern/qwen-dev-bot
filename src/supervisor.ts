@@ -7,6 +7,7 @@ import type { GateResult, HarnessEvent, ProjectConfig, RewardScorecard, RunCheck
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
 import { REQUIRED_GITHUB_CHECKS, REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
+import { runLocalGateReverification } from './gates/local-reverify.js';
 import { GitWorkspace, branchFor, isOrdinaryTrackedModification, type TrackedCandidateDigest } from './git/git-workspace.js';
 import { parseNormalizedSpec, type TaskNormalizer } from './intake/normalizer.js';
 import { Logger } from './logger.js';
@@ -382,6 +383,8 @@ export class HarnessSupervisor {
         return;
       }
 
+      await this.runLocalGateReverification(task, worktree.path, executionSignal);
+
       await this.verifyCandidate(
         task,
         worktree.path,
@@ -403,6 +406,49 @@ export class HarnessSupervisor {
     } finally {
       if (executionHeartbeatTimer) clearInterval(executionHeartbeatTimer);
     }
+  }
+
+  /**
+   * Deterministic local gate re-verification of the uncommitted Qwen
+   * candidate, run between the local handoff and commitCandidate. A workflow
+   * reviewer cannot prove timestamp freshness, so the supervisor itself runs
+   * the immutable controller-packaged
+   * template/.qwen-harness/scripts/run-gates.mjs inside the candidate
+   * worktree (never the mutable tracked project script) and requires a fresh
+   * machine receipt: terminal exit 0, status passed, the exact worktree and
+   * HEAD evaluated, no HEAD movement during the run, every configured required
+   * gate passed, and no input drift. Fail closed on a missing runner, an invalid receipt, or any failed
+   * check; the failure blocks commitCandidate, the PR, and independent review
+   * exactly like the existing exact-commit gates — a gate side effect on the
+   * candidate worktree now fails here first, before anything is committed.
+   * Recovered interrupted candidates skip this step: they are already exact commits re-verified by
+   * the exact-commit gates, so restart recovery is preserved. This never
+   * edits product code or weakens any gate.
+   */
+  private async runLocalGateReverification(task: TaskRecord, worktreePath: string, signal?: AbortSignal): Promise<void> {
+    // The exact HEAD the gates must evaluate: normally the saved base, but on
+    // a repair retry after an earlier committed candidate it is that candidate
+    // commit. What must hold deterministically is that the receipt describes
+    // precisely this HEAD and that it does not move during the run.
+    const headBefore = await this.git.headSha(worktreePath);
+    const result = await runLocalGateReverification({
+      worktreePath,
+      expectedHead: headBefore,
+      gates: this.config.gates,
+      signal,
+    });
+    const headAfter = await this.git.headSha(worktreePath);
+    if (headAfter !== headBefore) {
+      throw new Error(
+        `Local gate re-verification failed: candidate worktree HEAD moved from ${headBefore} to ${headAfter} during gate execution`,
+      );
+    }
+    this.store.recordEvent('task.local_reverification', task.id, {
+      runId: result.runId,
+      head: result.head,
+      status: 'passed',
+      gates: result.gateCount,
+    }, `local-reverification:${task.id}:${result.runId}`);
   }
 
   private async verifyCandidate(

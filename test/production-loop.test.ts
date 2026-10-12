@@ -1089,7 +1089,9 @@ describe('production supervisor trace', () => {
     await supervisor.tick();
     const task = store.findByIssue(2);
     expect(task?.state).toBe('ready');
-    expect(task?.lastError).toContain('Gates modified the exact verification worktree');
+    // The mutating gate now fails deterministically at local re-verification
+    // (input drift in the candidate worktree) before anything is committed.
+    expect(task?.lastError).toContain('Local gate re-verification failed');
     expect(github.prs.size).toBe(0);
     store.close();
   }, 30_000);
