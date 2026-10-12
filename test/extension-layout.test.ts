@@ -80,7 +80,7 @@ describe('Qwen extension packaging', () => {
           ? { passed: false, findings: ['missing receipt'] }
           : { summary: 'verbose report '.repeat(2000), changedFiles: [], tests: ['claimed pass'] };
       },
-      { taskId: 'fixture', executionFocus: { nextAction: 'write missing acceptance tests' } },
+      { taskId: 'fixture' },
       () => { throw new Error('Do not duplicate verbose reports in logs'); },
     );
     expect(JSON.stringify(result).slice(0,1000)).toContain('gateReceiptPath');
@@ -95,9 +95,73 @@ describe('Qwen extension packaging', () => {
     expect(prompts[2]!.prompt).toContain('add the tests before another broad survey');
     expect(prompts[2]!.prompt).toContain('run verification rather than re-planning it');
     expect(prompts[2]!.prompt).toContain('Preserve every acceptance criterion');
-    expect(prompts[2]!.prompt).toContain('"executionFocus":{"nextAction":"write missing acceptance tests"}');
+    expect(prompts[2]!.prompt).toContain('Use the independent reconnaissance below as your starting point');
     expect(prompts[3]!.prompt).toContain('A missing, incomplete, failed, stale, or wrong-worktree receipt is a blocker');
     expect(prompts[3]!.prompt).toContain('Do not edit files or attempt shell tools');
+  });
+
+  it('skips only reconnaissance on a focused continuation while keeping gates and review', async () => {
+    const source = readFileSync(path.join(root, 'template', '.qwen', 'workflows', 'harness-implement.js'), 'utf8');
+    const prompts: Array<{ prompt: string; agentType: string }> = [];
+    const run = new Function('phase', 'parallel', 'agent', 'args', 'log', `return (async () => {\n${source}\n})();`);
+    const result = await run(
+      () => {},
+      (calls: Array<() => Promise<unknown>>) => { throw new Error('reconnaissance must be skipped on a focused continuation'); },
+      async (prompt: string, options: { agentType: string }) => {
+        prompts.push({ prompt, agentType: options.agentType });
+        return options.agentType === 'harness-reviewer'
+          ? { passed: false, findings: ['missing receipt'] }
+          : { summary: 'focused step done', changedFiles: [], tests: [] };
+      },
+      { taskId: 'fixture', executionFocus: { nextAction: 'write missing acceptance tests' } },
+      () => {},
+    );
+    expect(prompts.map(item => item.agentType)).toEqual(['harness-implementer', 'harness-reviewer']);
+    expect(prompts[0]!.prompt).toContain('focused continuation');
+    expect(prompts[0]!.prompt).toContain('Next action from the coordinator: write missing acceptance tests');
+    expect(prompts[0]!.prompt).toContain('skip redundant reconnaissance');
+    expect(prompts[0]!.prompt).toContain('After your final code edit, execute node .qwen-harness/scripts/run-gates.mjs');
+    expect(prompts[0]!.prompt).toContain('never author or edit the receipt yourself');
+    expect(prompts[0]!.prompt).toContain('"taskId":"fixture"');
+    expect(prompts[1]!.prompt).toContain('A missing, incomplete, failed, stale, or wrong-worktree receipt is a blocker');
+    expect(prompts[1]!.prompt).toContain('Do not edit files or attempt shell tools');
+    expect(result.gateReceiptPath).toBe('.qwen-harness/state/gate-receipt.json');
+    expect(result.evidenceInstruction).toContain('machine-written gate receipt');
+  });
+
+  it('fails safe to full reconnaissance when executionFocus is missing or malformed', async () => {
+    const source = readFileSync(path.join(root, 'template', '.qwen', 'workflows', 'harness-implement.js'), 'utf8');
+    const run = new Function('phase', 'parallel', 'agent', 'args', 'log', `return (async () => {\n${source}\n})();`);
+    const agentTypesByRun: Array<string[]> = [];
+    for (const badArgs of [
+      { taskId: 'fixture' },
+      { taskId: 'fixture', executionFocus: null },
+      { taskId: 'fixture', executionFocus: 'write tests' },
+      { taskId: 'fixture', executionFocus: {} },
+      { taskId: 'fixture', executionFocus: { nextAction: '   ' } },
+      { taskId: 'fixture', executionFocus: { nextAction: 42 } },
+    ]) {
+      const agentTypes: string[] = [];
+      await run(
+        () => {},
+        (calls: Array<() => Promise<unknown>>) => Promise.all(calls.map(call => call())),
+        async (_prompt: string, options: { agentType: string }) => {
+          agentTypes.push(options.agentType);
+          return options.agentType === 'harness-reviewer'
+            ? { passed: true, findings: [] }
+            : { summary: 'done', changedFiles: [], tests: [] };
+        },
+        badArgs,
+        () => {},
+      );
+      agentTypesByRun.push(agentTypes);
+    }
+    expect(agentTypesByRun).toHaveLength(6);
+    for (const agentTypes of agentTypesByRun) {
+      expect(agentTypes).toEqual([
+        'harness-researcher', 'harness-verifier', 'harness-implementer', 'harness-reviewer',
+      ]);
+    }
   });
 
   it('keeps the installed implementer focused on finishing saved work without weakening gates', () => {

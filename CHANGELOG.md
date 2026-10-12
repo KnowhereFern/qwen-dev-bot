@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.71] - 2026-10-12
+
+- Send focused task continuations directly to the sole implementer, avoiding repeated broad reconnaissance while retaining gates and independent review.
+
 ## [1.0.0-rc.70] - 2026-10-12
 
 - Bind in-flight candidate recovery to recorded file bytes, suppress repository hooks during read-only base advances, and release daemon poll listeners after each wait.
