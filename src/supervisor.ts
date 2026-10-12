@@ -3,7 +3,7 @@ import { lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CommunityCollector, CommunityScanResult } from './community/collector.js';
-import type { GateResult, ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
+import type { GateResult, HarnessEvent, ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
 import { REQUIRED_GITHUB_CHECKS, REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
@@ -793,23 +793,69 @@ export class HarnessSupervisor {
       return null;
     }
     if (reconciling) {
-      const recorded = Array.isArray(latest?.payload.untrackedFiles)
-        ? [...(latest?.payload.untrackedFiles as string[])].sort()
-        : null;
-      if (latest?.payload.previousSha !== savedBase || recorded === null ||
-          recorded.length !== untracked.length || recorded.some((file, index) => file !== untracked[index])) {
-        throw new Error(`Durable implementation base advance for task ${task.id} no longer matches the recorded request evidence`);
-      }
+      this.assertRecordedCandidateMatches(task, latest, savedBase, worktreePath, untracked);
       this.store.recordEvent('task.implementation_base_advance_completed', task.id,
         { previousSha: savedBase, commitSha: head }, `implementation-base-completed:${task.id}:${head}`);
       return this.store.patch(task.id, { baseSha: head });
     }
+    if (latest?.payload.previousSha === savedBase && latest.payload.commitSha === target) {
+      // A prior request for this same savedBase+target exists but the merge
+      // never landed (HEAD is still savedBase). recordEvent is idempotent on
+      // the request key, so this retry cannot refresh stale evidence; verify
+      // the recorded candidate bytes against the current snapshot instead.
+      this.assertRecordedCandidateMatches(task, latest, savedBase, worktreePath, untracked);
+    }
+    const digestSnapshot = this.git.untrackedDigestSnapshot(worktreePath, untracked);
     this.store.recordEvent('task.implementation_base_advance_requested', task.id,
-      { previousSha: savedBase, commitSha: target, untrackedFiles: untracked }, `implementation-base-request:${task.id}:${target}`);
+      { previousSha: savedBase, commitSha: target, untrackedFiles: untracked, untrackedDigests: digestSnapshot },
+      `implementation-base-request:${task.id}:${target}`);
     await this.git.advanceImplementationBase(worktreePath, head, target, untracked);
+    // The merge verified its own before/after bytes, but the durable request
+    // snapshot was taken before the event write; fail closed if the candidate
+    // drifted between that snapshot and the completed merge.
+    const mergedDigests = this.git.untrackedDigestSnapshot(worktreePath, untracked);
+    const mergedDrift = untracked.filter((file) => mergedDigests[file] !== digestSnapshot[file]);
+    if (mergedDrift.length > 0) {
+      throw new Error(
+        `Implementation base advance for task ${task.id} found candidate byte drift between the request snapshot and the merge: ${mergedDrift.join(', ')}`,
+      );
+    }
     this.store.recordEvent('task.implementation_base_advance_completed', task.id,
       { previousSha: savedBase, commitSha: target }, `implementation-base-completed:${task.id}:${target}`);
     return this.store.patch(task.id, { baseSha: target });
+  }
+
+  /**
+   * Fail closed unless the durable request evidence still describes the exact
+   * current untracked candidate: same saved base, same file set, and identical
+   * per-file byte (or symlink-target) digests. Malformed records fail closed.
+   */
+  private assertRecordedCandidateMatches(
+    task: TaskRecord,
+    event: HarnessEvent | undefined,
+    savedBase: string,
+    worktreePath: string,
+    untracked: string[],
+  ): void {
+    const recorded = Array.isArray(event?.payload.untrackedFiles)
+      ? [...(event?.payload.untrackedFiles as string[])].sort()
+      : null;
+    if (event?.payload.previousSha !== savedBase || recorded === null ||
+        recorded.length !== untracked.length || recorded.some((file, index) => file !== untracked[index])) {
+      throw new Error(`Durable implementation base advance for task ${task.id} no longer matches the recorded request evidence`);
+    }
+    // Same names are not enough: every candidate byte (or symlink target)
+    // recorded in the durable request must still match exactly.
+    const recordedDigests = untrackedDigestRecord(event?.payload.untrackedDigests);
+    if (recordedDigests === null || Object.keys(recordedDigests).length !== untracked.length ||
+        untracked.some((file) => typeof recordedDigests[file] !== 'string')) {
+      throw new Error(`Durable implementation base advance for task ${task.id} lacks valid recorded candidate digests`);
+    }
+    const currentDigests = this.git.untrackedDigestSnapshot(worktreePath, untracked);
+    const drifted = untracked.filter((file) => currentDigests[file] !== recordedDigests[file]);
+    if (drifted.length > 0) {
+      throw new Error(`Durable implementation base advance for task ${task.id} found candidate byte drift: ${drifted.join(', ')}`);
+    }
   }
 
   private async verifyManagedAssetsMatchTemplates(
@@ -1158,6 +1204,22 @@ function renderPullRequestBody(task: TaskRecord, summary: string, scorecard: Rew
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+/**
+ * Validate a persisted untracked-digest snapshot from durable request
+ * evidence. Returns null unless the value is a plain object mapping
+ * repository-relative paths to non-empty digest strings, so reconciliation
+ * fails closed on missing, malformed, or non-string entries.
+ */
+function untrackedDigestRecord(value: unknown): Record<string, string> | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const record: Record<string, string> = {};
+  for (const [file, digest] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof digest !== 'string' || digest.length === 0) return null;
+    record[file] = digest;
+  }
+  return record;
 }
 
 /**

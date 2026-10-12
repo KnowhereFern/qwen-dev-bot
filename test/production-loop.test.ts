@@ -1230,7 +1230,7 @@ describe('production supervisor trace', () => {
     store.close();
   }, 30_000);
 
-  it.each(['advance', 'product-delta', 'tracked-dirty', 'collision', 'interrupted', 'tampered-asset', 'deleted-asset', 'partial-upgrade'] as const)(
+  it.each(['advance', 'product-delta', 'tracked-dirty', 'collision', 'interrupted', 'byte-drift-crash', 'stale-pending-request', 'snapshot-drift', 'tampered-asset', 'deleted-asset', 'partial-upgrade'] as const)(
     'guards the controller-managed implementation base advance: %s', async (scenario) => {
       const { repo } = await createGitFixture();
       const gitCmd = async (args: string[]): Promise<string> => {
@@ -1315,12 +1315,49 @@ describe('production supervisor trace', () => {
         mkdirSync(path.dirname(colliding), { recursive: true });
         writeFileSync(colliding, 'stale local workflow\n');
       }
-      if (scenario === 'interrupted') {
+      if (scenario === 'interrupted' || scenario === 'byte-drift-crash') {
         // Crash window: the durable request and the fast-forward landed, the task patch did not.
         store.recordEvent('task.implementation_base_advance_requested', paused.id,
-          { previousSha: oldBase, commitSha: newBase, untrackedFiles: ['src/genotype-store.ts'] },
+          {
+            previousSha: oldBase, commitSha: newBase, untrackedFiles: ['src/genotype-store.ts'],
+            untrackedDigests: git.untrackedDigestSnapshot(paused.worktreePath as string, ['src/genotype-store.ts']),
+          },
           `implementation-base-request:${paused.id}:${newBase}`);
         await git.advanceImplementationBase(paused.worktreePath as string, oldBase, newBase, ['src/genotype-store.ts']);
+        if (scenario === 'byte-drift-crash') {
+          // Same file name, different bytes: reconciliation must fail closed on the digest drift.
+          writeFileSync(path.join(paused.worktreePath as string, 'src', 'genotype-store.ts'), 'export const store = 2;\n');
+        }
+      }
+      if (scenario === 'stale-pending-request') {
+        // Crash window: the durable request landed but the merge did not, and
+        // the candidate bytes changed before the retry. The idempotent
+        // request event keeps the stale digests, so the retry must fail closed
+        // instead of merging over different bytes.
+        store.recordEvent('task.implementation_base_advance_requested', paused.id,
+          {
+            previousSha: oldBase, commitSha: newBase, untrackedFiles: ['src/genotype-store.ts'],
+            untrackedDigests: git.untrackedDigestSnapshot(paused.worktreePath as string, ['src/genotype-store.ts']),
+          },
+          `implementation-base-request:${paused.id}:${newBase}`);
+        writeFileSync(path.join(paused.worktreePath as string, 'src', 'genotype-store.ts'), 'export const store = 2;\n');
+      }
+      if (scenario === 'snapshot-drift') {
+        // Byte drift between the durable request snapshot and the completed
+        // merge must fail closed even though the merge's own before/after
+        // digest checks passed. The second supervisor snapshot call is the
+        // post-merge verification; drift the bytes right before it runs.
+        const realSnapshot = git.untrackedDigestSnapshot.bind(git);
+        let snapshotCalls = 0;
+        git.untrackedDigestSnapshot = (worktree: string, files: string[]) => {
+          const snapshot = realSnapshot(worktree, files);
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            writeFileSync(path.join(worktree, 'src', 'genotype-store.ts'), 'export const store = 2;\n');
+            return realSnapshot(worktree, files);
+          }
+          return snapshot;
+        };
       }
 
       await supervisor.tick();
@@ -1343,6 +1380,19 @@ describe('production supervisor trace', () => {
         expect(candidate.exitCode, candidate.stderr).toBe(0);
         expect(candidate.stdout).toContain('export const store = 1');
         expect(execute).toHaveBeenCalledTimes(2);
+      } else if (scenario === 'byte-drift-crash') {
+        expect(requested).toHaveLength(1);
+        expect(completed).toHaveLength(0);
+        expect(finished).toMatchObject({ state: 'ready', attempts: 1, baseSha: oldBase });
+        expect(finished.lastError).toContain('candidate byte drift');
+        expect(execute).toHaveBeenCalledTimes(1);
+      } else if (scenario === 'stale-pending-request' || scenario === 'snapshot-drift') {
+        expect(requested).toHaveLength(1);
+        expect(completed).toHaveLength(0);
+        expect(finished).toMatchObject({ state: 'ready', attempts: 1 });
+        expect(finished.baseSha).toBe(oldBase);
+        expect(finished.lastError).toContain('candidate byte drift');
+        expect(execute).toHaveBeenCalledTimes(1);
       } else {
         expect(requested).toHaveLength(0);
         expect(completed).toHaveLength(0);

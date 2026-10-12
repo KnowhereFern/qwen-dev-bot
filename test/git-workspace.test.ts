@@ -242,6 +242,114 @@ describe('real Git worktree delivery', () => {
     await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
   });
 
+  it('advances a read-only base without running repository hooks and verifies the post-merge state', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    const git = new GitWorkspace(repo, makeTmp('git-readonly-advance-state'), config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+
+    // A hostile repository hook must not run during the read-only fast-forward.
+    mkdirSync(path.join(repo, '.git', 'hooks'), { recursive: true });
+    const hook = path.join(repo, '.git', 'hooks', 'post-merge');
+    writeFileSync(
+      hook,
+      '#!/bin/sh\nprintf "hook ran\\n" > hook-ran.txt\nprintf "hook touched\\n" >> README.md\n',
+    );
+    chmodSync(hook, 0o755);
+
+    writeFileSync(path.join(repo, 'remote-evidence.txt'), 'merged evidence\n');
+    await command(['add', '.'], repo);
+    await command(['commit', '-m', 'remote evidence update'], repo);
+    const target = await command(['rev-parse', 'HEAD'], repo);
+
+    await git.advanceReadOnlyBase(worktree.path, task.baseSha, target);
+
+    expect(await git.headSha(worktree.path)).toBe(target);
+    expect(await git.changedFiles(worktree.path)).toEqual([]);
+    expect(existsSync(path.join(worktree.path, 'hook-ran.txt'))).toBe(false);
+    expect(readFileSync(path.join(worktree.path, 'README.md'), 'utf8')).not.toContain('hook touched');
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
+  });
+
+  it('fails closed when the worktree is dirty after a read-only base advance merge', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    class DirtyAfterMergeWorkspace extends GitWorkspace {
+      private changedCalls = 0;
+
+      override async changedFiles(worktree: string): Promise<string[]> {
+        this.changedCalls += 1;
+        // First call is the pre-merge guard; second is post-merge verification.
+        return this.changedCalls >= 2 ? ['unexpected-drift.txt'] : super.changedFiles(worktree);
+      }
+    }
+    const git = new DirtyAfterMergeWorkspace(repo, makeTmp('git-readonly-drift-state'), config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+
+    writeFileSync(path.join(repo, 'remote-evidence.txt'), 'merged evidence\n');
+    await command(['add', '.'], repo);
+    await command(['commit', '-m', 'remote evidence update'], repo);
+    const target = await command(['rev-parse', 'HEAD'], repo);
+
+    await expect(
+      git.advanceReadOnlyBase(worktree.path, task.baseSha, target),
+    ).rejects.toThrow('worktree changed during the merge');
+    expect(await git.headSha(worktree.path)).toBe(target);
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
+  });
+
+  it('fails closed when the disabled-hooks path blocks a read-only base advance', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    const state = makeTmp('git-readonly-hooks-state');
+    const git = new GitWorkspace(repo, state, config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+
+    writeFileSync(path.join(repo, 'remote-evidence.txt'), 'merged evidence\n');
+    await command(['add', '.'], repo);
+    await command(['commit', '-m', 'remote evidence update'], repo);
+    const target = await command(['rev-parse', 'HEAD'], repo);
+
+    const disabledHooks = path.join(state, 'disabled-hooks');
+    symlinkSync(path.join(state, 'nonexistent-hooks-target'), disabledHooks);
+    await expect(
+      git.advanceReadOnlyBase(worktree.path, task.baseSha, target),
+    ).rejects.toThrow('already exists');
+    expect(await git.headSha(worktree.path)).toBe(task.baseSha);
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
+  });
+
+  it('exposes an untracked digest snapshot that rejects non-file candidates', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    const git = new GitWorkspace(repo, makeTmp('git-digest-snapshot-state'), config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+    writeFileSync(path.join(worktree.path, 'candidate.ts'), 'export const original = 1;\n');
+    symlinkSync('candidate.ts', path.join(worktree.path, 'link.ts'));
+    mkdirSync(path.join(worktree.path, 'candidate-dir'));
+
+    const snapshot = git.untrackedDigestSnapshot(worktree.path, ['link.ts', 'candidate.ts']);
+    expect(Object.keys(snapshot).sort()).toEqual(['candidate.ts', 'link.ts']);
+    expect(snapshot['link.ts']).toBe('symlink:candidate.ts');
+    expect(snapshot['candidate.ts']).toMatch(/^[0-9a-f]{64}$/);
+    expect(() => git.untrackedDigestSnapshot(worktree.path, ['candidate-dir'])).toThrow(
+      'neither a regular file nor a symlink',
+    );
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
+  });
+
   it('removes a dirty disposable verification worktree without weakening implementation cleanup', async () => {
     const { repo } = await createGitFixture();
     const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');

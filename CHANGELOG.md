@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.70] - 2026-10-12
+
+- Bind in-flight candidate recovery to recorded file bytes, suppress repository hooks during read-only base advances, and release daemon poll listeners after each wait.
+
 ## [1.0.0-rc.69] - 2026-10-12
 
 - Safely advance paused implementation tasks across exact controller-managed asset updates, preserving candidate bytes and recovery history.

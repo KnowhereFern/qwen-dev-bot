@@ -198,12 +198,36 @@ export class GitWorkspace {
       createHash('sha256').update(expected.toString('utf8'), 'utf8').digest('hex');
   }
 
+  /**
+   * Fast-forward a read-only evidence worktree to the current base. Hooks are
+   * disabled through the same verified-nonexistent path used by
+   * advanceImplementationBase, and the post-merge state is verified: HEAD must
+   * land exactly on currentSha and the worktree must still be clean. This also
+   * covers the crash-recovery call path, where a durable request already
+   * exists and only the fast-forward is being replayed.
+   */
   async advanceReadOnlyBase(worktree: string, previousSha: string, currentSha: string): Promise<void> {
     this.assertOwnedPath(worktree);
     if (await this.headSha(worktree) !== previousSha || (await this.changedFiles(worktree)).length > 0) {
       throw new Error('Refusing to advance read-only evidence over a changed worktree');
     }
-    await this.git(['merge', '--ff-only', currentSha], worktree);
+    const disabledHooksPath = path.join(this.stateRoot, 'disabled-hooks');
+    // lstat (not existsSync) so a dangling symlink at the path also fails
+    // closed: git would still resolve core.hooksPath through it.
+    if (lstatSync(disabledHooksPath, { throwIfNoEntry: false }) !== undefined) {
+      throw new Error(
+        `Refusing read-only base advance: expected-absent hooks path ${disabledHooksPath} already exists`,
+      );
+    }
+    await this.git(['-c', `core.hooksPath=${disabledHooksPath}`, 'merge', '--ff-only', currentSha], worktree);
+    const mergedHead = await this.headSha(worktree);
+    if (mergedHead !== currentSha) {
+      throw new Error(`Read-only base advance verification failed: HEAD is ${mergedHead}, expected ${currentSha}`);
+    }
+    const dirty = await this.changedFiles(worktree);
+    if (dirty.length > 0) {
+      throw new Error(`Read-only base advance verification failed: worktree changed during the merge: ${dirty.join(', ')}`);
+    }
   }
 
   async filesChangedBetween(worktree: string, baseSha: string, headSha: string): Promise<string[]> {
@@ -332,6 +356,16 @@ export class GitWorkspace {
       }
     }
     return digests;
+  }
+
+  /**
+   * Narrowly scoped public snapshot of the exact untracked candidate bytes
+   * (regular-file SHA-256 or symlink target), keyed by repository-relative
+   * path. Callers persist this in durable request evidence and fail closed if
+   * the reconciled bytes no longer match.
+   */
+  untrackedDigestSnapshot(worktree: string, files: string[]): Record<string, string> {
+    return Object.fromEntries(this.untrackedDigests(worktree, [...files].sort()));
   }
 
   private async statusEntries(worktree: string): Promise<Array<{ untracked: boolean; path: string }>> {
