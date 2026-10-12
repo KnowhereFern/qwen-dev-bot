@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.77] - 2026-10-12
+
+- Add opt-in, exact-commit intake for concrete non-blocking independent-review findings so verified deliveries can inform the guarded maintenance loop without manual product edits.
+
 ## [1.0.0-rc.76] - 2026-10-12
 
 - Harden final-candidate gate receipts against stale or future timestamps, unsafe receipt paths, and failed cleanup; use no-follow config writes and adversarial regression tests.

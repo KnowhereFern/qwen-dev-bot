@@ -169,6 +169,7 @@ export interface ProjectConfig {
     githubFeedback: boolean;
     ciFailures: boolean;
     stagingFailures: boolean;
+    reviewFindings: boolean;
     productMetrics: Array<{ name: string; url: string }>;
     pollIntervalMs: number;
   };
@@ -420,7 +421,7 @@ export type SignalStatus = 'observed' | 'normalized' | 'deduplicated' | 'relevan
 export interface EvolutionSignal {
   id: string;
   projectId: string;
-  source: 'github' | 'ci' | 'staging' | 'metric' | 'community';
+  source: 'github' | 'ci' | 'staging' | 'metric' | 'community' | 'review';
   sourceKey: string;
   contentHash: string;
   title: string;

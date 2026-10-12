@@ -120,6 +120,7 @@ export function defaultProjectConfig(root: string, name = path.basename(root), g
       githubFeedback: true,
       ciFailures: true,
       stagingFailures: true,
+      reviewFindings: false,
       productMetrics: [],
       pollIntervalMs: 6 * 60 * 60_000,
     },
@@ -258,8 +259,9 @@ export function loadProjectConfig(rootOrFile: string): ProjectConfig {
     },
     evolution: {
       ...defaults.evolution,
-      ...(parsed.configVersion === 1 ? { enabled: false } : {}),
+      ...(parsed.configVersion === 1 ? { enabled: false, reviewFindings: false } : {}),
       ...parsed.evolution,
+      reviewFindings: parsed.configVersion === 1 ? false : (parsed.evolution?.reviewFindings ?? defaults.evolution.reviewFindings),
       productMetrics: parsed.evolution?.productMetrics ?? defaults.evolution.productMetrics,
     },
     deployment: {
@@ -491,6 +493,7 @@ function validateProgramConfig(config: ProjectConfig, source: string, gateIds: S
     typeof config.evolution.githubFeedback !== 'boolean' ||
     typeof config.evolution.ciFailures !== 'boolean' ||
     typeof config.evolution.stagingFailures !== 'boolean' ||
+    typeof config.evolution.reviewFindings !== 'boolean' ||
     !isPositiveInteger(config.evolution.pollIntervalMs) ||
     !Array.isArray(config.evolution.productMetrics)
   ) {
