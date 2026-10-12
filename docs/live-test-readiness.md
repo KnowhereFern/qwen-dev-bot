@@ -17,6 +17,8 @@ The honest status is:
 
 A normal user provides one objective file, runs guided setup, reviews the repository assessment and proposed program, and approves it. The harness handles bounded execution, reassessment, staging verification, repairs, and in-scope maintenance after that.
 
+The initial operator interface is `fern-harness interactive [PROJECT]` (or no arguments in an interactive terminal). It covers project setup and existing GitHub sign-in, provider/credential connection, explicit live verification, current revision review and typed approval, initial redrafting, readiness, evidence/logs/controller history, and separately confirmed execution startup/recovery. Commands provide elapsed-time activity animation and streamed feedback; the read-only live monitor refreshes durable work and separately checks worker service liveness on macOS/Linux. Broader interaction design and dedicated approval notifications remain for a later review. Neither a running service nor task counts prove objective delivery.
+
 Live planning exposed coverage omissions and unsupported completion claims. The controller now derives fixed coverage actions, downgrades source-only claims to unverified, checks the mandatory action matrix, and permits at most two synthesis corrections. Passing this structural validation does not replace review of behavior coverage, dependency timing, and authority before approval.
 
 ## What a 16-day run actually is
@@ -127,7 +129,7 @@ It does **not** keep the worker alive. Long-run continuity comes from the servic
 | Dependency and browser preflight | Ready | Setup/bootstrap and doctor check package managers, dependencies, configured gate executables, and declared Playwright/Cypress runtimes. |
 | Persistent worker | Implemented, not installed here | macOS uses `RunAtLoad` plus `KeepAlive`; Linux uses `Restart=always`. This Mac currently has no worker service. |
 | Current Qwen executable | Ready | `PATH` resolves Qwen Code version `0.23.3`. |
-| Current harness installation | Ready via immutable CLI | The immutable absolute CLI and extension are installed. `qwen-harness` is not on `PATH`; this is a convenience warning, not an execution blocker. |
+| Current harness installation | Ready via immutable CLI | The immutable absolute CLI and extension are installed. `fern-harness` is not on `PATH`; this is a convenience warning, not an execution blocker. |
 | Registered target | Verified | Festival SOS is registered and clean at the recorded starting revision. Its generated program remains review-only until approved. |
 | Configured model credential | Verified for planning | The Token Plan route and credential pass doctor, and live Qwen3.8-Max repository assessment/program synthesis has completed without copying the secret into tracked configuration. |
 | Always-on host | Not established | A sleeping or powered-off Mac does not execute work. A 16-day run needs an always-on host and network. |
@@ -212,7 +214,7 @@ node bin/qwen-harness.mjs status /absolute/path/to/demo-project
 node bin/qwen-harness.mjs logs /absolute/path/to/demo-project --lines 100
 ```
 
-Once setup has linked `qwen-harness`, the shorter commands work without `node bin/qwen-harness.mjs`.
+Once setup has linked `fern-harness`, the shorter commands work without `node bin/qwen-harness.mjs`.
 
 ## Definition of a successful autonomous proof
 

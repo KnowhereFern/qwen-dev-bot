@@ -1,7 +1,7 @@
 import { loadProjectConfig } from './core/config.js';
 import { createProductionHarness } from './factory.js';
 import { Logger } from './logger.js';
-import { ProjectRegistry } from './registry.js';
+import { ProjectRegistry, type ProjectRegistration } from './registry.js';
 
 export async function runDaemon(options: {
   once?: boolean;
@@ -17,6 +17,10 @@ export async function runDaemon(options: {
     let shortestPoll = 30_000;
     for (const registration of projects) {
       if (options.signal?.aborted) return;
+      if (isStaleRegistration(registry, registration)) {
+        logger.info('skipping stale project registration', { projectId: registration.id });
+        continue;
+      }
       let harness;
       try {
         const config = loadProjectConfig(registration.configPath);
@@ -47,13 +51,32 @@ export async function runDaemon(options: {
   } while (!options.signal?.aborted);
 }
 
-function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+function isStaleRegistration(registry: ProjectRegistry, registration: ProjectRegistration): boolean {
+  const current = registry.list().find((project) => project.id === registration.id);
+  if (!current || !current.enabled) return true;
+  return current.updatedAt !== registration.updatedAt ||
+    current.root !== registration.root ||
+    current.configPath !== registration.configPath;
+}
+
+/**
+ * Resolves after ms, or earlier if the signal aborts. An already-aborted
+ * signal resolves immediately: its abort event has already fired and would
+ * never trigger the listener. The abort listener is removed on normal timer
+ * completion so repeated poll iterations do not accumulate listeners on a
+ * long-lived signal.
+ */
+export function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
     const onAbort = (): void => {
       clearTimeout(timer);
       resolve();
     };
+    const timer = setTimeout((): void => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
     signal?.addEventListener('abort', onAbort, { once: true });
   });
 }

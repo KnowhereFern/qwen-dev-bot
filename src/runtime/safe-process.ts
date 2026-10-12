@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import path from 'node:path';
 import type { ProcessReceipt } from '../core/types.js';
 
@@ -28,6 +29,8 @@ export async function runProcess(options: ProcessOptions): Promise<ProcessReceip
     let timedOut = false;
     let aborted = false;
     let settled = false;
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
 
     const child = spawn(options.command, args, {
       cwd,
@@ -49,11 +52,11 @@ export async function runProcess(options: ProcessOptions): Promise<ProcessReceip
 
     child.stdout.on('data', (chunk: Buffer<ArrayBufferLike>) => {
       stdout = append(stdout, chunk);
-      options.onStdout?.(chunk.toString('utf8'));
+      options.onStdout?.(stdoutDecoder.write(chunk));
     });
     child.stderr.on('data', (chunk: Buffer<ArrayBufferLike>) => {
       stderr = append(stderr, chunk);
-      options.onStderr?.(chunk.toString('utf8'));
+      options.onStderr?.(stderrDecoder.write(chunk));
     });
     child.stdin.on('error', (error: NodeJS.ErrnoException) => {
       // A short-lived command can close stdin before the supplied confirmation
@@ -114,6 +117,10 @@ export async function runProcess(options: ProcessOptions): Promise<ProcessReceip
       if (timeout) clearTimeout(timeout);
       options.signal?.removeEventListener('abort', onAbort);
       if (spawnError) stderr = append(stderr, Buffer.from(spawnError.message));
+      const stdoutTail = stdoutDecoder.end();
+      const stderrTail = stderrDecoder.end();
+      if (stdoutTail) options.onStdout?.(stdoutTail);
+      if (stderrTail) options.onStderr?.(stderrTail);
       resolve({
         command: options.command,
         args: [...args],

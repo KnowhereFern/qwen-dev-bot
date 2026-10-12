@@ -42,6 +42,15 @@ describe('project configuration invariants', () => {
     expect(validateProjectConfig(config)).toBe(config);
   });
 
+  it('keeps scorecard review-finding ingestion opt-in and off by default', () => {
+    const config = defaultProjectConfig(makeTmp('config-review'), 'fixture', 'owner/fixture');
+    expect(config.evolution.reviewFindings).toBe(false);
+    config.evolution.reviewFindings = true;
+    expect(validateProjectConfig(config)).toBe(config);
+    config.evolution.reviewFindings = 'yes' as unknown as boolean;
+    expect(() => validateProjectConfig(config)).toThrow('invalid evolution settings');
+  });
+
   it('rejects multiple mutating workers and duplicate deterministic gates', () => {
     const multipleWriters = defaultProjectConfig(makeTmp('config-writers'), 'fixture', 'owner/fixture');
     multipleWriters.worker.maxConcurrentMutations = 2;
