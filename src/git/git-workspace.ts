@@ -146,6 +146,25 @@ export class GitWorkspace {
     return receipt.exitCode === 0;
   }
 
+  /** First-parent commits after ancestorSha through descendantSha, oldest first.
+   * Returns no candidates if ancestorSha is not on that exact first-parent chain.
+   */
+  async firstParentRange(worktree: string, ancestorSha: string, descendantSha: string): Promise<string[]> {
+    const receipt = await this.git(
+      ['rev-list', '--first-parent', '--reverse', '--parents', `${ancestorSha}..${descendantSha}`],
+      worktree,
+    );
+    const commits: string[] = [];
+    let expectedParent = ancestorSha;
+    for (const line of receipt.stdout.trim().split('\n').filter(Boolean)) {
+      const [commit, firstParent] = line.trim().split(/\s+/);
+      if (!commit || firstParent !== expectedParent) return [];
+      commits.push(commit);
+      expectedParent = commit;
+    }
+    return expectedParent === descendantSha ? commits : [];
+  }
+
   async trackedChanges(worktree: string): Promise<string[]> {
     const entries = await this.statusEntries(worktree);
     return entries.filter((entry) => !entry.untracked).map((entry) => entry.path);

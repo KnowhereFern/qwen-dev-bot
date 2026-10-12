@@ -794,7 +794,10 @@ export class HarnessSupervisor {
     // Crash recovery: the merge already landed but the task patch did not.
     const reconciling = requestedTarget !== null && head === requestedTarget && head !== savedBase;
     if (!reconciling && head !== savedBase) return null;
-    const target = reconciling ? head : remoteBase;
+    const target = reconciling
+      ? head
+      : await this.selectManagedAdvanceTarget(worktreePath, savedBase, remoteBase);
+    if (target === null) return null;
     if (!(await this.git.isAncestor(worktreePath, savedBase, target))) {
       if (reconciling) {
         throw new Error(`Durable implementation base advance for task ${task.id} is not descended from base ${savedBase}`);
@@ -993,6 +996,26 @@ export class HarnessSupervisor {
       }
     }
     return { ok: true };
+  }
+
+  /** Stop at the last safe first-parent prefix; never cross a project or
+   * authority change just because a later commit happens to restore its bytes.
+   */
+  private async selectManagedAdvanceTarget(
+    worktreePath: string,
+    savedBase: string,
+    remoteBase: string,
+  ): Promise<string | null> {
+    const chain = await this.git.firstParentRange(worktreePath, savedBase, remoteBase);
+    let target: string | null = null;
+    for (const commit of chain) {
+      const changed = await this.git.filesChangedBetween(worktreePath, savedBase, commit);
+      if (changed.length === 0 || changed.some((file) => !CONTROLLER_MANAGED_BASE_ASSETS.has(file))) break;
+      const templates = await this.verifyManagedAssetsMatchTemplates(worktreePath, commit);
+      if (!templates.ok) break;
+      target = commit;
+    }
+    return target;
   }
 
   private async reconcilePending(signal?: AbortSignal): Promise<TaskRecord[]> {

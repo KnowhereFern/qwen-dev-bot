@@ -1497,4 +1497,81 @@ describe('production supervisor trace', () => {
       store.close();
     }, 60_000,
   );
+
+  it.each(['managed-then-config', 'config-before-managed'] as const)(
+    'advances only across a verified first-parent managed-asset prefix: %s', async (order) => {
+      const { repo } = await createGitFixture();
+      const gitCmd = async (args: string[]): Promise<string> => {
+        const result = await runProcess({ command: 'git', args, cwd: repo, timeoutMs: 20_000 });
+        expect(result.exitCode, result.stderr).toBe(0);
+        return result.stdout.trim();
+      };
+      const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+      config.intake.trustedAuthors.push('bot');
+      config.worker.autoMerge = true;
+      config.gates = [{ id: 'unit', kind: 'unit', command: process.execPath, args: ['check.mjs'], required: true, timeoutMs: 10_000 }];
+      const state = makeTmp(`impl-prefix-${order}-state`);
+      const store = new PersistentTaskStore(`impl-prefix-${order}`, state);
+      try {
+        const github = new MockGitHub();
+        const git = new GitWorkspace(repo, state, config);
+        const qwen = new PausedThenCompleteQwenExecutor();
+        const execute = vi.spyOn(qwen, 'execute');
+        const supervisor = new HarnessSupervisor(
+          config, store, github, git, qwen, new MockNormalizer(), new GateRunner(),
+          new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+          silentLogger, `worker-impl-prefix-${order}`,
+        );
+        await supervisor.tick();
+        const paused = store.findByIssue(2)!;
+        expect(paused).toMatchObject({ state: 'ready', attempts: 0, commitSha: null });
+        const oldBase = paused.baseSha as string;
+        const candidatePath = path.join(paused.worktreePath as string, 'src', 'genotype-store.ts');
+        const candidateBytes = readFileSync(candidatePath);
+        const commitManaged = async (): Promise<string> => {
+          for (const asset of MANAGED_ASSET_PATHS) {
+            mkdirSync(path.dirname(path.join(repo, asset)), { recursive: true });
+            writeFileSync(path.join(repo, asset), readFileSync(path.resolve('template', asset)));
+          }
+          await gitCmd(['add', '.']);
+          await gitCmd(['commit', '-m', 'controller-managed harness asset update']);
+          await gitCmd(['push', 'origin', 'main']);
+          return gitCmd(['rev-parse', 'HEAD']);
+        };
+        const commitConfig = async (): Promise<void> => {
+          mkdirSync(path.join(repo, '.qwen-harness'), { recursive: true });
+          writeFileSync(path.join(repo, '.qwen-harness', 'project.yml'), '{"version":2,"reviewFindings":true}\n');
+          await gitCmd(['add', '.']);
+          await gitCmd(['commit', '-m', 'project-specific config decision']);
+          await gitCmd(['push', 'origin', 'main']);
+        };
+        if (order === 'config-before-managed') await commitConfig();
+        const managedCommit = await commitManaged();
+        if (order === 'managed-then-config') await commitConfig();
+        const remoteBase = await gitCmd(['rev-parse', 'HEAD']);
+
+        expect(await git.firstParentRange(paused.worktreePath as string, oldBase, remoteBase)).toHaveLength(2);
+        await supervisor.tick();
+        const finished = store.findByIssue(2)!;
+        const requested = store.listEvents('task.implementation_base_advance_requested');
+        const completed = store.listEvents('task.implementation_base_advance_completed');
+        expect(finished).toMatchObject({ state: 'done', attempts: 0 });
+        expect(execute).toHaveBeenCalledTimes(2);
+        expect(await gitCmd(['show', `${finished.commitSha}:src/genotype-store.ts`])).toBe(candidateBytes.toString('utf8').trim());
+        if (order === 'managed-then-config') {
+          expect(requested).toHaveLength(1);
+          expect(completed).toHaveLength(1);
+          expect(requested[0]!.payload).toMatchObject({ previousSha: oldBase, commitSha: managedCommit });
+          expect(finished.baseSha).toBe(managedCommit);
+          expect(await git.blobMatches(repo, finished.commitSha as string, MANAGED_ASSET_PATHS[1], readFileSync(path.resolve('template', MANAGED_ASSET_PATHS[1])))).toBe(true);
+        } else {
+          expect(requested).toHaveLength(0);
+          expect(completed).toHaveLength(0);
+          expect(finished.baseSha).toBe(oldBase);
+        }
+      } finally {
+        store.close();
+      }
+    }, 60_000,
+  );
 });

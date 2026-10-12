@@ -16,6 +16,27 @@ describe('real Git worktree delivery', () => {
     expect(githubSlugFromRemote('https://gitlab.com/owner/repo.git')).toBeNull();
   });
 
+  it('enumerates only an exact first-parent range across a merge', async () => {
+    const { repo } = await createGitFixture();
+    const git = new GitWorkspace(repo, makeTmp('git-first-parent-state'), defaultProjectConfig(repo, 'fixture', 'owner/fixture'));
+    const base = await command(['rev-parse', 'HEAD'], repo);
+    writeFileSync(path.join(repo, 'main-change.txt'), 'main\n');
+    await command(['add', 'main-change.txt'], repo);
+    await command(['commit', '-m', 'main change'], repo);
+    const mainCommit = await command(['rev-parse', 'HEAD'], repo);
+    await command(['checkout', '-b', 'side', base], repo);
+    writeFileSync(path.join(repo, 'side-change.txt'), 'side\n');
+    await command(['add', 'side-change.txt'], repo);
+    await command(['commit', '-m', 'side change'], repo);
+    const sideCommit = await command(['rev-parse', 'HEAD'], repo);
+    await command(['checkout', 'main'], repo);
+    await command(['merge', '--no-ff', 'side', '-m', 'merge side'], repo);
+    const mergeCommit = await command(['rev-parse', 'HEAD'], repo);
+
+    expect(await git.firstParentRange(repo, base, mergeCommit)).toEqual([mainCommit, mergeCommit]);
+    expect(await git.firstParentRange(repo, sideCommit, mergeCommit)).toEqual([]);
+  });
+
   it('creates an isolated branch, commits, pushes, and verifies the exact remote head', async () => {
     const { repo, remote } = await createGitFixture();
     const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
