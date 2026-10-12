@@ -125,6 +125,52 @@ describe('Qwen execution session isolation', () => {
     expect(stoppedTask).toEqual(before);
   });
 
+  it('directs a repair of a task-owned worktree with prior counters to focused inspection and executionFocus.nextAction', async () => {
+    const repairTask: TaskRecord = {
+      ...task, attempts: 1, continuations: 8,
+      worktreePath: '/tmp/project/worktrees/task-212',
+      qwenAutomaticStop: null, qwenSessionId: 'prior-session', qwenWorkflowRunId: 'prior-workflow',
+    };
+    await execute(['Required gate check failed'], repairTask);
+    const args = vi.mocked(runProcess).mock.calls[0]![0].args!;
+    expect(args).not.toContain('--resume');
+    const prompt = args[args.indexOf('--prompt') + 1]!;
+    expect(prompt).toContain('new bounded repair attempt in a fresh session');
+    expect(prompt).toContain('prior attempts or continuations');
+    expect(prompt).toContain('at most focused inspection of the existing candidate and the gate receipt');
+    expect(prompt).toMatch(/Do not repeat broad repository reconnaissance/);
+    expect(prompt).toContain('executionFocus');
+    expect(prompt).toContain('nextAction');
+    expect(prompt).toContain('then immediately invoke the saved workflow');
+    expect(prompt).toContain('unchanged required gates and independent review');
+    expect(prompt).toContain('single-writer rule');
+    expect(prompt).toContain('grants no new authority');
+    expect(prompt).toContain('Required gate check failed');
+    expect(prompt).not.toContain('automatic budget continuation');
+    expect(prompt).toContain('fresh workflow without resumeFromRunId');
+  });
+
+  it('does not assert an existing candidate from counters alone when worktreePath is null', async () => {
+    const repairTask: TaskRecord = { ...task, attempts: 1, continuations: 8, worktreePath: null };
+    await execute(['Required gate check failed'], repairTask);
+    const args = vi.mocked(runProcess).mock.calls[0]![0].args!;
+    const prompt = args[args.indexOf('--prompt') + 1]!;
+    expect(prompt).toContain('new bounded repair attempt in a fresh session');
+    expect(prompt).not.toContain('prior attempts or continuations');
+    expect(prompt).not.toContain('executionFocus');
+    expect(prompt).not.toContain('at most focused inspection');
+  });
+
+  it('keeps the first run on full reconnaissance without focused-repair wording', async () => {
+    const firstRunTask: TaskRecord = { ...task, attempts: 1, continuations: 0, worktreePath: '/tmp/project/worktrees/task-212' };
+    await execute([], firstRunTask);
+    const args = vi.mocked(runProcess).mock.calls[0]![0].args!;
+    const prompt = args[args.indexOf('--prompt') + 1]!;
+    expect(prompt).not.toContain('executionFocus');
+    expect(prompt).not.toContain('at most focused inspection');
+    expect(prompt).not.toContain('prior attempts or continuations');
+  });
+
   it.each([
     { sessionId: 'other-session', workflowRunId: 'prior-workflow', kind: 'budget-limit' },
     { sessionId: 'prior-session', workflowRunId: 'other-workflow', kind: 'budget-limit' },

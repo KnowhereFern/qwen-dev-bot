@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.72] - 2026-10-12
+
+- Focus repair sessions with an existing task worktree on the candidate and verifier feedback before immediately invoking the saved workflow.
+
 ## [1.0.0-rc.71] - 2026-10-12
 
 - Send focused task continuations directly to the sole implementer, avoiding repeated broad reconnaissance while retaining gates and independent review.
