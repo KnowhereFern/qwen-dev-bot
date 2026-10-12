@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import type { CommunityCollector, CommunityScanResult } from './community/collector.js';
 import type { GateResult, HarnessEvent, ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
 import { redactText } from './core/ledger.js';
@@ -21,15 +22,15 @@ import { prepareProjectCheckout } from './runtime/checkout-preflight.js';
 const RECONCILIATION_STATES = ['pr_open', 'waiting_ci', 'merge_ready', 'post_merge'] as const;
 
 /**
- * The only remote-main changes the controller itself may land under an in-flight
- * task worktree. A base advance is permitted when the saved-base..target diff
- * touches exactly (and only) these managed harness assets.
+ * Controller-owned assets that may advance beneath an in-flight task. A single
+ * separately verified, non-execution config opt-in is handled below.
  */
 const CONTROLLER_MANAGED_BASE_ASSETS = new Set([
   '.qwen/agents/harness-implementer.md',
   '.qwen/workflows/harness-implement.js',
   '.qwen-harness/scripts/run-gates.mjs',
 ]);
+const PROJECT_CONFIG_RELATIVE_PATH = '.qwen-harness/project.yml';
 
 type PortfolioPlanRecord = ReturnType<PersistentTaskStore['listPortfolioPlans']>[number];
 type PortfolioStoryRecord = PortfolioPlanRecord['stories'][number];
@@ -805,8 +806,7 @@ export class HarnessSupervisor {
       return null;
     }
     const changed = await this.git.filesChangedBetween(worktreePath, savedBase, target);
-    const managedOnly = changed.length > 0 && changed.every((file) => CONTROLLER_MANAGED_BASE_ASSETS.has(file));
-    if (!managedOnly) {
+    if (!(await this.isPermittedBaseDiff(worktreePath, savedBase, target, changed))) {
       if (reconciling) {
         throw new Error(`Durable implementation base advance for task ${task.id} includes non-managed changes: ${changed.join(', ')}`);
       }
@@ -998,8 +998,44 @@ export class HarnessSupervisor {
     return { ok: true };
   }
 
-  /** Stop at the last safe first-parent prefix; never cross a project or
-   * authority change just because a later commit happens to restore its bytes.
+  /** The only non-managed base change permitted during implementation is an
+   * opt-in to review-finding collection. No gate, model, authority, deployment,
+   * or other config field can change through this path. */
+  private async isPermittedBaseDiff(
+    worktreePath: string,
+    savedBase: string,
+    target: string,
+    changed: string[],
+  ): Promise<boolean> {
+    if (changed.length === 0) return false;
+    const nonManaged = changed.filter((file) => !CONTROLLER_MANAGED_BASE_ASSETS.has(file));
+    if (nonManaged.length === 0) return true;
+    if (nonManaged.length !== 1 || nonManaged[0] !== PROJECT_CONFIG_RELATIVE_PATH) return false;
+    const beforeText = await this.git.regularFileAtCommit(worktreePath, savedBase, PROJECT_CONFIG_RELATIVE_PATH);
+    const afterText = await this.git.regularFileAtCommit(worktreePath, target, PROJECT_CONFIG_RELATIVE_PATH);
+    if (beforeText === null || afterText === null) return false;
+    let before: unknown;
+    let after: unknown;
+    try {
+      before = JSON.parse(beforeText);
+      after = JSON.parse(afterText);
+    } catch {
+      return false;
+    }
+    if (!isJsonObject(before) || !isJsonObject(after) ||
+        !isJsonObject(before.evolution) || !isJsonObject(after.evolution)) return false;
+    const previous = before.evolution.reviewFindings;
+    if ((previous !== undefined && previous !== false) || after.evolution.reviewFindings !== true) return false;
+    const beforeComparable = { ...before, evolution: { ...before.evolution } };
+    const afterComparable = { ...after, evolution: { ...after.evolution } };
+    delete beforeComparable.evolution.reviewFindings;
+    delete afterComparable.evolution.reviewFindings;
+    return isDeepStrictEqual(beforeComparable, afterComparable);
+  }
+
+  /** Stop at the last safe first-parent prefix. A permitted config-only commit
+   * may be traversed while old managed assets remain, but the selected target
+   * must have every managed asset at immutable installed-template bytes.
    */
   private async selectManagedAdvanceTarget(
     worktreePath: string,
@@ -1008,12 +1044,23 @@ export class HarnessSupervisor {
   ): Promise<string | null> {
     const chain = await this.git.firstParentRange(worktreePath, savedBase, remoteBase);
     let target: string | null = null;
+    let previous = savedBase;
     for (const commit of chain) {
       const changed = await this.git.filesChangedBetween(worktreePath, savedBase, commit);
-      if (changed.length === 0 || changed.some((file) => !CONTROLLER_MANAGED_BASE_ASSETS.has(file))) break;
+      if (!(await this.isPermittedBaseDiff(worktreePath, savedBase, commit, changed))) break;
+      const stepChanged = await this.git.filesChangedBetween(worktreePath, previous, commit);
+      let unsafeManagedChange = false;
+      for (const file of stepChanged.filter((entry) => CONTROLLER_MANAGED_BASE_ASSETS.has(entry))) {
+        const template = controllerTemplateBytes(file);
+        if (template === null || !(await this.git.blobMatches(worktreePath, commit, file, template))) {
+          unsafeManagedChange = true;
+          break;
+        }
+      }
+      if (unsafeManagedChange) break;
       const templates = await this.verifyManagedAssetsMatchTemplates(worktreePath, commit);
-      if (!templates.ok) break;
-      target = commit;
+      if (templates.ok) target = commit;
+      previous = commit;
     }
     return target;
   }
@@ -1413,6 +1460,10 @@ function controllerTemplateBytes(relative: string): Buffer | null {
   } catch {
     return null;
   }
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

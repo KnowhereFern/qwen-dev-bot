@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.80] - 2026-10-12
+
+- Safely carry an in-flight implementation across a review-findings-only config opt-in followed by a controller-managed workflow update, preserving candidate bytes and restart recovery while rejecting other config changes.
+
 ## [1.0.0-rc.79] - 2026-10-12
 
 - Lead focused Qwen continuations with their concrete next action and a bounded-inspection instruction, without changing required gates or independent review.

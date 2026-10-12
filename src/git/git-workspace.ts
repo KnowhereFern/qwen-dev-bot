@@ -291,6 +291,15 @@ export class GitWorkspace {
       createHash('sha256').update(expected.toString('utf8'), 'utf8').digest('hex');
   }
 
+  /** Read a regular tracked UTF-8 file at an exact commit; reject symlinks and missing paths. */
+  async regularFileAtCommit(worktree: string, commitSha: string, file: string): Promise<string | null> {
+    const tree = await this.git(['ls-tree', commitSha, '--', file], worktree, false);
+    if (tree.exitCode !== 0 || !tree.stdout.startsWith('100644 blob ') ||
+        !tree.stdout.trimEnd().endsWith(`\t${file}`)) return null;
+    const blob = await this.git(['show', `${commitSha}:${file}`], worktree, false);
+    return blob.exitCode === 0 ? blob.stdout : null;
+  }
+
   /**
    * Fast-forward a read-only evidence worktree to the current base. Hooks are
    * disabled through the same verified-nonexistent path used by

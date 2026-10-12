@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
@@ -1564,6 +1564,99 @@ describe('production supervisor trace', () => {
           expect(requested[0]!.payload).toMatchObject({ previousSha: oldBase, commitSha: managedCommit });
           expect(finished.baseSha).toBe(managedCommit);
           expect(await git.blobMatches(repo, finished.commitSha as string, MANAGED_ASSET_PATHS[1], readFileSync(path.resolve('template', MANAGED_ASSET_PATHS[1])))).toBe(true);
+        } else {
+          expect(requested).toHaveLength(0);
+          expect(completed).toHaveLength(0);
+          expect(finished.baseSha).toBe(oldBase);
+        }
+      } finally {
+        store.close();
+      }
+    }, 60_000,
+  );
+
+  it.each(['review-only', 'review-absent', 'review-crash', 'other-config-field', 'malformed-config', 'symlink-config'] as const)(
+    'crosses a review-findings opt-in before a managed workflow update only when safe: %s', async (scenario) => {
+      const { repo } = await createGitFixture();
+      const gitCmd = async (args: string[]): Promise<string> => {
+        const result = await runProcess({ command: 'git', args, cwd: repo, timeoutMs: 20_000 });
+        expect(result.exitCode, result.stderr).toBe(0);
+        return result.stdout.trim();
+      };
+      const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+      config.intake.trustedAuthors.push('bot');
+      config.worker.autoMerge = true;
+      config.gates = [{ id: 'unit', kind: 'unit', command: process.execPath, args: ['check.mjs'], required: true, timeoutMs: 10_000 }];
+      const configPath = path.join(repo, '.qwen-harness', 'project.yml');
+      mkdirSync(path.dirname(configPath), { recursive: true });
+      const baseConfig = { evolution: { reviewFindings: false, githubFeedback: true }, worker: { maxContinuations: 8 } };
+      const savedConfig = scenario === 'review-absent'
+        ? { evolution: { githubFeedback: true }, worker: { maxContinuations: 8 } }
+        : baseConfig;
+      writeFileSync(configPath, `${JSON.stringify(savedConfig)}\n`);
+      await gitCmd(['add', '.qwen-harness/project.yml']);
+      await gitCmd(['commit', '-m', 'baseline project config']);
+      await gitCmd(['push', 'origin', 'main']);
+      const state = makeTmp(`impl-review-carry-${scenario}-state`);
+      const store = new PersistentTaskStore(`impl-review-carry-${scenario}`, state);
+      try {
+        const git = new GitWorkspace(repo, state, config);
+        const qwen = new PausedThenCompleteQwenExecutor();
+        const supervisor = new HarnessSupervisor(
+          config, store, new MockGitHub(), git, qwen, new MockNormalizer(), new GateRunner(),
+          new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+          silentLogger, `worker-impl-review-carry-${scenario}`,
+        );
+        await supervisor.tick();
+        const paused = store.findByIssue(2)!;
+        expect(paused).toMatchObject({ state: 'ready', attempts: 0, commitSha: null });
+        const oldBase = paused.baseSha as string;
+        const candidatePath = path.join(paused.worktreePath as string, 'src', 'genotype-store.ts');
+        const candidateBytes = readFileSync(candidatePath);
+        const nextConfig = structuredClone(baseConfig);
+        nextConfig.evolution.reviewFindings = true;
+        if (scenario === 'other-config-field') nextConfig.worker.maxContinuations = 1;
+        if (scenario === 'symlink-config') {
+          rmSync(configPath);
+          symlinkSync('../README.md', configPath);
+        } else {
+          writeFileSync(configPath, scenario === 'malformed-config' ? '{bad json\n' : `${JSON.stringify(nextConfig)}\n`);
+        }
+        await gitCmd(['add', '.qwen-harness/project.yml']);
+        await gitCmd(['commit', '-m', 'review signal opt-in']);
+        await gitCmd(['push', 'origin', 'main']);
+        for (const asset of MANAGED_ASSET_PATHS) {
+          mkdirSync(path.dirname(path.join(repo, asset)), { recursive: true });
+          writeFileSync(path.join(repo, asset), readFileSync(path.resolve('template', asset)));
+        }
+        await gitCmd(['add', ...MANAGED_ASSET_PATHS]);
+        await gitCmd(['commit', '-m', 'managed workflow update']);
+        await gitCmd(['push', 'origin', 'main']);
+        const newBase = await gitCmd(['rev-parse', 'HEAD']);
+
+        if (scenario === 'review-crash') {
+          const realAdvance = git.advanceImplementationBase.bind(git);
+          git.advanceImplementationBase = async (...args) => {
+            await realAdvance(...args);
+            throw new Error('simulated process loss after the fast-forward');
+          };
+        }
+
+        await supervisor.tick();
+        if (scenario === 'review-crash') {
+          expect(store.listEvents('task.implementation_base_advance_requested')).toHaveLength(1);
+          expect(store.listEvents('task.implementation_base_advance_completed')).toHaveLength(0);
+          await supervisor.tick();
+        }
+        const finished = store.findByIssue(2)!;
+        expect(finished).toMatchObject({ state: 'done', attempts: scenario === 'review-crash' ? 1 : 0 });
+        expect(await gitCmd(['show', `${finished.commitSha}:src/genotype-store.ts`])).toBe(candidateBytes.toString('utf8').trim());
+        const requested = store.listEvents('task.implementation_base_advance_requested');
+        const completed = store.listEvents('task.implementation_base_advance_completed');
+        if (scenario === 'review-only' || scenario === 'review-absent' || scenario === 'review-crash') {
+          expect(requested).toHaveLength(1);
+          expect(completed).toHaveLength(1);
+          expect(finished.baseSha).toBe(newBase);
         } else {
           expect(requested).toHaveLength(0);
           expect(completed).toHaveLength(0);
