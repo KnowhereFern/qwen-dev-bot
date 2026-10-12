@@ -91,8 +91,21 @@ describe('Qwen extension packaging', () => {
     ]);
     expect(prompts[2]!.prompt).toContain('After your final code edit, execute node .qwen-harness/scripts/run-gates.mjs');
     expect(prompts[2]!.prompt).toContain('never author or edit the receipt yourself');
+    expect(prompts[2]!.prompt).toContain('Act on any existing candidate early');
+    expect(prompts[2]!.prompt).toContain('add the tests before another broad survey');
+    expect(prompts[2]!.prompt).toContain('run verification rather than re-planning it');
+    expect(prompts[2]!.prompt).toContain('Preserve every acceptance criterion');
     expect(prompts[3]!.prompt).toContain('A missing, incomplete, failed, stale, or wrong-worktree receipt is a blocker');
     expect(prompts[3]!.prompt).toContain('Do not edit files or attempt shell tools');
+  });
+
+  it('keeps the installed implementer focused on finishing saved work without weakening gates', () => {
+    const agent = readFileSync(path.join(root, 'template', '.qwen', 'agents', 'harness-implementer.md'), 'utf8');
+    expect(agent).toContain('Act on an existing candidate early');
+    expect(agent).toContain('instead of repeating broad read/grep surveys');
+    expect(agent).toContain('add the tests before another broad survey');
+    expect(agent).toContain('run the required gates rather than re-planning it');
+    expect(agent).toContain('Never weaken an acceptance criterion, gate, or review');
   });
 
   it('requires the supervisor-owned Goal to invoke the bounded saved workflow', () => {
