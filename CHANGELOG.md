@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.74] - 2026-10-12
+
+- Normalize JSON-string workflow arguments before choosing the focused continuation path, preserving initial-run reconnaissance and required review/gates.
+
 ## [1.0.0-rc.73] - 2026-10-12
 
 - Preserve byte-identical unstaged tracked candidate edits alongside untracked work when advancing a paused task across disjoint controller-managed assets, with durable crash recovery and fail-closed collision checks.

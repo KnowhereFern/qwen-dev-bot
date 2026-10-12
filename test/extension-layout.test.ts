@@ -129,11 +129,49 @@ describe('Qwen extension packaging', () => {
     expect(result.evidenceInstruction).toContain('machine-written gate receipt');
   });
 
+  it('parses JSON-string args from the parent tool call as a focused continuation', async () => {
+    const source = readFileSync(path.join(root, 'template', '.qwen', 'workflows', 'harness-implement.js'), 'utf8');
+    const prompts: Array<{ prompt: string; agentType: string }> = [];
+    const run = new Function('phase', 'parallel', 'agent', 'args', 'log', `return (async () => {\n${source}\n})();`);
+    const result = await run(
+      () => {},
+      (calls: Array<() => Promise<unknown>>) => { throw new Error('a stringified valid focus must skip reconnaissance'); },
+      async (prompt: string, options: { agentType: string }) => {
+        prompts.push({ prompt, agentType: options.agentType });
+        return options.agentType === 'harness-reviewer'
+          ? { passed: false, findings: ['missing receipt'] }
+          : { summary: 'focused step done', changedFiles: [], tests: [] };
+      },
+      JSON.stringify({ taskId: 'fixture', executionFocus: { nextAction: 'write missing acceptance tests' } }),
+      () => {},
+    );
+    expect(prompts.map(item => item.agentType)).toEqual(['harness-implementer', 'harness-reviewer']);
+    expect(prompts[0]!.prompt).toContain('focused continuation');
+    expect(prompts[0]!.prompt).toContain('Next action from the coordinator: write missing acceptance tests');
+    expect(prompts[0]!.prompt).toContain('After your final code edit, execute node .qwen-harness/scripts/run-gates.mjs');
+    expect(prompts[0]!.prompt).toContain('never author or edit the receipt yourself');
+    expect(prompts[0]!.prompt).toContain('"taskId":"fixture"');
+    expect(prompts[0]!.prompt).toContain('"nextAction":"write missing acceptance tests"');
+    expect(prompts[1]!.prompt).toContain('"taskId":"fixture"');
+    expect(prompts[1]!.prompt).toContain('A missing, incomplete, failed, stale, or wrong-worktree receipt is a blocker');
+    expect(result.gateReceiptPath).toBe('.qwen-harness/state/gate-receipt.json');
+    expect(result.evidenceInstruction).toContain('machine-written gate receipt');
+  });
+
   it('fails safe to full reconnaissance when executionFocus is missing or malformed', async () => {
     const source = readFileSync(path.join(root, 'template', '.qwen', 'workflows', 'harness-implement.js'), 'utf8');
     const run = new Function('phase', 'parallel', 'agent', 'args', 'log', `return (async () => {\n${source}\n})();`);
     const agentTypesByRun: Array<string[]> = [];
     for (const badArgs of [
+      '{"taskId":"fixture"',
+      'not json at all',
+      '"just a plain string"',
+      '42',
+      'null',
+      '["array","not","object"]',
+      JSON.stringify({ taskId: 'fixture', executionFocus: { nextAction: '   ' } }),
+      JSON.stringify({ taskId: 'fixture', executionFocus: 'write tests' }),
+      JSON.stringify({ taskId: 'fixture' }),
       { taskId: 'fixture' },
       { taskId: 'fixture', executionFocus: null },
       { taskId: 'fixture', executionFocus: 'write tests' },
@@ -156,7 +194,7 @@ describe('Qwen extension packaging', () => {
       );
       agentTypesByRun.push(agentTypes);
     }
-    expect(agentTypesByRun).toHaveLength(6);
+    expect(agentTypesByRun).toHaveLength(15);
     for (const agentTypes of agentTypesByRun) {
       expect(agentTypes).toEqual([
         'harness-researcher', 'harness-verifier', 'harness-implementer', 'harness-reviewer',
