@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.76] - 2026-10-12
+
+- Harden final-candidate gate receipts against stale or future timestamps, unsafe receipt paths, and failed cleanup; use no-follow config writes and adversarial regression tests.
+
 ## [1.0.0-rc.75] - 2026-10-12
 
 - Re-run immutable, controller-configured gates on the final local candidate before committing; reject stale receipts, failed checks, and input drift while retaining exact-commit verification.

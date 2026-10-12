@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
+import { RECEIPT_CLOCK_SKEW_MS, runLocalGateReverification, validateReceipt } from '../src/gates/local-reverify.js';
 import { PersistentTaskStore } from '../src/core/persistent-store.js';
 import type { RemoteIssue, RemotePullRequest, GitHubControl, CheckSummary } from '../src/github/control-plane.js';
 import type { TaskSpec } from '../src/core/types.js';
@@ -294,6 +295,231 @@ describe('deterministic local gate re-verification before commitCandidate', () =
       expect(harnessInCommit).toBe('');
     } finally {
       store.close();
+    }
+  }, 30_000);
+});
+
+describe('local gate re-verification fail-closed hardening (RC76)', () => {
+  function receiptFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    const now = Date.now();
+    return {
+      version: 1,
+      runId: 'run-fixture',
+      startedAt: new Date(now - 1_000).toISOString(),
+      finishedAt: new Date(now).toISOString(),
+      worktree: '/wt',
+      cwd: '/wt',
+      status: 'passed',
+      head: 'deadbeef',
+      configHash: 'c'.repeat(64),
+      contentHash: 'd'.repeat(64),
+      finalContentHash: 'd'.repeat(64),
+      gates: [{ id: 'unit', status: 'passed', applicable: true, required: true, exitCode: 0 }],
+      ...overrides,
+    };
+  }
+
+  function receiptExpectation(): { worktree: string; expectedHead: string; startedMs: number; nowMs: number; gates: ReturnType<typeof unitGate>[] } {
+    const now = Date.now();
+    return { worktree: '/wt', expectedHead: 'deadbeef', startedMs: now - 2_000, nowMs: now, gates: [unitGate()] };
+  }
+
+  it('rejects a receipt whose start timestamp is future-dated beyond clock skew', () => {
+    const future = Date.now() + RECEIPT_CLOCK_SKEW_MS + 60_000;
+    expect(() =>
+      validateReceipt(
+        receiptFixture({ startedAt: new Date(future).toISOString(), finishedAt: new Date(future + 1_000).toISOString() }),
+        receiptExpectation(),
+      ),
+    ).toThrow(/future-dated.*start timestamp/);
+  });
+
+  it('rejects a receipt whose completion timestamp is future-dated beyond clock skew', () => {
+    const future = Date.now() + RECEIPT_CLOCK_SKEW_MS + 60_000;
+    expect(() =>
+      validateReceipt(receiptFixture({ finishedAt: new Date(future).toISOString() }), receiptExpectation()),
+    ).toThrow(/future-dated.*completion timestamp/);
+  });
+
+  it('accepts an otherwise-valid receipt inside both freshness bounds', () => {
+    expect(validateReceipt(receiptFixture(), receiptExpectation())).toEqual({
+      runId: 'run-fixture',
+      head: 'deadbeef',
+      gateCount: 1,
+    });
+  });
+
+  it('fails closed without writing anything when .qwen-harness/state is a symlink', async () => {
+    const { repo } = await createGitFixture();
+    writeFileSync(path.join(repo, 'feature.txt'), 'implemented by Qwen\n');
+    mkdirSync(path.join(repo, '.qwen-harness'), { recursive: true });
+    // Adversary: point state at a directory outside the worktree so a
+    // naive runner/cleanup would write evidence through the link.
+    const outside = makeTmp('reverify-symlink-outside');
+    writeFileSync(path.join(outside, 'sentinel.txt'), 'do not touch\n');
+    symlinkSync(outside, path.join(repo, '.qwen-harness', 'state'));
+    const head = await git(['rev-parse', 'HEAD'], repo);
+
+    await expect(
+      runLocalGateReverification({ worktreePath: repo, expectedHead: head, gates: [unitGate()] }),
+    ).rejects.toThrow(/\.qwen-harness\/state in the candidate worktree is not a real directory/);
+
+    // Nothing was written or removed anywhere, including through the link.
+    expect(readdirSync(outside).sort()).toEqual(['sentinel.txt']);
+    expect(existsSync(path.join(repo, '.qwen-harness', 'project.yml'))).toBe(false);
+  }, 30_000);
+
+  it('fails closed when .qwen-harness/state is a regular file', async () => {
+    const { repo } = await createGitFixture();
+    writeFileSync(path.join(repo, 'feature.txt'), 'implemented by Qwen\n');
+    mkdirSync(path.join(repo, '.qwen-harness'), { recursive: true });
+    writeFileSync(path.join(repo, '.qwen-harness', 'state'), 'not a directory\n');
+    const head = await git(['rev-parse', 'HEAD'], repo);
+
+    await expect(
+      runLocalGateReverification({ worktreePath: repo, expectedHead: head, gates: [unitGate()] }),
+    ).rejects.toThrow(/\.qwen-harness\/state in the candidate worktree is not a real directory/);
+    expect(readFileSync(path.join(repo, '.qwen-harness', 'state'), 'utf8')).toBe('not a directory\n');
+  }, 30_000);
+
+  it('verifies restored project.yml bytes and receipt removal on the success path', async () => {
+    const { repo } = await createGitFixture();
+    writeFileSync(path.join(repo, 'feature.txt'), 'implemented by Qwen\n');
+    mkdirSync(path.join(repo, '.qwen-harness'), { recursive: true });
+    const configPath = path.join(repo, '.qwen-harness', 'project.yml');
+    writeFileSync(configPath, 'original: true\n');
+    const head = await git(['rev-parse', 'HEAD'], repo);
+
+    const result = await runLocalGateReverification({ worktreePath: repo, expectedHead: head, gates: [unitGate()] });
+    expect(result.gateCount).toBe(1);
+    // Restoration is verified, not assumed: the exact prior bytes are back...
+    expect(readFileSync(configPath, 'utf8')).toBe('original: true\n');
+    // ...and the machine receipt is gone.
+    expect(existsSync(path.join(repo, '.qwen-harness', 'state', 'gate-receipt.json'))).toBe(false);
+  }, 30_000);
+
+  it('fails closed when verified restoration of pre-existing project.yml bytes is impossible', async () => {
+    const { repo } = await createGitFixture();
+    // Keep .qwen-harness out of the runner content hash so the induced
+    // permission change only affects the cleanup restoration step.
+    writeFileSync(path.join(repo, '.gitignore'), '.qwen-harness/\n');
+    await git(['add', '.'], repo);
+    await git(['commit', '-m', 'ignore harness state for cleanup test'], repo);
+    writeFileSync(path.join(repo, 'feature.txt'), 'implemented by Qwen\n');
+    mkdirSync(path.join(repo, '.qwen-harness'), { recursive: true });
+    const configPath = path.join(repo, '.qwen-harness', 'project.yml');
+    writeFileSync(configPath, 'original: true\n');
+    const head = await git(['rev-parse', 'HEAD'], repo);
+
+    try {
+      await expect(
+        runLocalGateReverification({
+          worktreePath: repo,
+          expectedHead: head,
+          gates: [unitGate({ args: ['-e', "require('fs').chmodSync('.qwen-harness/project.yml', 0o444)"] })],
+        }),
+      ).rejects.toThrow(/bytes could not be restored/);
+      // The un-restorable mismatch is observable, not silent: the file no
+      // longer holds the original bytes the worktree arrived with.
+      expect(readFileSync(configPath, 'utf8')).not.toBe('original: true\n');
+      // The receipt step of cleanup still ran and removed the receipt.
+      expect(existsSync(path.join(repo, '.qwen-harness', 'state', 'gate-receipt.json'))).toBe(false);
+    } finally {
+      chmodSync(configPath, 0o644);
+    }
+  }, 30_000);
+
+  it('never writes through a project.yml symlink swapped in mid-run', async () => {
+    const { repo } = await createGitFixture();
+    writeFileSync(path.join(repo, 'feature.txt'), 'implemented by Qwen\n');
+    mkdirSync(path.join(repo, '.qwen-harness'), { recursive: true });
+    const configPath = path.join(repo, '.qwen-harness', 'project.yml');
+    writeFileSync(configPath, 'original: true\n');
+    const head = await git(['rev-parse', 'HEAD'], repo);
+    // Adversary: while the gate command runs, replace project.yml with a
+    // symlink pointing at a sensitive file outside the candidate worktree.
+    const outside = makeTmp('reverify-config-swap-outside');
+    const outsideConfig = path.join(outside, 'project.yml');
+    writeFileSync(outsideConfig, 'outside secret bytes\n');
+
+    try {
+      const rejection = await runLocalGateReverification({
+        worktreePath: repo,
+        expectedHead: head,
+        gates: [unitGate({ args: ['-e', [
+          "const fs = require('fs')",
+          "fs.rmSync('.qwen-harness/project.yml')",
+          "fs.symlinkSync(process.argv[1], '.qwen-harness/project.yml')",
+        ].join('; ')].concat(outsideConfig) })],
+      }).then(
+        () => {
+          throw new Error('expected runLocalGateReverification to reject');
+        },
+        (error: unknown) => error,
+      );
+      expect(rejection).toBeInstanceOf(Error);
+      // The run itself fails closed (the swap is input drift the immutable
+      // runner detects); what matters is that no cleanup write followed the
+      // swapped symlink out of the candidate worktree.
+      expect((rejection as Error).message).toContain('immutable gate runner exited 1');
+      expect((rejection as Error).message).not.toContain('cleanup failed');
+      // The outside file is untouched...
+      expect(readFileSync(outsideConfig, 'utf8')).toBe('outside secret bytes\n');
+      // ...and the swapped symlink is left exactly as the adversary made it
+      // (restoration refused rather than written through the link).
+      expect(lstatSync(configPath).isSymbolicLink()).toBe(true);
+    } finally {
+      rmSync(configPath, { force: true });
+    }
+  }, 30_000);
+
+  it('creates the temporary controller config owner-only (0o600) while the gates run', async () => {
+    const { repo } = await createGitFixture();
+    writeFileSync(path.join(repo, 'feature.txt'), 'implemented by Qwen\n');
+    const head = await git(['rev-parse', 'HEAD'], repo);
+
+    const result = await runLocalGateReverification({
+      worktreePath: repo,
+      expectedHead: head,
+      gates: [unitGate({ args: ['-e', [
+        "const fs = require('fs')",
+        "const mode = fs.statSync('.qwen-harness/project.yml').mode & 0o777",
+        "if (mode !== 0o600) { console.error('temporary config mode is ' + mode.toString(8)); process.exit(1) }",
+      ].join('; ')] })],
+    });
+    expect(result.gateCount).toBe(1);
+    // The temporary config is fully removed again afterwards.
+    expect(existsSync(path.join(repo, '.qwen-harness', 'project.yml'))).toBe(false);
+  }, 30_000);
+
+  it('preserves the primary gate failure when cleanup also fails', async () => {
+    const { repo } = await createGitFixture();
+    writeFileSync(path.join(repo, 'feature.txt'), 'implemented by Qwen\n');
+    mkdirSync(path.join(repo, '.qwen-harness'), { recursive: true });
+    const configPath = path.join(repo, '.qwen-harness', 'project.yml');
+    writeFileSync(configPath, 'original: true\n');
+    const head = await git(['rev-parse', 'HEAD'], repo);
+
+    try {
+      // The chmod changes the (unignored) project.yml mode mid-run, so the
+      // runner detects input drift AND the cleanup restoration fails.
+      const rejection = await runLocalGateReverification({
+        worktreePath: repo,
+        expectedHead: head,
+        gates: [unitGate({ args: ['-e', "require('fs').chmodSync('.qwen-harness/project.yml', 0o444)"] })],
+      }).then(
+        () => {
+          throw new Error('expected runLocalGateReverification to reject');
+        },
+        (error: unknown) => error,
+      );
+      expect(rejection).toBeInstanceOf(Error);
+      expect((rejection as Error).message).toContain('immutable gate runner exited 1');
+      expect((rejection as Error).message).not.toContain('cleanup failed');
+      // Cleanup still removed the receipt despite the restore failure.
+      expect(existsSync(path.join(repo, '.qwen-harness', 'state', 'gate-receipt.json'))).toBe(false);
+    } finally {
+      chmodSync(configPath, 0o644);
     }
   }, 30_000);
 });
