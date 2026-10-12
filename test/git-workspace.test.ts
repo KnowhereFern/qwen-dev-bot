@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readlinkSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
@@ -107,6 +107,139 @@ describe('real Git worktree delivery', () => {
     });
     expect(receipt.exitCode).toBe(1);
     expect(receipt.stderr).toContain('AUTONOMY.md');
+  });
+
+  it('advances an implementation base without running repository hooks and preserves candidate bytes', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    const git = new GitWorkspace(repo, makeTmp('git-impl-advance-state'), config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+    mkdirSync(path.join(worktree.path, 'src'), { recursive: true });
+    writeFileSync(path.join(worktree.path, 'src', 'genotype-store.ts'), 'export {};\n');
+    const candidateBytes = 'export {};\n';
+
+    // A hostile repository hook must not run during the fast-forward.
+    mkdirSync(path.join(repo, '.git', 'hooks'), { recursive: true });
+    const hook = path.join(repo, '.git', 'hooks', 'post-merge');
+    writeFileSync(
+      hook,
+      '#!/bin/sh\nprintf "hook ran\\n" > hook-ran.txt\nprintf "hook touched\\n" >> src/genotype-store.ts\n',
+    );
+    chmodSync(hook, 0o755);
+
+    mkdirSync(path.join(repo, '.qwen-harness', 'scripts'), { recursive: true });
+    writeFileSync(path.join(repo, '.qwen-harness', 'scripts', 'run-gates.mjs'), 'export const gates = 1;\n');
+    await command(['add', '.'], repo);
+    await command(['commit', '-m', 'controller asset update'], repo);
+    const target = await command(['rev-parse', 'HEAD'], repo);
+
+    await git.advanceImplementationBase(worktree.path, task.baseSha, target, ['src/genotype-store.ts']);
+
+    expect(await git.headSha(worktree.path)).toBe(target);
+    expect(await git.untrackedFiles(worktree.path)).toEqual(['src/genotype-store.ts']);
+    expect(await git.trackedChanges(worktree.path)).toEqual([]);
+    expect(readFileSync(path.join(worktree.path, 'src', 'genotype-store.ts'), 'utf8')).toBe(candidateBytes);
+    expect(existsSync(path.join(worktree.path, 'hook-ran.txt'))).toBe(false);
+    await expect(
+      git.advanceImplementationBase(worktree.path, task.baseSha, target, ['src/genotype-store.ts']),
+    ).rejects.toThrow('HEAD moved');
+    await expect(
+      git.advanceImplementationBase(worktree.path, target, target, []),
+    ).rejects.toThrow('Untracked candidate set changed');
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
+  });
+
+  it('fails closed when untracked candidate bytes drift across the fast-forward', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    class ByteDriftWorkspace extends GitWorkspace {
+      private digestCalls = 0;
+
+      protected override untrackedDigests(worktree: string, files: string[]): Map<string, string> {
+        this.digestCalls += 1;
+        const digests = super.untrackedDigests(worktree, files);
+        if (this.digestCalls === 2) {
+          // Simulate the candidate being mutated while the merge runs.
+          digests.set(files[0] as string, 'drifted-bytes');
+        }
+        return digests;
+      }
+    }
+    const git = new ByteDriftWorkspace(repo, makeTmp('git-impl-drift-state'), config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+    writeFileSync(path.join(worktree.path, 'candidate.ts'), 'export const original = 1;\n');
+
+    mkdirSync(path.join(repo, '.qwen-harness', 'scripts'), { recursive: true });
+    writeFileSync(path.join(repo, '.qwen-harness', 'scripts', 'run-gates.mjs'), 'export const gates = 1;\n');
+    await command(['add', '.'], repo);
+    await command(['commit', '-m', 'controller asset update'], repo);
+    const target = await command(['rev-parse', 'HEAD'], repo);
+
+    await expect(
+      git.advanceImplementationBase(worktree.path, task.baseSha, target, ['candidate.ts']),
+    ).rejects.toThrow('altered untracked candidate bytes');
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
+  });
+
+  it('preserves untracked symlink candidates across an implementation base advance', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    const git = new GitWorkspace(repo, makeTmp('git-impl-symlink-state'), config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+    writeFileSync(path.join(worktree.path, 'candidate.ts'), 'export const original = 1;\n');
+    symlinkSync('candidate.ts', path.join(worktree.path, 'link.ts'));
+
+    mkdirSync(path.join(repo, '.qwen-harness', 'scripts'), { recursive: true });
+    writeFileSync(path.join(repo, '.qwen-harness', 'scripts', 'run-gates.mjs'), 'export const gates = 1;\n');
+    await command(['add', '.'], repo);
+    await command(['commit', '-m', 'controller asset update'], repo);
+    const target = await command(['rev-parse', 'HEAD'], repo);
+
+    await git.advanceImplementationBase(worktree.path, task.baseSha, target, ['candidate.ts', 'link.ts']);
+
+    expect(readlinkSync(path.join(worktree.path, 'link.ts'))).toBe('candidate.ts');
+    expect(await git.untrackedFiles(worktree.path)).toEqual(['candidate.ts', 'link.ts']);
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
+  });
+
+  it('fails closed when the disabled-hooks path is a dangling symlink', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    const state = makeTmp('git-impl-dangling-hooks-state');
+    const git = new GitWorkspace(repo, state, config);
+    const task = taskRecord();
+    task.branch = branchFor(task);
+    const worktree = await git.createOrResume(task);
+    task.baseSha = worktree.baseSha;
+    writeFileSync(path.join(worktree.path, 'candidate.ts'), 'export const original = 1;\n');
+
+    mkdirSync(path.join(repo, '.qwen-harness', 'scripts'), { recursive: true });
+    writeFileSync(path.join(repo, '.qwen-harness', 'scripts', 'run-gates.mjs'), 'export const gates = 1;\n');
+    await command(['add', '.'], repo);
+    await command(['commit', '-m', 'controller asset update'], repo);
+    const target = await command(['rev-parse', 'HEAD'], repo);
+
+    // A dangling symlink at the hooks path would defeat an existsSync guard
+    // (existsSync follows the link and reports false), so the lstat check must
+    // refuse the advance instead of letting git resolve hooks through it.
+    const disabledHooks = path.join(state, 'disabled-hooks');
+    symlinkSync(path.join(state, 'nonexistent-hooks-target'), disabledHooks);
+    expect(existsSync(disabledHooks)).toBe(false);
+
+    await expect(
+      git.advanceImplementationBase(worktree.path, task.baseSha, target, ['candidate.ts']),
+    ).rejects.toThrow('already exists');
+    expect(await git.headSha(worktree.path)).toBe(task.baseSha);
+    await git.removeOwnedWorktree(worktree.path, { allowDirty: true });
   });
 
   it('removes a dirty disposable verification worktree without weakening implementation cleanup', async () => {

@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { CommunityCollector, CommunityScanResult } from './community/collector.js';
 import type { GateResult, ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
 import { redactText } from './core/ledger.js';
@@ -16,6 +18,17 @@ import { GateRunner } from './rewards/gates.js';
 import { prepareProjectCheckout } from './runtime/checkout-preflight.js';
 
 const RECONCILIATION_STATES = ['pr_open', 'waiting_ci', 'merge_ready', 'post_merge'] as const;
+
+/**
+ * The only remote-main changes the controller itself may land under an in-flight
+ * task worktree. A base advance is permitted when the saved-base..target diff
+ * touches exactly (and only) these managed harness assets.
+ */
+const CONTROLLER_MANAGED_BASE_ASSETS = new Set([
+  '.qwen/agents/harness-implementer.md',
+  '.qwen/workflows/harness-implement.js',
+  '.qwen-harness/scripts/run-gates.mjs',
+]);
 
 type PortfolioPlanRecord = ReturnType<PersistentTaskStore['listPortfolioPlans']>[number];
 type PortfolioStoryRecord = PortfolioPlanRecord['stories'][number];
@@ -306,6 +319,8 @@ export class HarnessSupervisor {
         await this.verifyCandidate(task, worktree.path, recovery.summary, executionSignal, stopHeartbeat, onCandidateReady, recovery.commitSha);
         return;
       }
+      const advanced = await this.advanceImplementationBase(task, worktree.path);
+      if (advanced) task = advanced;
       await prepareProjectCheckout(worktree.path, executionSignal);
       const qwenResult = await this.qwen.execute({
         task,
@@ -708,6 +723,111 @@ export class HarnessSupervisor {
     return { kind: 'candidate', commitSha, summary };
   }
 
+  /**
+   * Advance a task-owned implementation worktree to the current remote base when the
+   * only intervening change is controller-managed harness assets, so the next Qwen
+   * session executes against the tracked workflows instead of stale ones. The
+   * untracked candidate is never touched. Returns the patched task, or null when a
+   * guard declines and execution must proceed with the worktree unchanged.
+   */
+  private async advanceImplementationBase(task: TaskRecord, worktreePath: string): Promise<TaskRecord | null> {
+    if (this.isReadOnlyProgramTask(task) || task.commitSha !== null || task.baseSha === null) return null;
+    const unconsumedCandidate = this.store.listEvents('task.candidate_ready').some(
+      (event) => event.taskId === task.id && !this.store.hasIdempotencyKey(`candidate-consumed:${event.id}`),
+    );
+    if (unconsumedCandidate) return null;
+    const savedBase = task.baseSha;
+    const remoteBase = await this.git.baseSha();
+    if (remoteBase === savedBase) return null;
+    const head = await this.git.headSha(worktreePath);
+    const requests = this.store
+      .listEvents('task.implementation_base_advance_requested')
+      .filter((event) => event.taskId === task.id);
+    const latest = requests.at(-1);
+    const requestedTarget = typeof latest?.payload.commitSha === 'string' ? latest.payload.commitSha : null;
+    // Crash recovery: the merge already landed but the task patch did not.
+    const reconciling = requestedTarget !== null && head === requestedTarget && head !== savedBase;
+    if (!reconciling && head !== savedBase) return null;
+    const target = reconciling ? head : remoteBase;
+    if (!(await this.git.isAncestor(worktreePath, savedBase, target))) {
+      if (reconciling) {
+        throw new Error(`Durable implementation base advance for task ${task.id} is not descended from base ${savedBase}`);
+      }
+      return null;
+    }
+    const changed = await this.git.filesChangedBetween(worktreePath, savedBase, target);
+    const managedOnly = changed.length > 0 && changed.every((file) => CONTROLLER_MANAGED_BASE_ASSETS.has(file));
+    if (!managedOnly) {
+      if (reconciling) {
+        throw new Error(`Durable implementation base advance for task ${task.id} includes non-managed changes: ${changed.join(', ')}`);
+      }
+      return null;
+    }
+    // Only advance onto bytes that exactly match the immutable installed
+    // controller templates. Every managed asset is verified at the target
+    // commit, not only the paths listed as changed, so a partial or mixed
+    // upgrade (one asset at template bytes while the others stay stale) is
+    // declined; deletions or arbitrary modified workflow, agent, or runner
+    // content are likewise rejected.
+    const templateCheck = await this.verifyManagedAssetsMatchTemplates(worktreePath, target);
+    if (!templateCheck.ok) {
+      if (reconciling) {
+        throw new Error(
+          `Durable implementation base advance for task ${task.id} failed controller template verification: ${templateCheck.reason}`,
+        );
+      }
+      return null;
+    }
+    const tracked = await this.git.trackedChanges(worktreePath);
+    if (tracked.length > 0) {
+      if (reconciling) {
+        throw new Error(`Durable implementation base advance for task ${task.id} found tracked changes: ${tracked.join(', ')}`);
+      }
+      return null;
+    }
+    const untracked = (await this.git.untrackedFiles(worktreePath)).sort();
+    if (untracked.some((file) => changed.includes(file))) {
+      if (reconciling) {
+        throw new Error(`Durable implementation base advance for task ${task.id} collides with untracked candidate files`);
+      }
+      return null;
+    }
+    if (reconciling) {
+      const recorded = Array.isArray(latest?.payload.untrackedFiles)
+        ? [...(latest?.payload.untrackedFiles as string[])].sort()
+        : null;
+      if (latest?.payload.previousSha !== savedBase || recorded === null ||
+          recorded.length !== untracked.length || recorded.some((file, index) => file !== untracked[index])) {
+        throw new Error(`Durable implementation base advance for task ${task.id} no longer matches the recorded request evidence`);
+      }
+      this.store.recordEvent('task.implementation_base_advance_completed', task.id,
+        { previousSha: savedBase, commitSha: head }, `implementation-base-completed:${task.id}:${head}`);
+      return this.store.patch(task.id, { baseSha: head });
+    }
+    this.store.recordEvent('task.implementation_base_advance_requested', task.id,
+      { previousSha: savedBase, commitSha: target, untrackedFiles: untracked }, `implementation-base-request:${task.id}:${target}`);
+    await this.git.advanceImplementationBase(worktreePath, head, target, untracked);
+    this.store.recordEvent('task.implementation_base_advance_completed', task.id,
+      { previousSha: savedBase, commitSha: target }, `implementation-base-completed:${task.id}:${target}`);
+    return this.store.patch(task.id, { baseSha: target });
+  }
+
+  private async verifyManagedAssetsMatchTemplates(
+    worktreePath: string,
+    targetSha: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    for (const file of CONTROLLER_MANAGED_BASE_ASSETS) {
+      const template = controllerTemplateBytes(file);
+      if (template === null) {
+        return { ok: false, reason: `installed controller template for ${file} is missing or unreadable` };
+      }
+      if (!(await this.git.blobMatches(worktreePath, targetSha, file, template))) {
+        return { ok: false, reason: `${file} at ${targetSha} does not match the installed controller template` };
+      }
+    }
+    return { ok: true };
+  }
+
   private async reconcilePending(signal?: AbortSignal): Promise<TaskRecord[]> {
     const reconciled: TaskRecord[] = [];
     for (let index = 0; index < 20; index += 1) {
@@ -1038,6 +1158,23 @@ function renderPullRequestBody(task: TaskRecord, summary: string, scorecard: Rew
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+/**
+ * Read the exact bytes of an installed controller template asset from the
+ * immutable package template directory. Returns null whenever the asset cannot
+ * be verified, so callers fail closed instead of advancing onto unknown bytes.
+ */
+function controllerTemplateBytes(relative: string): Buffer | null {
+  try {
+    const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const templatePath = path.join(packageRoot, 'template', ...relative.split('/'));
+    const stat = lstatSync(templatePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) return null;
+    return readFileSync(templatePath);
+  } catch {
+    return null;
+  }
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import type { ProjectConfig, TaskRecord } from '../core/types.js';
 import { formatProcessFailure, runProcess, type ProcessOptions } from '../runtime/safe-process.js';
@@ -13,6 +14,7 @@ export interface WorktreeReceipt {
 export class GitWorkspace {
   private readonly repoRoot: string;
   private readonly worktreesRoot: string;
+  protected readonly stateRoot: string;
 
   constructor(
     root: string,
@@ -20,6 +22,7 @@ export class GitWorkspace {
     private readonly config: ProjectConfig,
   ) {
     this.repoRoot = realpathSync(root);
+    this.stateRoot = stateDir;
     this.worktreesRoot = path.join(stateDir, 'worktrees');
     mkdirSync(this.worktreesRoot, { recursive: true, mode: 0o700 });
   }
@@ -120,6 +123,79 @@ export class GitWorkspace {
 
   async headSha(worktree: string): Promise<string> {
     return (await this.git(['rev-parse', 'HEAD'], worktree)).stdout.trim();
+  }
+
+  async isAncestor(worktree: string, ancestorSha: string, descendantSha: string): Promise<boolean> {
+    const receipt = await this.git(['merge-base', '--is-ancestor', ancestorSha, descendantSha], worktree, false);
+    return receipt.exitCode === 0;
+  }
+
+  async trackedChanges(worktree: string): Promise<string[]> {
+    const entries = await this.statusEntries(worktree);
+    return entries.filter((entry) => !entry.untracked).map((entry) => entry.path);
+  }
+
+  async untrackedFiles(worktree: string): Promise<string[]> {
+    const entries = await this.statusEntries(worktree);
+    return entries.filter((entry) => entry.untracked).map((entry) => entry.path);
+  }
+
+  /**
+   * Fast-forward a task-owned implementation worktree whose only content is an
+   * untracked candidate. The exact untracked set must be declared up front and is
+   * re-verified before and after the merge; every candidate byte (or symlink
+   * target) is hashed on both sides so no drift can slip through. Repository
+   * hooks are disabled for the merge via a verified nonexistent hooks path under
+   * the harness-owned state root, so a hook cannot mutate the candidate between
+   * the two verifications. No backup, delete, or reset is performed.
+   */
+  async advanceImplementationBase(
+    worktree: string,
+    previousSha: string,
+    targetSha: string,
+    expectedUntracked: string[],
+  ): Promise<void> {
+    this.assertOwnedPath(worktree);
+    if ((await this.headSha(worktree)) !== previousSha) {
+      throw new Error(`Refusing implementation base advance: worktree HEAD moved away from ${previousSha}`);
+    }
+    const entries = await this.statusEntries(worktree);
+    const tracked = entries.filter((entry) => !entry.untracked).map((entry) => entry.path);
+    if (tracked.length > 0) {
+      throw new Error(`Refusing implementation base advance over tracked changes: ${tracked.join(', ')}`);
+    }
+    const before = entries.filter((entry) => entry.untracked).map((entry) => entry.path).sort();
+    const expected = [...expectedUntracked].sort();
+    if (before.length !== expected.length || before.some((file, index) => file !== expected[index])) {
+      throw new Error('Untracked candidate set changed before the implementation base advance');
+    }
+    const beforeDigests = this.untrackedDigests(worktree, before);
+    const disabledHooksPath = path.join(this.stateRoot, 'disabled-hooks');
+    // lstat (not existsSync) so a dangling symlink at the path also fails
+    // closed: git would still resolve core.hooksPath through it.
+    if (lstatSync(disabledHooksPath, { throwIfNoEntry: false }) !== undefined) {
+      throw new Error(
+        `Refusing implementation base advance: expected-absent hooks path ${disabledHooksPath} already exists`,
+      );
+    }
+    await this.git(['-c', `core.hooksPath=${disabledHooksPath}`, 'merge', '--ff-only', targetSha], worktree);
+    const after = (await this.statusEntries(worktree)).filter((entry) => entry.untracked).map((entry) => entry.path).sort();
+    if (after.length !== before.length || after.some((file, index) => file !== before[index])) {
+      throw new Error(`Fast-forward to ${targetSha} altered the untracked candidate set`);
+    }
+    const afterDigests = this.untrackedDigests(worktree, after);
+    const drifted = after.filter((file) => afterDigests.get(file) !== beforeDigests.get(file));
+    if (drifted.length > 0) {
+      throw new Error(`Fast-forward to ${targetSha} altered untracked candidate bytes: ${drifted.join(', ')}`);
+    }
+  }
+
+  /** Compare a tracked blob at an exact commit against expected template bytes. */
+  async blobMatches(worktree: string, commitSha: string, file: string, expected: Buffer): Promise<boolean> {
+    const receipt = await this.git(['show', `${commitSha}:${file}`], worktree, false);
+    if (receipt.exitCode !== 0) return false;
+    return createHash('sha256').update(receipt.stdout, 'utf8').digest('hex') ===
+      createHash('sha256').update(expected.toString('utf8'), 'utf8').digest('hex');
   }
 
   async advanceReadOnlyBase(worktree: string, previousSha: string, currentSha: string): Promise<void> {
@@ -235,6 +311,41 @@ export class GitWorkspace {
     }
     await this.git(['worktree', 'remove', ...(options.allowDirty ? ['--force'] : []), worktree], this.repoRoot);
     await this.git(['worktree', 'prune'], this.repoRoot);
+  }
+
+  /**
+   * Hash the exact bytes (or symlink target) of each declared untracked
+   * candidate so byte-level drift fails closed. Anything that is not a regular
+   * file or a symlink is refused.
+   */
+  protected untrackedDigests(worktree: string, files: string[]): Map<string, string> {
+    const digests = new Map<string, string>();
+    for (const file of files) {
+      const absolute = path.join(worktree, file);
+      const stat = lstatSync(absolute);
+      if (stat.isSymbolicLink()) {
+        digests.set(file, `symlink:${readlinkSync(absolute)}`);
+      } else if (stat.isFile()) {
+        digests.set(file, createHash('sha256').update(readFileSync(absolute)).digest('hex'));
+      } else {
+        throw new Error(`Untracked candidate entry ${file} is neither a regular file nor a symlink`);
+      }
+    }
+    return digests;
+  }
+
+  private async statusEntries(worktree: string): Promise<Array<{ untracked: boolean; path: string }>> {
+    const receipt = await this.git(['status', '--porcelain=v1', '-z', '--untracked-files=all'], worktree);
+    const tokens = receipt.stdout.split('\0');
+    const entries: Array<{ untracked: boolean; path: string }> = [];
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index];
+      if (!token) continue;
+      const status = token.slice(0, 2);
+      entries.push({ untracked: status === '??', path: token.slice(3) });
+      if (status.includes('R') || status.includes('C')) index += 1;
+    }
+    return entries;
   }
 
   private assertOwnedPath(target: string): void {

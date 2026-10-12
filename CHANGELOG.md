@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.69] - 2026-10-12
+
+- Safely advance paused implementation tasks across exact controller-managed asset updates, preserving candidate bytes and recovery history.
+- Recheck shared-worker registration before each project tick so an unregistered project cannot run from a stale registry snapshot.
+
 ## [1.0.0-rc.68] - 2026-10-12
 
 - Direct budget continuations and the sole implementation agent to finish saved candidate work before repeating broad reconnaissance, while retaining required gates and independent review.

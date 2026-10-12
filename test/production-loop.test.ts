@@ -1,4 +1,4 @@
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
@@ -261,6 +261,38 @@ class PostmergeJournalFaultStore extends PersistentTaskStore {
     return super.recordEvent(type, taskId, payload, idempotencyKey);
   }
 }
+
+/** Qwen pauses once with an untracked candidate, then completes it on the next run. */
+class PausedThenCompleteQwenExecutor implements QwenExecutor {
+  private runs = 0;
+
+  async execute(input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
+    this.runs += 1;
+    const sessionId = `impl-advance-session-${this.runs}`;
+    input.onSession?.(sessionId);
+    const candidate = path.join(input.worktree, 'src', 'genotype-store.ts');
+    mkdirSync(path.dirname(candidate), { recursive: true });
+    writeFileSync(candidate, 'export const store = 1;\n');
+    if (this.runs === 1) {
+      return {
+        sessionId, workflowRunId: null, summary: 'candidate drafted', goalState: 'paused', goalReason: 'turn budget limit',
+        needsContinuation: true, continuationKind: 'budget', usage: {}, durationMs: 1,
+        automaticStop: { sessionId, workflowRunId: null, kind: 'turn-limit' },
+      };
+    }
+    writeFileSync(path.join(input.worktree, 'feature.txt'), 'implemented by Qwen\n');
+    return {
+      sessionId, workflowRunId: null, summary: 'delivered candidate on the advanced base', goalState: 'complete',
+      goalReason: null, needsContinuation: false, usage: {}, durationMs: 1,
+    };
+  }
+}
+
+const MANAGED_ASSET_PATHS = [
+  '.qwen/agents/harness-implementer.md',
+  '.qwen/workflows/harness-implement.js',
+  '.qwen-harness/scripts/run-gates.mjs',
+] as const;
 
 describe('production supervisor trace', () => {
   it.each(['no-plan', 'draft', 'active-without-approval'] as const)('blocks every execution path until initial program approval: %s', async (scenario) => {
@@ -1197,4 +1229,133 @@ describe('production supervisor trace', () => {
     expect(github.prs.size).toBe(1);
     store.close();
   }, 30_000);
+
+  it.each(['advance', 'product-delta', 'tracked-dirty', 'collision', 'interrupted', 'tampered-asset', 'deleted-asset', 'partial-upgrade'] as const)(
+    'guards the controller-managed implementation base advance: %s', async (scenario) => {
+      const { repo } = await createGitFixture();
+      const gitCmd = async (args: string[]): Promise<string> => {
+        const result = await runProcess({ command: 'git', args, cwd: repo, timeoutMs: 20_000 });
+        expect(result.exitCode, result.stderr).toBe(0);
+        return result.stdout.trim();
+      };
+      const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+      config.intake.trustedAuthors.push('bot');
+      config.worker.autoMerge = true;
+      config.gates = [{ id: 'unit', kind: 'unit', command: process.execPath, args: ['check.mjs'], required: true, timeoutMs: 10_000 }];
+      const state = makeTmp(`impl-advance-${scenario}-state`);
+      const store = new PersistentTaskStore(`impl-advance-${scenario}`, state);
+      const github = new MockGitHub();
+      const git = new GitWorkspace(repo, state, config);
+      const qwen = new PausedThenCompleteQwenExecutor();
+      const execute = vi.spyOn(qwen, 'execute');
+      // A deletion scenario needs the managed asset present in the saved base first;
+      // a partial upgrade needs all three assets present but stale at the base.
+      if (scenario === 'deleted-asset') {
+        const initial = MANAGED_ASSET_PATHS[2];
+        mkdirSync(path.dirname(path.join(repo, initial)), { recursive: true });
+        writeFileSync(path.join(repo, initial), readFileSync(path.resolve('template', initial)));
+        await gitCmd(['add', '.']);
+        await gitCmd(['commit', '-m', 'seed managed asset']);
+        await gitCmd(['push', 'origin', 'main']);
+      }
+      if (scenario === 'partial-upgrade') {
+        for (const asset of MANAGED_ASSET_PATHS) {
+          mkdirSync(path.dirname(path.join(repo, asset)), { recursive: true });
+          writeFileSync(path.join(repo, asset), `// stale controller asset: ${asset}\n`);
+        }
+        await gitCmd(['add', '.']);
+        await gitCmd(['commit', '-m', 'seed stale managed assets']);
+        await gitCmd(['push', 'origin', 'main']);
+      }
+      const supervisor = new HarnessSupervisor(
+        config, store, github, git, qwen, new MockNormalizer(), new GateRunner(),
+        new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+        silentLogger, `worker-impl-advance-${scenario}`,
+      );
+
+      // First run pauses on budget with only an untracked candidate in the worktree.
+      await supervisor.tick();
+      const paused = store.findByIssue(2)!;
+      expect(paused).toMatchObject({ state: 'ready', attempts: 0, commitSha: null });
+      expect(await git.untrackedFiles(paused.worktreePath as string)).toEqual(['src/genotype-store.ts']);
+      const oldBase = paused.baseSha as string;
+
+      // Remote main advances through exactly the controller-managed harness assets,
+      // byte-identical to the immutable installed controller templates. A partial
+      // upgrade moves only one asset to template bytes and leaves the others stale.
+      for (const asset of MANAGED_ASSET_PATHS) {
+        if (scenario === 'partial-upgrade' && asset !== MANAGED_ASSET_PATHS[0]) continue;
+        mkdirSync(path.dirname(path.join(repo, asset)), { recursive: true });
+        writeFileSync(path.join(repo, asset), readFileSync(path.resolve('template', asset)));
+      }
+      if (scenario === 'product-delta') {
+        mkdirSync(path.join(repo, 'src'), { recursive: true });
+        writeFileSync(path.join(repo, 'src', 'product.ts'), 'unrelated product change\n');
+      }
+      if (scenario === 'tampered-asset') {
+        // A managed path is touched but its content does not match the installed template.
+        const tampered = MANAGED_ASSET_PATHS[0];
+        writeFileSync(path.join(repo, tampered), `${readFileSync(path.resolve('template', tampered))}\n# tampered controller asset\n`);
+      }
+      if (scenario === 'deleted-asset') {
+        // A managed path is deleted outright in the target commit.
+        rmSync(path.join(repo, MANAGED_ASSET_PATHS[2]));
+      }
+      await gitCmd(['add', '.']);
+      await gitCmd(['commit', '-m', 'controller-managed harness asset update']);
+      await gitCmd(['push', 'origin', 'main']);
+      const newBase = await gitCmd(['rev-parse', 'HEAD']);
+
+      if (scenario === 'tracked-dirty') {
+        writeFileSync(path.join(paused.worktreePath as string, 'README.md'), 'locally edited\n');
+      }
+      if (scenario === 'collision') {
+        rmSync(path.join(paused.worktreePath as string, 'src', 'genotype-store.ts'));
+        const colliding = path.join(paused.worktreePath as string, '.qwen', 'workflows', 'harness-implement.js');
+        mkdirSync(path.dirname(colliding), { recursive: true });
+        writeFileSync(colliding, 'stale local workflow\n');
+      }
+      if (scenario === 'interrupted') {
+        // Crash window: the durable request and the fast-forward landed, the task patch did not.
+        store.recordEvent('task.implementation_base_advance_requested', paused.id,
+          { previousSha: oldBase, commitSha: newBase, untrackedFiles: ['src/genotype-store.ts'] },
+          `implementation-base-request:${paused.id}:${newBase}`);
+        await git.advanceImplementationBase(paused.worktreePath as string, oldBase, newBase, ['src/genotype-store.ts']);
+      }
+
+      await supervisor.tick();
+      const finished = store.findByIssue(2)!;
+      const requested = store.listEvents('task.implementation_base_advance_requested');
+      const completed = store.listEvents('task.implementation_base_advance_completed');
+      if (scenario === 'advance' || scenario === 'interrupted') {
+        expect(requested).toHaveLength(1);
+        expect(requested[0]!.payload).toMatchObject({ previousSha: oldBase, commitSha: newBase });
+        expect(completed).toHaveLength(1);
+        expect(completed[0]!.payload).toMatchObject({ previousSha: oldBase, commitSha: newBase });
+        expect(finished).toMatchObject({ state: 'done', baseSha: newBase, attempts: 0 });
+        expect(await gitCmd(['merge-base', finished.commitSha as string, newBase])).toBe(newBase);
+        const candidate = await runProcess({
+          command: 'git',
+          args: ['show', `${finished.commitSha}:src/genotype-store.ts`],
+          cwd: repo,
+          timeoutMs: 10_000,
+        });
+        expect(candidate.exitCode, candidate.stderr).toBe(0);
+        expect(candidate.stdout).toContain('export const store = 1');
+        expect(execute).toHaveBeenCalledTimes(2);
+      } else {
+        expect(requested).toHaveLength(0);
+        expect(completed).toHaveLength(0);
+        expect(finished.baseSha).toBe(oldBase);
+        if (scenario === 'collision') {
+          expect(finished).toMatchObject({ state: 'ready', attempts: 1 });
+          expect(finished.lastError).toContain('protected governance paths');
+        } else {
+          expect(finished).toMatchObject({ state: 'done', attempts: 0 });
+        }
+        expect(execute).toHaveBeenCalledTimes(2);
+      }
+      store.close();
+    }, 60_000,
+  );
 });
