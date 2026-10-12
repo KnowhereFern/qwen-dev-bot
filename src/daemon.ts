@@ -1,7 +1,7 @@
 import { loadProjectConfig } from './core/config.js';
 import { createProductionHarness } from './factory.js';
 import { Logger } from './logger.js';
-import { ProjectRegistry } from './registry.js';
+import { ProjectRegistry, type ProjectRegistration } from './registry.js';
 
 export async function runDaemon(options: {
   once?: boolean;
@@ -17,6 +17,10 @@ export async function runDaemon(options: {
     let shortestPoll = 30_000;
     for (const registration of projects) {
       if (options.signal?.aborted) return;
+      if (isStaleRegistration(registry, registration)) {
+        logger.info('skipping stale project registration', { projectId: registration.id });
+        continue;
+      }
       let harness;
       try {
         const config = loadProjectConfig(registration.configPath);
@@ -45,6 +49,14 @@ export async function runDaemon(options: {
     if (options.once) return;
     await abortableDelay(shortestPoll, options.signal);
   } while (!options.signal?.aborted);
+}
+
+function isStaleRegistration(registry: ProjectRegistry, registration: ProjectRegistration): boolean {
+  const current = registry.list().find((project) => project.id === registration.id);
+  if (!current || !current.enabled) return true;
+  return current.updatedAt !== registration.updatedAt ||
+    current.root !== registration.root ||
+    current.configPath !== registration.configPath;
 }
 
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
