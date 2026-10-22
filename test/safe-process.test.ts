@@ -3,6 +3,18 @@ import { runProcess } from '../src/runtime/safe-process.js';
 import { makeTmp } from './helpers.js';
 
 describe('safe process runner', () => {
+  it('preserves UTF-8 characters split across streamed output chunks', async () => {
+    let streamed = '';
+    const receipt = await runProcess({
+      command: process.execPath,
+      args: ['-e', "const b=Buffer.from('Fern 🌿'); process.stdout.write(b.subarray(0,7)); setTimeout(()=>process.stdout.write(b.subarray(7)),30)"],
+      cwd: makeTmp('process-utf8'), timeoutMs: 5_000,
+      onStdout: (chunk) => { streamed += chunk; },
+    });
+    expect(receipt.exitCode).toBe(0);
+    expect(streamed).toBe('Fern 🌿');
+    expect(receipt.stdout).toBe(streamed);
+  });
   it('passes arguments without shell interpretation', async () => {
     const receipt = await runProcess({
       command: process.execPath,

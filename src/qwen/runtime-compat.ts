@@ -90,6 +90,17 @@ export function qwenSubagentArgs(maxDepth: number): string[] {
   return ['--max-subagent-depth', String(maxDepth)];
 }
 
+/** Register the workflow's repository tools in headless auto mode without auto-approving them. */
+export function qwenImplementationToolArgs(): string[] {
+  // Qwen 0.24.5 otherwise adds shell/edit/write to the headless deny list,
+  // which its workflow children inherit. core-tools controls registration;
+  // allowed-tools remains scoped to the exact saved workflow below.
+  return ['--core-tools',
+    'read_file', 'edit', 'write_file', 'run_shell_command', 'glob', 'grep_search',
+    'workflow', 'agent', 'tool_search', 'tool_call', 'get_goal', 'update_goal', 'structured_output',
+  ];
+}
+
 /** Auto-approve only the audited saved workflow required by the headless Goal. */
 export function qwenSavedWorkflowPermissionArgs(scriptPath: string): string[] {
   if (!path.isAbsolute(scriptPath) || /[,()\r\n]/.test(scriptPath)) {

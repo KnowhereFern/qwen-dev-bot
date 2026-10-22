@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   NO_MCP_SERVERS_VALUE,
   qwenEnvironment,
+  qwenImplementationToolArgs,
   qwenMcpArgs,
   qwenMmCoreCheckArgs,
   qwenMmCoreInstallArgs,
@@ -11,6 +12,14 @@ import {
 } from '../src/qwen/runtime-compat.js';
 
 describe('Qwen runtime boundary', () => {
+  it('registers bounded implementation tools without granting blanket approval', () => {
+    const args = qwenImplementationToolArgs();
+    expect(args).toEqual(['--core-tools', 'read_file', 'edit', 'write_file', 'run_shell_command',
+      'glob', 'grep_search', 'workflow', 'agent', 'tool_search', 'tool_call', 'get_goal', 'update_goal', 'structured_output']);
+    expect(args).not.toContain('--allowed-tools');
+    expect(args).not.toContain('--approval-mode');
+    expect(args).not.toContain('*');
+  });
   it('passes only runtime essentials and the dedicated Qwen credential', () => {
     const environment = qwenEnvironment({
       PATH: '/bin',

@@ -2,10 +2,22 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
-import { projectDependencyChecks, qwenHarnessExtensionPresent } from '../src/doctor.js';
+import { programGateChecks, projectDependencyChecks, qwenHarnessExtensionPresent } from '../src/doctor.js';
 import { makeTmp } from './helpers.js';
 
 describe('dependency preflight', () => {
+  it('requires product checks for program execution while preserving legacy readiness', () => {
+    const config = defaultProjectConfig(makeTmp('doctor-empty-program'));
+    expect(programGateChecks(config)).toEqual([]);
+    config.program.enabled = true;
+    expect(programGateChecks(config)[0].status).toBe('fail');
+    config.gates = [{ id: 'security', kind: 'security', command: 'scan', args: [], required: true, timeoutMs: 1000 }];
+    expect(programGateChecks(config)[0].status).toBe('fail');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: false, timeoutMs: 1000 }];
+    expect(programGateChecks(config)[0].status).toBe('fail');
+    config.gates[0].required = true;
+    expect(programGateChecks(config)[0].status).toBe('pass');
+  });
   it('recognizes the Qwen CLI display name used for the harness extension', () => {
     expect(qwenHarnessExtensionPresent('✓ Autonomous Software Delivery Harness (1.0.0-rc.24)')).toBe(true);
     expect(qwenHarnessExtensionPresent('qwen-dev-harness')).toBe(true);

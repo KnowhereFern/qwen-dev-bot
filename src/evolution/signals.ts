@@ -99,6 +99,36 @@ export class EvolutionSignalCollector {
         });
       }
     }
+    if (this.config.evolution.reviewFindings) {
+      const doneTasks = new Map(
+        this.store.list(['done']).filter((task) => task.mergeSha).map((task) => [task.id, task] as const),
+      );
+      for (const scorecard of this.store.listScorecards()) {
+        const task = doneTasks.get(scorecard.taskId);
+        if (!task || !scorecard.passed) continue;
+        // Only a scorecard evaluated against the task's final merged candidate
+        // commit is trustworthy; findings from earlier candidate commits are
+        // stale and may describe code that no longer exists.
+        if (scorecard.commitSha !== (task.commitSha ?? task.mergeSha)) continue;
+        for (const criterion of scorecard.criteria) {
+          if (criterion.id !== 'independent-review' || !criterion.passed) continue;
+          const finding = extractReviewFinding(criterion.reason);
+          if (!finding) continue;
+          candidates.push({
+            source: 'review',
+            sourceKey: `review:${task.id}:${scorecard.commitSha}:${sha256(finding).slice(0, 16)}`,
+            title: `Non-blocking review findings for ${task.title}`,
+            content: finding,
+            evidence: [{
+              kind: 'signal',
+              locator: scorecard.id,
+              summary: `Passing scorecard ${scorecard.id} independent-review criterion at commit ${scorecard.commitSha}`,
+              commitSha: scorecard.commitSha,
+            }],
+          });
+        }
+      }
+    }
     for (const metric of this.config.evolution.productMetrics) {
       const response = await this.fetchImpl(metric.url, { headers: { accept: 'application/json,text/plain' }, signal: AbortSignal.timeout(30_000), redirect: 'error' });
       if (!response.ok) continue;
@@ -142,6 +172,27 @@ export class EvolutionSignalCollector {
       summary: text(response.value.summary, candidate.content).slice(0, 4_000),
     };
   }
+}
+
+const REVIEW_FINDINGS_MARKER = /non-blocking issues only:/i;
+const FILE_LINE_CITATION = /[\w.-]+\/[\w.@-]*[\w.-]+:\d+/;
+const MAX_REVIEW_FINDING_CHARS = 4_000;
+
+/**
+ * Extract the concrete nonblocking finding text that follows the explicit
+ * "Non-blocking issues only:" marker in an independent-review criterion reason.
+ * Returns null unless the marked text is non-empty and carries at least one
+ * bounded repository-style file:line citation. Review prose is treated purely
+ * as untrusted observation content, never as execution authority.
+ */
+function extractReviewFinding(reason: string): string | null {
+  if (typeof reason !== 'string') return null;
+  const marker = REVIEW_FINDINGS_MARKER.exec(reason);
+  if (!marker) return null;
+  const finding = reason.slice(marker.index + marker[0].length).trim().slice(0, MAX_REVIEW_FINDING_CHARS);
+  if (!finding) return null;
+  if (!FILE_LINE_CITATION.test(finding)) return null;
+  return finding;
 }
 
 function relevantIssue(issue: RemoteIssue): boolean {

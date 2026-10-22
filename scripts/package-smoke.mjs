@@ -15,13 +15,17 @@ try {
   if (!archive) throw new Error('npm pack did not create an archive');
   writeFileSync(path.join(packageDir, 'package.json'), `${JSON.stringify({ private: true, dependencies: { 'qwen-dev-bot': `file:${path.join(temp, archive)}` } }, null, 2)}\n`);
   run(npm(), ['install', '--ignore-scripts', '--no-audit', '--no-fund'], packageDir);
-  const command = process.platform === 'win32'
-    ? path.join(packageDir, 'node_modules', '.bin', 'qwen-harness.cmd')
-    : path.join(packageDir, 'node_modules', '.bin', 'qwen-harness');
-  const receipt = spawnSync(command, ['--version'], { cwd: packageDir, encoding: 'utf8', shell: false });
-  if (receipt.status !== 0) throw new Error(receipt.stderr || 'packaged qwen-harness failed to start');
-  if (receipt.stdout.trim() !== version) throw new Error(`packaged CLI returned ${receipt.stdout.trim()}, expected ${version}`);
-  console.log(`PASS  packed CLI installs and reports ${version}`);
+  for (const name of ['fern-harness', 'qwen-harness']) {
+    const command = path.join(packageDir, 'node_modules', '.bin', process.platform === 'win32' ? `${name}.cmd` : name);
+    const receipt = spawnSync(command, ['--version'], { cwd: packageDir, encoding: 'utf8', shell: false });
+    if (receipt.status !== 0) throw new Error(receipt.stderr || `packaged ${name} failed to start`);
+    if (receipt.stdout.trim() !== version) throw new Error(`${name} returned ${receipt.stdout.trim()}, expected ${version}`);
+    const usage = spawnSync(command, ['--help'], { cwd: packageDir, encoding: 'utf8', shell: false });
+    if (usage.status !== 0 || !usage.stdout.includes('Usage: fern-harness') || !usage.stdout.includes('Compatibility alias: qwen-harness')) {
+      throw new Error(`${name} did not expose the shared Fern Harness command interface`);
+    }
+    console.log(`PASS  packed ${name} installs and reports ${version}`);
+  }
 } finally {
   rmSync(temp, { recursive: true, force: true });
 }

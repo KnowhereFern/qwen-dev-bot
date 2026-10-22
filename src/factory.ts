@@ -64,7 +64,7 @@ export async function createProductionHarness(
     await git.assertReady();
     const rewards = new UniversalRewardEngine([
       new ExecutionEvaluator(),
-      new QwenRubricEvaluator(qwenApi),
+      new QwenRubricEvaluator(qwenApi, credential),
       new QwenAgenticEvaluator(credential),
       new QwenVisualEvaluator(qwenApi),
     ]);
@@ -89,6 +89,8 @@ export async function createProductionHarness(
       new RepositoryAssessor(config, qwenApi),
       planner,
       new EvolutionSignalCollector(config, store, github, qwenApi),
+      undefined,
+      options.logger,
     );
     const selfHosting = new ControllerReleaseManager(config, store);
     return { supervisor, program, selfHosting, store, github, close: () => store.close() };

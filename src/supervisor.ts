@@ -1,11 +1,15 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import type { CommunityCollector, CommunityScanResult } from './community/collector.js';
-import type { ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
+import type { GateResult, HarnessEvent, ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
-import { REQUIRED_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
-import { GitWorkspace, branchFor } from './git/git-workspace.js';
+import { REQUIRED_GITHUB_CHECKS, REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
+import { runLocalGateReverification } from './gates/local-reverify.js';
+import { GitWorkspace, branchFor, isOrdinaryTrackedModification, type TrackedCandidateDigest } from './git/git-workspace.js';
 import { parseNormalizedSpec, type TaskNormalizer } from './intake/normalizer.js';
 import { Logger } from './logger.js';
 import { matchesPortfolioTaskContract, PortfolioCoordinator } from './portfolio/coordinator.js';
@@ -16,6 +20,20 @@ import { GateRunner } from './rewards/gates.js';
 import { prepareProjectCheckout } from './runtime/checkout-preflight.js';
 
 const RECONCILIATION_STATES = ['pr_open', 'waiting_ci', 'merge_ready', 'post_merge'] as const;
+
+/**
+ * Controller-owned assets that may advance beneath an in-flight task. A single
+ * separately verified, non-execution config opt-in is handled below.
+ */
+const CONTROLLER_MANAGED_BASE_ASSETS = new Set([
+  '.qwen/agents/harness-implementer.md',
+  '.qwen/workflows/harness-implement.js',
+  '.qwen-harness/scripts/run-gates.mjs',
+]);
+const PROJECT_CONFIG_RELATIVE_PATH = '.qwen-harness/project.yml';
+
+type PortfolioPlanRecord = ReturnType<PersistentTaskStore['listPortfolioPlans']>[number];
+type PortfolioStoryRecord = PortfolioPlanRecord['stories'][number];
 
 export interface SupervisorTickResult {
   community: CommunityScanResult;
@@ -41,9 +59,16 @@ export class HarnessSupervisor {
   ) {}
 
   async tick(signal?: AbortSignal): Promise<SupervisorTickResult> {
+    if (this.requiresInitialProgramApproval()) {
+      return {
+        community: { checked: 0, changed: 0, created: 0, skipped: 0, failed: 0 },
+        ingested: 0, recovered: 0, processedTaskId: null, action: 'awaiting-program-approval',
+      };
+    }
     try {
       const recovered = await this.recoverExpiredLeases();
       this.resumeProviderWaits();
+      await this.reconcileReadOnlyClosures();
       const community = this.community
         ? await this.community.scan()
         : { checked: 0, changed: 0, created: 0, skipped: 0, failed: 0 };
@@ -93,6 +118,7 @@ export class HarnessSupervisor {
   }
 
   async syncIntake(): Promise<number> {
+    if (this.requiresInitialProgramApproval()) return 0;
     const issues = await this.github.listOpenIssues();
     let ingested = 0;
     for (const issue of issues) {
@@ -193,18 +219,60 @@ export class HarnessSupervisor {
     return ingested;
   }
 
+  private requiresInitialProgramApproval(): boolean {
+    // Labels and pre-existing tasks are not a substitute for the initial program approval.
+    // Legacy issue-driven projects retain their explicit program.disabled behavior.
+    return this.config.program.enabled && !this.store.listPortfolioPlans().some((plan) =>
+      typeof plan.approvedAt === 'number' && Number.isFinite(plan.approvedAt) && plan.approvedAt > 0,
+    );
+  }
+
   private async executeTask(claimed: TaskRecord, signal?: AbortSignal): Promise<void> {
     let task = claimed;
     let executionHeartbeatTimer: NodeJS.Timeout | null = null;
+    let candidateReadyEventId: string | null = null;
+    let inheritedCandidateMarkerId: string | null = null;
+    const inheritedCandidateMarker = (markerId: string | null): void => {
+      inheritedCandidateMarkerId = markerId;
+    };
+    const localAbort = new AbortController();
+    const executionSignal = signal ? AbortSignal.any([signal, localAbort.signal]) : localAbort.signal;
     try {
       const branch = task.branch ?? branchFor(task);
       const worktree = await this.git.createOrResume({ ...task, branch });
+      if (this.isReadOnlyProgramTask(task) && task.prNumber === null &&
+          (!task.commitSha || task.commitSha === worktree.baseSha) &&
+          (await this.git.changedFiles(worktree.path)).length === 0) {
+        const currentSha = await this.git.baseSha();
+        const head = await this.git.headSha(worktree.path);
+        const interrupted = this.store.listEvents('task.read_only_base_advance_requested').filter((event) => event.taskId === task.id).at(-1);
+        if (currentSha !== worktree.baseSha && [worktree.baseSha, currentSha, interrupted?.payload.commitSha].includes(head)) {
+          this.store.recordEvent('task.read_only_base_advance_requested', task.id, { previousSha: worktree.baseSha, commitSha: currentSha }, `read-only-base-request:${task.id}:${currentSha}`);
+          await this.git.advanceReadOnlyBase(worktree.path, head, currentSha);
+          this.store.recordEvent('task.read_only_base_advanced', task.id, { previousSha: worktree.baseSha, commitSha: currentSha }, `read-only-base-advanced:${task.id}:${currentSha}`);
+          worktree.baseSha = currentSha;
+          task = this.store.patch(task.id, { baseSha: currentSha, commitSha: null, rewardRunId: null });
+        }
+      }
       task = this.store.transition(task.id, 'active', {
         branch,
         baseSha: worktree.baseSha,
         worktreePath: worktree.path,
       });
       this.checkpoint(task, { reusedWorktree: worktree.reused });
+      const stagingLink = this.readOnlyProgramLink(task);
+      if (stagingLink?.story.workType === 'operate' && this.config.deployment.staging.enabled &&
+          await this.git.headSha(worktree.path) === task.baseSha && (await this.git.changedFiles(worktree.path)).length === 0) {
+        const deployment = this.store.listDeployments(stagingLink.plan.id)[0];
+        if (deployment?.status !== 'succeeded' || deployment.commitSha !== task.baseSha || deployment.observedRevision !== task.baseSha) {
+          this.store.transition(task.id, 'waiting', {
+            commitSha: task.baseSha, waitKind: 'provider', resumeAfter: Date.now() + Math.max(this.config.worker.pollIntervalMs, 30_000),
+            leaseOwner: null, leaseExpiresAt: null, lastError: 'Waiting for controller-owned staging preparation before operations acceptance',
+          });
+          this.store.recordEvent('task.staging_preparation_requested', task.id, { commitSha: task.baseSha });
+          return;
+        }
+      }
 
       let lastHeartbeat = 0;
       const heartbeatInterval = Math.max(1_000, Math.min(30_000, Math.floor(this.config.worker.leaseMs / 3)));
@@ -212,24 +280,66 @@ export class HarnessSupervisor {
         const now = Date.now();
         if (now - lastHeartbeat < Math.max(500, Math.floor(heartbeatInterval / 2))) return;
         lastHeartbeat = now;
-        this.store.heartbeat(task.id, this.workerId, this.config.worker.leaseMs, now);
+        try {
+          const current = this.store.get(task.id);
+          if (!['active', 'verifying'].includes(current.state) ||
+              current.leaseOwner !== this.workerId ||
+              typeof current.leaseExpiresAt !== 'number' || current.leaseExpiresAt <= now) {
+            stopHeartbeat();
+            localAbort.abort();
+            return;
+          }
+          this.store.heartbeat(task.id, this.workerId, this.config.worker.leaseMs, now);
+        } catch {
+          stopHeartbeat();
+          localAbort.abort();
+        }
       };
       executionHeartbeatTimer = setInterval(heartbeat, heartbeatInterval);
       executionHeartbeatTimer.unref();
-      await prepareProjectCheckout(worktree.path, signal);
+      const stopHeartbeat = (): void => {
+        if (executionHeartbeatTimer !== null) {
+          clearInterval(executionHeartbeatTimer);
+          executionHeartbeatTimer = null;
+        }
+      };
+      const onCandidateReady = (eventId: string): void => {
+        candidateReadyEventId = eventId;
+      };
+      const recovery = await this.recoverInterruptedCandidate(
+        task, worktree.path, executionSignal, inheritedCandidateMarker,
+      );
+      if (recovery.kind === 'lost-lease') return;
+      const stored = this.store.get(task.id);
+      if (stored.state !== 'active' || stored.leaseOwner !== this.workerId ||
+          typeof stored.leaseExpiresAt !== 'number' || stored.leaseExpiresAt <= Date.now()) {
+        inheritedCandidateMarker(null);
+        return;
+      }
+      task = stored;
+      if (recovery.kind === 'candidate') {
+        await this.verifyCandidate(task, worktree.path, recovery.summary, executionSignal, stopHeartbeat, onCandidateReady, recovery.commitSha);
+        return;
+      }
+      const advanced = await this.advanceImplementationBase(task, worktree.path);
+      if (advanced) task = advanced;
+      await prepareProjectCheckout(worktree.path, executionSignal);
       const qwenResult = await this.qwen.execute({
         task,
         worktree: worktree.path,
         feedback: task.lastError ? [task.lastError] : [],
         onHeartbeat: heartbeat,
         onSession: (sessionId) => {
-          if (this.store.get(task.id).qwenSessionId !== sessionId) this.store.patch(task.id, { qwenSessionId: sessionId });
+          if (this.store.get(task.id).qwenSessionId !== sessionId) {
+            this.store.patch(task.id, { qwenSessionId: sessionId, qwenWorkflowRunId: null, qwenAutomaticStop: null });
+          }
         },
-        signal,
+        signal: executionSignal,
       });
       task = this.store.patch(task.id, {
         qwenSessionId: qwenResult.sessionId,
         qwenWorkflowRunId: qwenResult.workflowRunId,
+        qwenAutomaticStop: qwenResult.needsContinuation ? qwenResult.automaticStop ?? null : null,
       });
       if (qwenResult.needsContinuation) {
         const continuations = (task.continuations ?? 0) + 1;
@@ -238,121 +348,756 @@ export class HarnessSupervisor {
           goalReason: qwenResult.goalReason,
           usage: qwenResult.usage,
           continuations,
+          automaticStop: task.qwenAutomaticStop ?? null,
         });
         if (qwenResult.continuationKind === 'provider') {
-          const resumeAfter = Date.now() + Math.max(this.config.worker.pollIntervalMs, 30_000);
+          const providerReason = qwenResult.goalReason ?? 'Qwen provider is temporarily unavailable';
+          const now = Date.now();
+          const defaultWaitMs = Math.max(this.config.worker.pollIntervalMs, 30_000);
+          // A structured quota reason may carry the exact provider reset time.
+          // When it parses and is admitted (future, within the 32-day cap),
+          // wait until the reset plus a modest safety margin instead of
+          // burning ~30-second retries against an exhausted quota. Missing or
+          // invalid reset strings fall back to bounded exponential backoff.
+          const resetAt = parseProviderResetAt(providerReason, now);
+          const waitUntil = resetAt !== null
+            ? Math.min(
+              Math.max(now + defaultWaitMs, resetAt + PROVIDER_RESET_SAFETY_MARGIN_MS),
+              now + PROVIDER_RESET_MAX_FUTURE_MS,
+            )
+            : now + providerFallbackWaitMs(defaultWaitMs, continuations);
+          // Never shorten a still-durable provider wait: a fresh provider
+          // continuation recorded while an earlier resumeAfter is still in the
+          // future may only extend the wait, never pull it earlier.
+          const existingWait = typeof task.resumeAfter === 'number' && task.resumeAfter > now
+            ? task.resumeAfter
+            : 0;
+          const resumeAfter = Math.max(waitUntil, existingWait);
           this.store.transition(task.id, 'waiting', {
             continuations,
             waitKind: 'provider',
             resumeAfter,
             leaseOwner: null,
             leaseExpiresAt: null,
-            lastError: qwenResult.goalReason ?? 'Qwen provider is temporarily unavailable',
-          });
-          this.store.recordEvent('task.provider_wait', task.id, { continuations, resumeAfter, reason: qwenResult.goalReason });
-        } else if (continuations >= this.config.worker.maxContinuations) {
-          this.store.patch(task.id, { continuations });
-          this.store.recordFailure(
-            task.id,
-            `Qwen paused ${continuations} consecutive times without completing the goal; last reason: ${qwenResult.goalReason ?? 'budget or provider wait'}`,
-            this.config.worker.identicalFailureLimit,
-          );
-        } else {
-          this.store.transition(task.id, 'ready', {
-            continuations,
-            waitKind: null,
-            resumeAfter: null,
-            leaseOwner: null,
-            leaseExpiresAt: null,
+            // A provider wait is not repair feedback: preserving it here would
+            // start a fresh Qwen session instead of resuming the saved one.
             lastError: null,
           });
+          this.store.recordEvent('task.provider_wait', task.id, { continuations, resumeAfter, reason: providerReason, resetAt });
+        } else {
+          // Provider waits are already persisted as task.provider_wait events
+          // and must not consume the budget-continuation allowance: compare
+          // the total continuation count minus the recorded provider waits,
+          // clamped at 0, against the configured bound. Total continuation
+          // and provider-wait history stay untouched.
+          // Invariant: every persisted task.provider_wait event corresponds
+          // to exactly one provider-kind continuation of this task, and no
+          // other code path records, rewrites, or deletes these events. This
+          // count-based subtraction is only correct while that 1:1 mapping
+          // holds; a second writer or a replayed/deduplicated key here would
+          // silently misprice the budget-continuation allowance.
+          const providerWaits = this.store.countTaskEvents(task.id, 'task.provider_wait');
+          const budgetContinuations = Math.max(0, continuations - providerWaits);
+          if (budgetContinuations >= this.config.worker.maxContinuations) {
+            this.store.patch(task.id, { continuations });
+            this.store.recordFailure(
+              task.id,
+              `Qwen reached the configured budget-continuation limit of ${this.config.worker.maxContinuations} after ${budgetContinuations} budget continuations (${continuations} total continuations, ${providerWaits} provider waits); last reason: ${qwenResult.goalReason ?? 'budget or provider wait'}`,
+              this.config.worker.identicalFailureLimit,
+            );
+          } else {
+            this.store.transition(task.id, 'ready', {
+              continuations,
+              waitKind: null,
+              resumeAfter: null,
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              lastError: null,
+            });
+          }
         }
         return;
       }
 
-      task = this.store.transition(task.id, 'verifying');
-      const changedBeforeCommit = await this.git.changedFiles(worktree.path);
-      this.git.assertNoProtectedChanges(changedBeforeCommit);
-      const commitSha = await this.git.commitCandidate(worktree.path, task, qwenResult.summary);
-      task = this.store.patch(task.id, { commitSha });
-      const changedFiles = await this.git.filesChangedBetween(worktree.path, task.baseSha as string, commitSha);
-      this.git.assertNoProtectedChanges(changedFiles);
-      const diff = await this.git.diff(worktree.path, task.baseSha as string, commitSha);
-      const verificationPath = await this.git.createDetachedWorktree(
-        commitSha,
-        `candidate-${task.issueNumber}-${commitSha.slice(0, 12)}`,
-      );
-      let scorecard: RewardScorecard;
-      try {
-        await prepareProjectCheckout(verificationPath, signal);
-        const gateResults = await this.gates.runAll(this.config.gates, verificationPath, changedFiles, signal);
-        const failedGate = gateResults.find((gate) => gate.required && gate.applicable && !gate.ok);
-        if (failedGate) {
-          throw new Error(`Gate ${failedGate.id} failed: ${(failedGate.stderr || failedGate.stdout).slice(-1_500)}`);
-        }
-        const sideEffectFailure = await this.gateSideEffectFailure(verificationPath);
-        if (sideEffectFailure) throw new Error(sideEffectFailure);
-        scorecard = await this.rewards.evaluate({
-          config: this.config,
-          task,
-          worktree: verificationPath,
-          commitSha,
-          changedFiles,
-          diff,
-          gateResults,
-          signal,
-        });
-      } finally {
-        await this.git.removeOwnedWorktree(verificationPath, { allowDirty: true });
-      }
-      this.store.saveScorecard(scorecard);
-      if (!scorecard.passed) {
-        throw new Error(`Reward verification failed: ${scorecard.blockingReasons.join('; ')}`);
-      }
-      throwIfAborted(signal);
-      await this.git.pushCandidate(worktree.path, task.branch as string, commitSha);
-      await this.publishRewardCheck(scorecard);
+      await this.runLocalGateReverification(task, worktree.path, executionSignal);
 
-      throwIfAborted(signal);
-      const pr = await this.github.createPullRequest({
-        title: `[harness] ${task.title}`,
-        body: renderPullRequestBody(task, qwenResult.summary, scorecard),
-        head: task.branch as string,
-        headSha: task.commitSha as string,
-        base: this.config.project.defaultBranch,
-      });
-      task = this.store.transition(task.id, 'pr_open', {
-        prNumber: pr.number,
-        prUrl: pr.url,
-        leaseOwner: this.workerId,
-        leaseExpiresAt: Date.now() + this.config.worker.leaseMs,
-      });
-      clearInterval(executionHeartbeatTimer);
-      executionHeartbeatTimer = null;
-      this.checkpoint(task, { prNumber: pr.number, commitSha });
-      await this.reconcileWithLease(task, signal);
+      await this.verifyCandidate(
+        task,
+        worktree.path,
+        qwenResult.summary,
+        executionSignal,
+        stopHeartbeat,
+        onCandidateReady,
+      );
     } catch (error) {
-      if (signal?.aborted) this.releaseInterruptedTask(task.id);
+      const current = this.store.get(task.id);
+      if (current.leaseOwner !== null && current.leaseOwner !== this.workerId) {
+        return;
+      }
+      const leaseHeld = current.leaseOwner === this.workerId &&
+        typeof current.leaseExpiresAt === 'number' && current.leaseExpiresAt > Date.now();
+      if (['leased', 'active', 'verifying'].includes(current.state) && !leaseHeld) return;
+      if (signal?.aborted) this.releaseInterruptedTask(task.id, candidateReadyEventId, inheritedCandidateMarkerId);
       else await this.failAttempt(task.id, error);
     } finally {
       if (executionHeartbeatTimer) clearInterval(executionHeartbeatTimer);
     }
   }
 
-  private releaseInterruptedTask(taskId: string): void {
+  /**
+   * Deterministic local gate re-verification of the uncommitted Qwen
+   * candidate, run between the local handoff and commitCandidate. A workflow
+   * reviewer cannot prove timestamp freshness, so the supervisor itself runs
+   * the immutable controller-packaged
+   * template/.qwen-harness/scripts/run-gates.mjs inside the candidate
+   * worktree (never the mutable tracked project script) and requires a fresh
+   * machine receipt: terminal exit 0, status passed, the exact worktree and
+   * HEAD evaluated, no HEAD movement during the run, every configured required
+   * gate passed, and no input drift. Fail closed on a missing runner, an invalid receipt, or any failed
+   * check; the failure blocks commitCandidate, the PR, and independent review
+   * exactly like the existing exact-commit gates — a gate side effect on the
+   * candidate worktree now fails here first, before anything is committed.
+   * Recovered interrupted candidates skip this step: they are already exact commits re-verified by
+   * the exact-commit gates, so restart recovery is preserved. This never
+   * edits product code or weakens any gate.
+   */
+  private async runLocalGateReverification(task: TaskRecord, worktreePath: string, signal?: AbortSignal): Promise<void> {
+    // The exact HEAD the gates must evaluate: normally the saved base, but on
+    // a repair retry after an earlier committed candidate it is that candidate
+    // commit. What must hold deterministically is that the receipt describes
+    // precisely this HEAD and that it does not move during the run.
+    const headBefore = await this.git.headSha(worktreePath);
+    const result = await runLocalGateReverification({
+      worktreePath,
+      expectedHead: headBefore,
+      gates: this.config.gates,
+      signal,
+    });
+    const headAfter = await this.git.headSha(worktreePath);
+    if (headAfter !== headBefore) {
+      throw new Error(
+        `Local gate re-verification failed: candidate worktree HEAD moved from ${headBefore} to ${headAfter} during gate execution`,
+      );
+    }
+    this.store.recordEvent('task.local_reverification', task.id, {
+      runId: result.runId,
+      head: result.head,
+      status: 'passed',
+      gates: result.gateCount,
+    }, `local-reverification:${task.id}:${result.runId}`);
+  }
+
+  private async verifyCandidate(
+    task: TaskRecord,
+    worktreePath: string,
+    summary: string,
+    signal: AbortSignal | undefined,
+    stopHeartbeat: () => void,
+    onCandidateReady: (eventId: string) => void,
+    recoveredCommitSha?: string,
+  ): Promise<void> {
+    task = this.store.transition(task.id, 'verifying');
+    const changedBeforeCommit = await this.git.changedFiles(worktreePath);
+    this.git.assertNoProtectedChanges(changedBeforeCommit);
+    const readOnly = changedBeforeCommit.length === 0 &&
+      await this.git.headSha(worktreePath) === task.baseSha && this.isReadOnlyProgramTask(task);
+    let commitSha: string;
+    if (recoveredCommitSha === undefined) {
+      commitSha = readOnly
+        ? task.baseSha as string
+        : await this.git.commitCandidate(worktreePath, task, summary);
+    } else {
+      if (changedBeforeCommit.length !== 0 ||
+          (await this.git.headSha(worktreePath)) !== recoveredCommitSha ||
+          task.commitSha !== recoveredCommitSha) {
+        throw new Error('Recovered candidate no longer matches the clean worktree HEAD or stored commit');
+      }
+      commitSha = recoveredCommitSha;
+    }
+    task = this.store.patch(task.id, { commitSha });
+    const candidateReadyEvent = this.store.recordEvent('task.candidate_ready', task.id, {
+      commitSha,
+      baseSha: task.baseSha,
+      branch: task.branch,
+      contractHash: sha256(JSON.stringify(task.spec)),
+      attempts: task.attempts,
+      lineageFailures: task.lineageFailures ?? task.attempts,
+      readOnly,
+      summary: summary.slice(0, 12_000),
+      qwenSessionId: task.qwenSessionId,
+      qwenWorkflowRunId: task.qwenWorkflowRunId,
+    }, randomUUID());
+    onCandidateReady(candidateReadyEvent.id);
+    const changedFiles = await this.git.filesChangedBetween(worktreePath, task.baseSha as string, commitSha);
+    this.git.assertNoProtectedChanges(changedFiles);
+    const diff = await this.git.diff(worktreePath, task.baseSha as string, commitSha);
+    const verificationPath = await this.git.createDetachedWorktree(
+      commitSha,
+      `candidate-${task.issueNumber}-${commitSha.slice(0, 12)}`,
+    );
+    let scorecard: RewardScorecard;
+    try {
+      await prepareProjectCheckout(verificationPath, signal);
+      const gateResults = await this.gates.runAll(this.config.gates, verificationPath, changedFiles, signal);
+      const failedGate = gateResults.find((gate) => gate.required && gate.applicable && !gate.ok);
+      if (failedGate) {
+        throw new Error(`Gate ${failedGate.id} failed: ${(failedGate.stderr || failedGate.stdout).slice(-1_500)}`);
+      }
+      const sideEffectFailure = await this.gateSideEffectFailure(verificationPath);
+      if (sideEffectFailure) throw new Error(sideEffectFailure);
+      scorecard = await this.rewards.evaluate({
+        config: this.config,
+        task,
+        worktree: verificationPath,
+        commitSha,
+        changedFiles,
+        diff,
+        gateResults,
+        signal,
+      });
+    } finally {
+      await this.git.removeOwnedWorktree(verificationPath, { allowDirty: true });
+    }
+    this.store.saveScorecard(scorecard);
+    if (!scorecard.passed) {
+      throw new Error(`Reward verification failed: ${scorecard.blockingReasons.join('; ')}`);
+    }
+    throwIfAborted(signal);
+    if (readOnly) {
+      await this.finishReadOnlyTask(task, scorecard, signal);
+      return;
+    }
+    await this.git.pushCandidate(worktreePath, task.branch as string, commitSha);
+    await this.publishRewardCheck(scorecard);
+
+    throwIfAborted(signal);
+    const pr = await this.github.createPullRequest({
+      title: `[harness] ${task.title}`,
+      body: renderPullRequestBody(task, summary, scorecard),
+      head: task.branch as string,
+      headSha: task.commitSha as string,
+      base: this.config.project.defaultBranch,
+    });
+    task = this.store.transition(task.id, 'pr_open', {
+      prNumber: pr.number,
+      prUrl: pr.url,
+      leaseOwner: this.workerId,
+      leaseExpiresAt: Date.now() + this.config.worker.leaseMs,
+    });
+    stopHeartbeat();
+    this.checkpoint(task, { prNumber: pr.number, commitSha });
+    await this.reconcileWithLease(task, signal);
+  }
+
+  private readOnlyProgramLink(task: TaskRecord): { plan: PortfolioPlanRecord; story: PortfolioStoryRecord } | undefined {
+    if (!this.config.program.enabled || !task.spec) return undefined;
+    const spec = task.spec as NonNullable<TaskRecord['spec']>;
+    const eligible = this.store.listPortfolioPlans().flatMap((plan) =>
+      plan.stories
+        .filter((story) =>
+          plan.approvedAt !== null && ['active', 'blocked'].includes(plan.status) &&
+          !story.supersededAt && story.normalizedIssueNumber === task.issueNumber &&
+          (story.wave ?? 1) <= (plan.currentWave ?? 1) &&
+          ['verify', 'operate'].includes(story.workType ?? '') &&
+          matchesPortfolioTaskContract(plan, story, spec),
+        )
+        .map((story) => ({ plan, story })),
+    );
+    if (eligible.length > 1) {
+      const links = eligible.map((link) => `${link.plan.id}/${link.story.key}`).join(', ');
+      throw new Error(`Ambiguous read-only program authorization for task ${task.id}: ${links}`);
+    }
+    return eligible[0];
+  }
+
+  private isReadOnlyProgramTask(task: TaskRecord): boolean {
+    return Boolean(this.readOnlyProgramLink(task));
+  }
+
+  private async finishReadOnlyTask(task: TaskRecord, scorecard: RewardScorecard, signal?: AbortSignal): Promise<void> {
+    const checks = await this.github.checksForRef(scorecard.commitSha, [...REQUIRED_POST_MERGE_GITHUB_CHECKS]);
+    if (checks.failed.length) throw new Error(`GitHub checks failed: ${checks.failed.join(', ')}`);
+    const issue = await this.github.getIssue(task.issueNumber);
+    const remoteSpec = parseNormalizedSpec(issue.body);
+    const link = this.readOnlyProgramLink(task);
+    if (!link) throw new Error('Read-only program contract changed during verification');
+    if (!remoteSpec || !this.config.intake.trustedAuthors.includes(issue.author) ||
+        !issue.labels.includes(this.config.intake.normalizedLabel) ||
+        !matchesPortfolioTaskContract(link.plan, link.story, remoteSpec)) {
+      throw new Error('Read-only issue contract changed during verification');
+    }
+    const needsDeployment = link.story.workType === 'operate' && this.config.deployment.staging.enabled;
+    const deployment = this.store.listDeployments(link.plan.id)[0];
+    const verifiedDeployment = !needsDeployment || (deployment?.status === 'succeeded' &&
+      deployment.commitSha === scorecard.commitSha && deployment.observedRevision === scorecard.commitSha);
+    if (!checks.complete || !checks.successful || !verifiedDeployment) {
+      const reason = !verifiedDeployment ? 'Waiting for controller-owned staging verification of this exact commit'
+        : `Waiting for required GitHub checks: ${checks.pending.join(', ') || 'not successful'}`;
+      this.store.transition(task.id, 'waiting', {
+        waitKind: 'provider', resumeAfter: Date.now() + Math.max(this.config.worker.pollIntervalMs, 30_000),
+        leaseOwner: null, leaseExpiresAt: null, lastError: reason,
+      });
+      this.store.recordEvent('task.verification_wait', task.id, { commitSha: scorecard.commitSha, reason });
+      return;
+    }
+    // Required checks and independent review describe the current merged commit, not an obsolete snapshot.
+    await this.git.verifyRemoteHead(this.config.project.defaultBranch, scorecard.commitSha);
+    if (await this.git.headSha(task.worktreePath as string) !== scorecard.commitSha ||
+        (await this.git.changedFiles(task.worktreePath as string)).length > 0) {
+      throw new Error('Read-only task worktree changed during verification');
+    }
+    throwIfAborted(signal);
+    this.store.recordEvent('task.read_only_verified', task.id, {
+      commitSha: scorecard.commitSha, scorecardId: scorecard.id, issueNumber: task.issueNumber,
+    }, `read-only-verified:${task.id}:${scorecard.commitSha}`);
+    this.store.transition(task.id, 'done', {
+      mergeSha: scorecard.commitSha, leaseOwner: null, leaseExpiresAt: null, lastError: null,
+    });
+    await this.reconcileReadOnlyClosures();
+    try {
+      await this.git.removeOwnedWorktree(task.worktreePath as string);
+    } catch (error) {
+      this.logger.warn('worktree cleanup deferred', { taskId: task.id, error: String(error) });
+    }
+  }
+
+  private async reconcileReadOnlyClosures(): Promise<void> {
+    for (const event of this.store.listEvents('task.read_only_verified')) {
+      if (!event.taskId) continue;
+      const task = this.store.get(event.taskId);
+      const key = `read-only-closed:${task.id}`;
+      if (task.state !== 'done' || this.store.hasIdempotencyKey(key)) continue;
+      try {
+        // Absolute PATCH is idempotent; the durable receipt survives interruption or provider failure.
+        await this.github.updateIssue(task.issueNumber, { state: 'closed' });
+        this.store.recordEvent('task.read_only_closed', task.id, { issueNumber: task.issueNumber }, key);
+      } catch (error) {
+        this.logger.warn('verified task issue closure deferred', { taskId: task.id, error: String(error) });
+      }
+    }
+  }
+
+  private releaseInterruptedTask(
+    taskId: string, markerId: string | null = null, inheritedMarkerId: string | null = null,
+  ): void {
     const current = this.store.get(taskId);
     if (!['leased', 'active', 'verifying'].includes(current.state)) return;
-    const message = 'Worker shutdown interrupted the prior attempt; inspect the existing worktree and continue from its saved Qwen session.';
+    const message = 'Worker shutdown interrupted the prior attempt; inspect and continue from the existing worktree. The controller selects the appropriate session for recovery.';
     const released = this.store.transition(taskId, 'ready', {
       leaseOwner: null,
       leaseExpiresAt: null,
       lastError: message,
     });
-    this.store.recordEvent('task.interrupted', taskId, {
+    const interruptedPayload: Record<string, unknown> = {
       from: current.state,
       qwenSessionId: released.qwenSessionId,
-    });
+    };
+    if (current.state === 'verifying' && markerId !== null) {
+      const marker = this.store.listEvents('task.candidate_ready').find(
+        (event) => event.id === markerId && event.taskId === taskId,
+      );
+      if (
+        marker &&
+        marker.payload.commitSha === current.commitSha &&
+        marker.payload.baseSha === current.baseSha &&
+        marker.payload.branch === current.branch &&
+        marker.payload.contractHash === sha256(JSON.stringify(current.spec)) &&
+        marker.payload.attempts === current.attempts &&
+        marker.payload.lineageFailures === (current.lineageFailures ?? current.attempts)
+      ) {
+        interruptedPayload.candidateReadyEventId = markerId;
+      }
+    }
+    if (current.state === 'active' && inheritedMarkerId !== null) {
+      const inherited = this.store.listEvents('task.candidate_ready').find(
+        (event) => event.id === inheritedMarkerId && event.taskId === taskId,
+      );
+      if (
+        inherited &&
+        !this.store.hasIdempotencyKey(`candidate-consumed:${inherited.id}`) &&
+        inherited.payload.commitSha === current.commitSha &&
+        inherited.payload.baseSha === current.baseSha &&
+        inherited.payload.branch === current.branch &&
+        inherited.payload.contractHash === sha256(JSON.stringify(current.spec)) &&
+        inherited.payload.attempts === current.attempts &&
+        inherited.payload.lineageFailures === (current.lineageFailures ?? current.attempts) &&
+        inherited.payload.qwenSessionId === current.qwenSessionId &&
+        inherited.payload.qwenWorkflowRunId === current.qwenWorkflowRunId
+      ) {
+        interruptedPayload.candidateReadyEventId = inheritedMarkerId;
+        interruptedPayload.inheritedCandidateRecovery = true;
+      }
+    }
+    this.store.recordEvent('task.interrupted', taskId, interruptedPayload);
     this.logger.info('task released after worker shutdown', { taskId, from: current.state });
+  }
+
+  private async recoverInterruptedCandidate(
+    task: TaskRecord,
+    worktreePath: string,
+    signal?: AbortSignal,
+    onInheritedMarker?: (markerId: string | null) => void,
+  ): Promise<{ kind: 'none' } | { kind: 'lost-lease' } | { kind: 'candidate'; commitSha: string; summary: string }> {
+    const ownsActiveLease = (record: TaskRecord, now = Date.now()): boolean =>
+      record.state === 'active' && record.leaseOwner === this.workerId &&
+      typeof record.leaseExpiresAt === 'number' && record.leaseExpiresAt > now;
+    const interrupted = this.store.listEvents('task.interrupted').filter((event) => event.taskId === task.id).at(-1);
+    const inheritedActive = interrupted?.payload.from === 'active' &&
+      interrupted.payload.inheritedCandidateRecovery === true;
+    if (!interrupted || typeof interrupted.payload.candidateReadyEventId !== 'string' ||
+        (interrupted.payload.from !== 'verifying' && !inheritedActive)) {
+      return { kind: 'none' };
+    }
+    const marker = this.store.listEvents('task.candidate_ready').find(
+      (event) => event.id === interrupted.payload.candidateReadyEventId && event.taskId === task.id,
+    );
+    if (!marker || this.store.hasIdempotencyKey(`candidate-consumed:${marker.id}`)) return { kind: 'none' };
+    const stored = this.store.get(task.id);
+    if (!ownsActiveLease(stored)) return { kind: 'lost-lease' };
+    onInheritedMarker?.(marker.id);
+    const issue = (await this.github.listOpenIssues()).find((candidate) => candidate.number === task.issueNumber) ?? null;
+    const remoteSpec = issue ? parseNormalizedSpec(issue.body) : null;
+    const headSha = await this.git.headSha(worktreePath);
+    const dirtyFiles = await this.git.changedFiles(worktreePath);
+    const currentBaseSha = await this.git.baseSha();
+    const fresh = this.store.get(task.id);
+    if (!ownsActiveLease(fresh)) {
+      onInheritedMarker?.(null);
+      return { kind: 'lost-lease' };
+    }
+    const issueAuthorized = issue !== null && remoteSpec !== null &&
+      this.config.intake.trustedAuthors.includes(issue.author) &&
+      issue.labels.includes(this.config.intake.normalizedLabel) &&
+      sha256(JSON.stringify(remoteSpec)) === sha256(JSON.stringify(fresh.spec));
+    const links = this.store.listPortfolioPlans().flatMap((plan) => plan.stories
+      .filter((story) => story.normalizedIssueNumber === task.issueNumber).map((story) => ({ plan, story })));
+    const programAuthorized = links.length === 0 || links.some(({ plan, story }) =>
+      typeof plan.approvedAt === 'number' && Number.isFinite(plan.approvedAt) && plan.approvedAt > 0 &&
+      ['active', 'blocked'].includes(plan.status) && !story.supersededAt &&
+      (story.wave ?? 1) <= (plan.currentWave ?? 1) && fresh.spec !== null &&
+      matchesPortfolioTaskContract(plan, story, fresh.spec as NonNullable<TaskRecord['spec']>),
+    );
+    if (!issueAuthorized || !programAuthorized) {
+      onInheritedMarker?.(null);
+      throw new Error(`Interrupted candidate for task ${task.id} failed issue or program contract reauthorization`);
+    }
+    const commitSha = typeof marker.payload.commitSha === 'string' ? marker.payload.commitSha : null;
+    const summary = typeof marker.payload.summary === 'string' && marker.payload.summary.trim().length > 0
+      ? marker.payload.summary : null;
+    const cleanHead = dirtyFiles.length === 0 ? headSha : null;
+    const evidenceValid = commitSha !== null && summary !== null && /^[0-9a-f]{40}$/.test(commitSha) &&
+      marker.payload.commitSha === fresh.commitSha && marker.payload.baseSha === fresh.baseSha &&
+      marker.payload.baseSha === currentBaseSha && cleanHead === commitSha &&
+      marker.payload.branch === fresh.branch && marker.payload.contractHash === sha256(JSON.stringify(fresh.spec)) &&
+      marker.payload.attempts === fresh.attempts &&
+      marker.payload.lineageFailures === (fresh.lineageFailures ?? fresh.attempts) &&
+      marker.payload.qwenSessionId === fresh.qwenSessionId &&
+      marker.payload.qwenWorkflowRunId === fresh.qwenWorkflowRunId &&
+      (cleanHead === fresh.baseSha && this.isReadOnlyProgramTask(fresh)) === marker.payload.readOnly;
+    if (!evidenceValid) onInheritedMarker?.(null);
+    throwIfAborted(signal);
+    const consumerId = randomUUID();
+    onInheritedMarker?.(null);
+    const consumed = this.store.recordEvent('task.candidate_recovery_consumed', task.id,
+      { markerId: marker.id, eligible: evidenceValid, consumerId }, `candidate-consumed:${marker.id}`);
+    if (consumed.payload.consumerId !== consumerId) return { kind: 'lost-lease' };
+    if (!evidenceValid || commitSha === null || summary === null) return { kind: 'none' };
+    return { kind: 'candidate', commitSha, summary };
+  }
+
+  /**
+   * Advance a task-owned implementation worktree to the current remote base when the
+   * only intervening change is controller-managed harness assets, so the next Qwen
+   * session executes against the tracked workflows instead of stale ones. The
+   * untracked candidate is never touched. Returns the patched task, or null when a
+   * guard declines and execution must proceed with the worktree unchanged.
+   */
+  private async advanceImplementationBase(task: TaskRecord, worktreePath: string): Promise<TaskRecord | null> {
+    if (this.isReadOnlyProgramTask(task) || task.commitSha !== null || task.baseSha === null) return null;
+    const unconsumedCandidate = this.store.listEvents('task.candidate_ready').some(
+      (event) => event.taskId === task.id && !this.store.hasIdempotencyKey(`candidate-consumed:${event.id}`),
+    );
+    if (unconsumedCandidate) return null;
+    const savedBase = task.baseSha;
+    const remoteBase = await this.git.baseSha();
+    if (remoteBase === savedBase) return null;
+    const head = await this.git.headSha(worktreePath);
+    const requests = this.store
+      .listEvents('task.implementation_base_advance_requested')
+      .filter((event) => event.taskId === task.id);
+    const latest = requests.at(-1);
+    const requestedTarget = typeof latest?.payload.commitSha === 'string' ? latest.payload.commitSha : null;
+    // Crash recovery: the merge already landed but the task patch did not.
+    const reconciling = requestedTarget !== null && head === requestedTarget && head !== savedBase;
+    if (!reconciling && head !== savedBase) return null;
+    const target = reconciling
+      ? head
+      : await this.selectManagedAdvanceTarget(worktreePath, savedBase, remoteBase);
+    if (target === null) return null;
+    if (!(await this.git.isAncestor(worktreePath, savedBase, target))) {
+      if (reconciling) {
+        throw new Error(`Durable implementation base advance for task ${task.id} is not descended from base ${savedBase}`);
+      }
+      return null;
+    }
+    const changed = await this.git.filesChangedBetween(worktreePath, savedBase, target);
+    if (!(await this.isPermittedBaseDiff(worktreePath, savedBase, target, changed))) {
+      if (reconciling) {
+        throw new Error(`Durable implementation base advance for task ${task.id} includes non-managed changes: ${changed.join(', ')}`);
+      }
+      return null;
+    }
+    // Only advance onto bytes that exactly match the immutable installed
+    // controller templates. Every managed asset is verified at the target
+    // commit, not only the paths listed as changed, so a partial or mixed
+    // upgrade (one asset at template bytes while the others stay stale) is
+    // declined; deletions or arbitrary modified workflow, agent, or runner
+    // content are likewise rejected.
+    const templateCheck = await this.verifyManagedAssetsMatchTemplates(worktreePath, target);
+    if (!templateCheck.ok) {
+      if (reconciling) {
+        throw new Error(
+          `Durable implementation base advance for task ${task.id} failed controller template verification: ${templateCheck.reason}`,
+        );
+      }
+      return null;
+    }
+    // Narrow tracked-candidate allowance: only disjoint ordinary unstaged
+    // modifications — porcelain ' M' —
+    // of already-tracked regular files may ride under the fast-forward.
+    // Staged or mixed modifications are untested in this flow and, like
+    // renames, copies, conflicts, typechanges, submodule or symlink edits,
+    // additions, and deletions, fail closed, as does any tracked path that
+    // overlaps the controller-managed remote diff.
+    const trackedCandidates = await this.git.trackedCandidates(worktreePath);
+    const tracked = trackedCandidates.map((entry) => entry.path).sort();
+    const unsupportedTracked = trackedCandidates.filter((entry) => !isOrdinaryTrackedModification(entry.status));
+    if (unsupportedTracked.length > 0) {
+      if (reconciling) {
+        throw new Error(
+          `Durable implementation base advance for task ${task.id} found unsupported tracked changes: ${unsupportedTracked.map((entry) => `${entry.path} (${entry.status.trim() || 'index'})`).join(', ')}`,
+        );
+      }
+      return null;
+    }
+    const trackedOverlap = tracked.filter((file) => changed.includes(file));
+    if (trackedOverlap.length > 0) {
+      if (reconciling) {
+        throw new Error(
+          `Durable implementation base advance for task ${task.id} has tracked candidates overlapping managed base changes: ${trackedOverlap.join(', ')}`,
+        );
+      }
+      return null;
+    }
+    const untracked = (await this.git.untrackedFiles(worktreePath)).sort();
+    if (untracked.some((file) => changed.includes(file))) {
+      if (reconciling) {
+        throw new Error(`Durable implementation base advance for task ${task.id} collides with untracked candidate files`);
+      }
+      return null;
+    }
+    if (reconciling) {
+      this.assertRecordedCandidateMatches(task, latest, savedBase, worktreePath, untracked, trackedCandidates);
+      this.store.recordEvent('task.implementation_base_advance_completed', task.id,
+        { previousSha: savedBase, commitSha: head }, `implementation-base-completed:${task.id}:${head}`);
+      return this.store.patch(task.id, { baseSha: head });
+    }
+    if (latest?.payload.previousSha === savedBase && latest.payload.commitSha === target) {
+      // A prior request for this same savedBase+target exists but the merge
+      // never landed (HEAD is still savedBase). recordEvent is idempotent on
+      // the request key, so this retry cannot refresh stale evidence; verify
+      // the recorded candidate bytes against the current snapshot instead.
+      this.assertRecordedCandidateMatches(task, latest, savedBase, worktreePath, untracked, trackedCandidates);
+    }
+    const digestSnapshot = this.git.untrackedDigestSnapshot(worktreePath, untracked);
+    const trackedSnapshot = this.git.trackedCandidateSnapshot(worktreePath, trackedCandidates);
+    this.store.recordEvent('task.implementation_base_advance_requested', task.id,
+      {
+        previousSha: savedBase, commitSha: target, untrackedFiles: untracked, untrackedDigests: digestSnapshot,
+        trackedFiles: tracked, trackedSnapshot,
+      },
+      `implementation-base-request:${task.id}:${target}`);
+    await this.git.advanceImplementationBase(worktreePath, head, target, untracked, tracked);
+    // The merge verified its own before/after bytes, but the durable request
+    // snapshot was taken before the event write; fail closed if either the
+    // untracked or the tracked candidate drifted between that snapshot and
+    // the completed merge.
+    const mergedDigests = this.git.untrackedDigestSnapshot(worktreePath, untracked);
+    const mergedDrift = untracked.filter((file) => mergedDigests[file] !== digestSnapshot[file]);
+    if (mergedDrift.length > 0) {
+      throw new Error(
+        `Implementation base advance for task ${task.id} found candidate byte drift between the request snapshot and the merge: ${mergedDrift.join(', ')}`,
+      );
+    }
+    const mergedTrackedCandidates = await this.git.trackedCandidates(worktreePath);
+    const mergedTrackedSnapshot = this.git.trackedCandidateSnapshot(worktreePath, mergedTrackedCandidates);
+    // Compare the full tracked path set, not only the expected path digests:
+    // any extra tracked path that appeared between the GitWorkspace return
+    // and this outer verification must fail closed before the completion
+    // event is written. (A disappeared path already fails via the digest
+    // comparison below, since its merged snapshot entry is undefined.)
+    const trackedSet = new Set(tracked);
+    const extraTracked = mergedTrackedCandidates
+      .map((entry) => entry.path)
+      .filter((file) => !trackedSet.has(file))
+      .sort();
+    if (extraTracked.length > 0) {
+      throw new Error(
+        `Implementation base advance for task ${task.id} found extra tracked paths after the merge: ${extraTracked.join(', ')}`,
+      );
+    }
+    const mergedTrackedDrift = tracked.filter((file) =>
+      !trackedSnapshotEntryEquals(mergedTrackedSnapshot[file], trackedSnapshot[file]),
+    );
+    if (mergedTrackedDrift.length > 0) {
+      throw new Error(
+        `Implementation base advance for task ${task.id} found tracked candidate byte drift between the request snapshot and the merge: ${mergedTrackedDrift.join(', ')}`,
+      );
+    }
+    this.store.recordEvent('task.implementation_base_advance_completed', task.id,
+      { previousSha: savedBase, commitSha: target }, `implementation-base-completed:${task.id}:${target}`);
+    return this.store.patch(task.id, { baseSha: target });
+  }
+
+  /**
+   * Fail closed unless the durable request evidence still describes the exact
+   * current candidates: same saved base, same tracked and untracked file sets,
+   * identical per-file byte (or symlink-target) digests for untracked files,
+   * and identical status, mode, and byte digests for tracked candidate edits.
+   * Malformed records fail closed.
+   */
+  private assertRecordedCandidateMatches(
+    task: TaskRecord,
+    event: HarnessEvent | undefined,
+    savedBase: string,
+    worktreePath: string,
+    untracked: string[],
+    trackedCandidates: Array<{ path: string; status: string }>,
+  ): void {
+    const recorded = Array.isArray(event?.payload.untrackedFiles)
+      ? [...(event?.payload.untrackedFiles as string[])].sort()
+      : null;
+    if (event?.payload.previousSha !== savedBase || recorded === null ||
+        recorded.length !== untracked.length || recorded.some((file, index) => file !== untracked[index])) {
+      throw new Error(`Durable implementation base advance for task ${task.id} no longer matches the recorded request evidence`);
+    }
+    // Same names are not enough: every candidate byte (or symlink target)
+    // recorded in the durable request must still match exactly.
+    const recordedDigests = untrackedDigestRecord(event?.payload.untrackedDigests);
+    if (recordedDigests === null || Object.keys(recordedDigests).length !== untracked.length ||
+        untracked.some((file) => typeof recordedDigests[file] !== 'string')) {
+      throw new Error(`Durable implementation base advance for task ${task.id} lacks valid recorded candidate digests`);
+    }
+    const currentDigests = this.git.untrackedDigestSnapshot(worktreePath, untracked);
+    const drifted = untracked.filter((file) => currentDigests[file] !== recordedDigests[file]);
+    if (drifted.length > 0) {
+      throw new Error(`Durable implementation base advance for task ${task.id} found candidate byte drift: ${drifted.join(', ')}`);
+    }
+    const tracked = trackedCandidates.map((entry) => entry.path).sort();
+    const recordedTracked = Array.isArray(event?.payload.trackedFiles)
+      ? [...(event?.payload.trackedFiles as string[])].sort()
+      : [];
+    if (recordedTracked.length !== tracked.length ||
+        recordedTracked.some((file, index) => file !== tracked[index])) {
+      throw new Error(`Durable implementation base advance for task ${task.id} no longer matches the recorded request evidence`);
+    }
+    if (tracked.length > 0) {
+      const recordedSnapshot = trackedSnapshotRecord(event?.payload.trackedSnapshot);
+      if (recordedSnapshot === null || Object.keys(recordedSnapshot).length !== tracked.length ||
+          tracked.some((file) => recordedSnapshot[file] === undefined)) {
+        throw new Error(`Durable implementation base advance for task ${task.id} lacks valid recorded tracked candidate snapshots`);
+      }
+      const currentSnapshot = this.git.trackedCandidateSnapshot(worktreePath, trackedCandidates);
+      const trackedDrift = tracked.filter((file) =>
+        !trackedSnapshotEntryEquals(recordedSnapshot[file], currentSnapshot[file]),
+      );
+      if (trackedDrift.length > 0) {
+        throw new Error(`Durable implementation base advance for task ${task.id} found tracked candidate byte drift: ${trackedDrift.join(', ')}`);
+      }
+    }
+  }
+
+  private async verifyManagedAssetsMatchTemplates(
+    worktreePath: string,
+    targetSha: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    for (const file of CONTROLLER_MANAGED_BASE_ASSETS) {
+      const template = controllerTemplateBytes(file);
+      if (template === null) {
+        return { ok: false, reason: `installed controller template for ${file} is missing or unreadable` };
+      }
+      if (!(await this.git.blobMatches(worktreePath, targetSha, file, template))) {
+        return { ok: false, reason: `${file} at ${targetSha} does not match the installed controller template` };
+      }
+    }
+    return { ok: true };
+  }
+
+  /** The only non-managed base change permitted during implementation is an
+   * opt-in to review-finding collection. No gate, model, authority, deployment,
+   * or other config field can change through this path. */
+  private async isPermittedBaseDiff(
+    worktreePath: string,
+    savedBase: string,
+    target: string,
+    changed: string[],
+  ): Promise<boolean> {
+    if (changed.length === 0) return false;
+    const nonManaged = changed.filter((file) => !CONTROLLER_MANAGED_BASE_ASSETS.has(file));
+    if (nonManaged.length === 0) return true;
+    if (nonManaged.length !== 1 || nonManaged[0] !== PROJECT_CONFIG_RELATIVE_PATH) return false;
+    const beforeText = await this.git.regularFileAtCommit(worktreePath, savedBase, PROJECT_CONFIG_RELATIVE_PATH);
+    const afterText = await this.git.regularFileAtCommit(worktreePath, target, PROJECT_CONFIG_RELATIVE_PATH);
+    if (beforeText === null || afterText === null) return false;
+    let before: unknown;
+    let after: unknown;
+    try {
+      before = JSON.parse(beforeText);
+      after = JSON.parse(afterText);
+    } catch {
+      return false;
+    }
+    if (!isJsonObject(before) || !isJsonObject(after) ||
+        !isJsonObject(before.evolution) || !isJsonObject(after.evolution)) return false;
+    const previous = before.evolution.reviewFindings;
+    if ((previous !== undefined && previous !== false) || after.evolution.reviewFindings !== true) return false;
+    const beforeComparable = { ...before, evolution: { ...before.evolution } };
+    const afterComparable = { ...after, evolution: { ...after.evolution } };
+    delete beforeComparable.evolution.reviewFindings;
+    delete afterComparable.evolution.reviewFindings;
+    return isDeepStrictEqual(beforeComparable, afterComparable);
+  }
+
+  /** Stop at the last safe first-parent prefix. A permitted config-only commit
+   * may be traversed while old managed assets remain, but the selected target
+   * must have every managed asset at immutable installed-template bytes.
+   */
+  private async selectManagedAdvanceTarget(
+    worktreePath: string,
+    savedBase: string,
+    remoteBase: string,
+  ): Promise<string | null> {
+    const chain = await this.git.firstParentRange(worktreePath, savedBase, remoteBase);
+    let target: string | null = null;
+    let previous = savedBase;
+    for (const commit of chain) {
+      const changed = await this.git.filesChangedBetween(worktreePath, savedBase, commit);
+      if (!(await this.isPermittedBaseDiff(worktreePath, savedBase, commit, changed))) break;
+      const stepChanged = await this.git.filesChangedBetween(worktreePath, previous, commit);
+      let unsafeManagedChange = false;
+      for (const file of stepChanged.filter((entry) => CONTROLLER_MANAGED_BASE_ASSETS.has(entry))) {
+        const template = controllerTemplateBytes(file);
+        if (template === null || !(await this.git.blobMatches(worktreePath, commit, file, template))) {
+          unsafeManagedChange = true;
+          break;
+        }
+      }
+      if (unsafeManagedChange) break;
+      const templates = await this.verifyManagedAssetsMatchTemplates(worktreePath, commit);
+      if (templates.ok) target = commit;
+      previous = commit;
+    }
+    return target;
   }
 
   private async reconcilePending(signal?: AbortSignal): Promise<TaskRecord[]> {
@@ -374,19 +1119,6 @@ export class HarnessSupervisor {
         const current = this.store.get(task.id);
         if (signal?.aborted) {
           this.store.recordEvent('task.reconciliation_interrupted', task.id, { state: current.state });
-        } else if (current.state === 'post_merge') {
-          const message = error instanceof Error ? error.message : String(error);
-          const updated = this.store.recordPostMergeFailure(
-            task.id,
-            message,
-            this.config.worker.identicalFailureLimit,
-          );
-          this.logger.warn('post-merge verification retry scheduled', {
-            taskId: task.id,
-            state: updated.state,
-            attempts: updated.attempts,
-            error: message,
-          });
         } else {
           await this.failAttempt(task.id, error);
         }
@@ -480,6 +1212,8 @@ export class HarnessSupervisor {
 
   private async runPostMerge(task: TaskRecord, signal?: AbortSignal): Promise<void> {
     if (!task.mergeSha) throw new Error('Post-merge verification requires mergeSha');
+    const runId = randomUUID();
+    const startedAt = Date.now();
     const verificationPath = await this.git.createDetachedWorktree(task.mergeSha, `postmerge-${task.issueNumber}`);
     let failure: string | null = null;
     try {
@@ -490,6 +1224,16 @@ export class HarnessSupervisor {
       if (failed.length > 0) failure = failed.map((gate) => `${gate.id}: ${(gate.stderr || gate.stdout).slice(-700)}`).join('\n');
       const sideEffectFailure = await this.gateSideEffectFailure(verificationPath);
       if (!failure && sideEffectFailure) failure = sideEffectFailure;
+      throwIfAborted(signal);
+      this.store.recordEvent('postmerge.verification', task.id, {
+        runId,
+        mergeSha: task.mergeSha,
+        startedAt,
+        finishedAt: Date.now(),
+        passed: failure === null,
+        sideEffectFailure: sideEffectFailure !== null,
+        gates: results.map(safePostMergeGateMetadata),
+      }, `postmerge-verification:${runId}`);
     } finally {
       await this.git.removeOwnedWorktree(verificationPath, { allowDirty: true });
     }
@@ -591,6 +1335,16 @@ export class HarnessSupervisor {
     const message = redactText(error instanceof Error ? error.message : String(error));
     const task = this.store.get(taskId);
     if (['done', 'failed', 'cancelled', 'quarantined'].includes(task.state)) return;
+    if (task.state === 'post_merge') {
+      const updated = this.store.recordPostMergeFailure(taskId, message, this.config.worker.identicalFailureLimit);
+      this.logger.warn('post-merge verification retry scheduled', {
+        taskId,
+        state: updated.state,
+        attempts: updated.attempts,
+        error: message,
+      });
+      return;
+    }
     const updated = this.store.recordFailure(taskId, message, this.config.worker.identicalFailureLimit);
     this.logger.warn('task attempt failed', { taskId, state: updated.state, attempts: updated.attempts, error: message });
     if (updated.prNumber) {
@@ -632,6 +1386,108 @@ export class HarnessSupervisor {
 
 }
 
+/** Upper bound on a goalReason inspected for a reset timestamp, so the
+ * strict scan never runs over unbounded provider output. */
+const PROVIDER_RESET_MAX_REASON_LENGTH = 2_000;
+/** Provider resets further than 32 days out are not admitted; the wait cap
+ * matches this horizon. */
+const PROVIDER_RESET_MAX_FUTURE_MS = 32 * 24 * 60 * 60 * 1_000;
+/** Modest safety margin added to an admitted reset so the resumed session
+ * lands strictly after the quota is restored. */
+const PROVIDER_RESET_SAFETY_MARGIN_MS = 5 * 60 * 1_000;
+/** Cap for exponential provider-wait backoff without an admitted reset. */
+const PROVIDER_BACKOFF_CAP_MS = 24 * 60 * 60 * 1_000;
+/** Doubling stops here so base * 2**exponent can never overflow. */
+const PROVIDER_BACKOFF_MAX_EXPONENT = 20;
+
+const FULL_RESET_PATTERN = /reset at (\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)? UTC/;
+const YEARLESS_RESET_PATTERN = /reset at (\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}) UTC/;
+
+/**
+ * Parse a strict provider reset timestamp out of a structured qwenResult
+ * goalReason: either a full `YYYY-MM-DD[ HH:mm[:ss]] UTC` form or a yearless
+ * `MM-DD HH:mm:ss UTC` form (as emitted by token-plan quota messages).
+ * Yearless values resolve to the next valid UTC occurrence of that calendar
+ * moment. Returns the reset epoch milliseconds, or null when the reason is
+ * missing, oversized, malformed, not a real calendar date (round-trip
+ * verified), in the past, or further than 32 days out. Pure: no clock or
+ * store access.
+ */
+export function parseProviderResetAt(reason: string | null | undefined, now: number): number | null {
+  if (typeof reason !== 'string' || reason.length === 0 ||
+      reason.length > PROVIDER_RESET_MAX_REASON_LENGTH || !Number.isFinite(now)) {
+    return null;
+  }
+  const full = FULL_RESET_PATTERN.exec(reason);
+  if (full) {
+    const candidate = utcTimestampStrict(
+      Number(full[1]), Number(full[2]), Number(full[3]),
+      Number(full[4] ?? '0'), Number(full[5] ?? '0'), Number(full[6] ?? '0'),
+    );
+    return candidate !== null && admittedResetWindow(candidate, now) ? candidate : null;
+  }
+  const yearless = YEARLESS_RESET_PATTERN.exec(reason);
+  if (yearless) {
+    const currentYear = new Date(now).getUTCFullYear();
+    for (const year of [currentYear, currentYear + 1]) {
+      const candidate = utcTimestampStrict(
+        year, Number(yearless[1]), Number(yearless[2]),
+        Number(yearless[3]), Number(yearless[4]), Number(yearless[5]),
+      );
+      if (candidate !== null && admittedResetWindow(candidate, now)) return candidate;
+    }
+  }
+  return null;
+}
+
+/** Bounded exponential backoff for provider waits without an admitted reset
+ * timestamp, driven by the persisted continuation count and capped at 24
+ * hours. The exponent is bounded so the doubling can never overflow. Pure. */
+export function providerFallbackWaitMs(defaultWaitMs: number, continuations: number): number {
+  const base = Math.max(1, defaultWaitMs);
+  const exponent = Math.min(Math.max(Math.trunc(continuations) || 1, 1) - 1, PROVIDER_BACKOFF_MAX_EXPONENT);
+  return Math.min(base * 2 ** exponent, PROVIDER_BACKOFF_CAP_MS);
+}
+
+function admittedResetWindow(candidate: number, now: number): boolean {
+  // Admit only resets that fit inside the 32-day wait cap MINUS the safety
+  // margin. Admitting a reset exactly at the cap would let the capped
+  // resumeAfter land at or before resetAt, resuming before the quota is
+  // restored; the margin-subtracted bound guarantees resetAt + margin always
+  // fits under the cap.
+  return candidate > now && candidate - now <= PROVIDER_RESET_MAX_FUTURE_MS - PROVIDER_RESET_SAFETY_MARGIN_MS;
+}
+
+/** Date.UTC plus a strict round-trip check so nonexistent calendar moments
+ * (e.g. 02-30, 04-31) are rejected instead of silently rolling over. */
+function utcTimestampStrict(
+  year: number, month: number, day: number, hour: number, minute: number, second: number,
+): number | null {
+  if (month < 1 || month > 12 || day < 1 || day > 31 ||
+      hour > 23 || minute > 59 || second > 59) return null;
+  const timestamp = Date.UTC(year, month - 1, day, hour, minute, second);
+  const roundTrip = new Date(timestamp);
+  if (roundTrip.getUTCFullYear() !== year || roundTrip.getUTCMonth() !== month - 1 ||
+      roundTrip.getUTCDate() !== day || roundTrip.getUTCHours() !== hour ||
+      roundTrip.getUTCMinutes() !== minute || roundTrip.getUTCSeconds() !== second) {
+    return null;
+  }
+  return timestamp;
+}
+
+function safePostMergeGateMetadata(gate: GateResult): Pick<GateResult, 'id' | 'kind' | 'required' | 'applicable' | 'ok' | 'exitCode' | 'durationMs' | 'evidenceHash'> {
+  return {
+    id: redactText(gate.id).slice(0, 200),
+    kind: gate.kind,
+    required: gate.required,
+    applicable: gate.applicable,
+    ok: gate.ok,
+    exitCode: gate.exitCode,
+    durationMs: gate.durationMs,
+    evidenceHash: redactText(gate.evidenceHash).slice(0, 128),
+  };
+}
+
 function repairLineage(body: string, store: PersistentTaskStore): Pick<TaskRecord, 'failureLineageId' | 'lineageFailures' | 'identicalFailures' | 'lastFailureFingerprint'> | null {
   const originIssue = /Origin task:\s*#(\d+)/i.exec(body)?.[1];
   if (!originIssue) return null;
@@ -663,6 +1519,75 @@ function renderPullRequestBody(task: TaskRecord, summary: string, scorecard: Rew
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+/**
+ * Validate a persisted untracked-digest snapshot from durable request
+ * evidence. Returns null unless the value is a plain object mapping
+ * repository-relative paths to non-empty digest strings, so reconciliation
+ * fails closed on missing, malformed, or non-string entries.
+ */
+function untrackedDigestRecord(value: unknown): Record<string, string> | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const record: Record<string, string> = {};
+  for (const [file, digest] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof digest !== 'string' || digest.length === 0) return null;
+    record[file] = digest;
+  }
+  return record;
+}
+
+/**
+ * Validate a persisted tracked-candidate snapshot from durable request
+ * evidence. Returns null unless the value is a plain object mapping
+ * repository-relative paths to valid { status, mode, sha256 } entries, so
+ * reconciliation fails closed on missing, malformed, or tampered records.
+ */
+function trackedSnapshotRecord(value: unknown): Record<string, TrackedCandidateDigest> | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const record: Record<string, TrackedCandidateDigest> = {};
+  for (const [file, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return null;
+    const candidate = entry as Record<string, unknown>;
+    if (typeof candidate.status !== 'string' || !isOrdinaryTrackedModification(candidate.status) ||
+        typeof candidate.mode !== 'number' || !Number.isFinite(candidate.mode) ||
+        typeof candidate.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(candidate.sha256)) {
+      return null;
+    }
+    record[file] = { status: candidate.status, mode: candidate.mode, sha256: candidate.sha256 };
+  }
+  return record;
+}
+
+function trackedSnapshotEntryEquals(
+  recorded: TrackedCandidateDigest | undefined,
+  current: TrackedCandidateDigest | undefined,
+): boolean {
+  return recorded !== undefined && current !== undefined &&
+    recorded.status === current.status &&
+    recorded.mode === current.mode &&
+    recorded.sha256 === current.sha256;
+}
+
+/**
+ * Read the exact bytes of an installed controller template asset from the
+ * immutable package template directory. Returns null whenever the asset cannot
+ * be verified, so callers fail closed instead of advancing onto unknown bytes.
+ */
+function controllerTemplateBytes(relative: string): Buffer | null {
+  try {
+    const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const templatePath = path.join(packageRoot, 'template', ...relative.split('/'));
+    const stat = lstatSync(templatePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) return null;
+    return readFileSync(templatePath);
+  } catch {
+    return null;
+  }
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

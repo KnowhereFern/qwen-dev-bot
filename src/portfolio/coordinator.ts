@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { PersistentTaskStore } from '../core/persistent-store.js';
 import type {
+  ApprovedProgramContract,
   PortfolioPlan,
   PortfolioStory,
   ProgramRevision,
@@ -16,6 +17,13 @@ import type { PortfolioDraft } from './planner.js';
 const PLAN_MARKER = 'qwen-harness-plan:v1';
 const STORY_MARKER = 'qwen-harness-plan-story:v1';
 const NORMALIZED_STORY_MARKER = 'qwen-harness-plan-normalized:v1';
+
+export class RecoveryLineageError extends Error {
+  constructor(message: string, readonly storyKeys: string[], readonly originIssueNumbers: number[], readonly assessmentId: string) {
+    super(message);
+    this.name = 'RecoveryLineageError';
+  }
+}
 
 export class PortfolioCoordinator {
   constructor(
@@ -99,6 +107,29 @@ export class PortfolioCoordinator {
     return { plan: await this.publishDraft(plan), created: true };
   }
 
+  assertCanRedraft(input: {
+    planId: string;
+    sourcePath: string;
+    content: string;
+    reviseObjective?: boolean;
+    expected?: { revision: number; contentHash: string };
+  }): PortfolioPlan {
+    const current = this.requirePlan(input.planId);
+    if (!['draft', 'awaiting_initial_approval'].includes(current.status) || current.approvedAt !== null) {
+      throw new Error(`Portfolio plan ${current.id} can only be redrafted before initial approval`);
+    }
+    if (input.reviseObjective && !input.expected) {
+      throw new Error('Objective revision requires the current --revision and --hash review guards');
+    }
+    if (input.expected && ((current.revision ?? 1) !== input.expected.revision || current.contentHash !== input.expected.contentHash)) {
+      throw new Error('The program changed since review. Review the current draft before redrafting.');
+    }
+    if (input.sourcePath !== current.sourcePath || (sha256(input.content) !== current.contentHash && !input.reviseObjective)) {
+      throw new Error('Plan redraft must preserve the originally proposed objective and requirements file; use --revise-objective explicitly before initial approval');
+    }
+    return current;
+  }
+
   async replaceUnapprovedDraft(input: {
     planId: string;
     sourcePath: string;
@@ -106,15 +137,12 @@ export class PortfolioCoordinator {
     draft: PortfolioDraft;
     assessment: RepositoryAssessment;
     summary: string;
+    reviseObjective?: boolean;
+    expected?: { revision: number; contentHash: string };
   }): Promise<PortfolioPlan> {
-    const current = this.requirePlan(input.planId);
-    if (!['draft', 'awaiting_initial_approval'].includes(current.status) || current.approvedAt !== null) {
-      throw new Error(`Portfolio plan ${current.id} can only be redrafted before initial approval`);
-    }
+    const current = this.assertCanRedraft(input);
     const contentHash = sha256(input.content);
-    if (contentHash !== current.contentHash || input.sourcePath !== current.sourcePath) {
-      throw new Error('Plan redraft must preserve the originally proposed objective and requirements file');
-    }
+    const objectiveChanged = contentHash !== current.contentHash;
     const now = Date.now();
     const nextRevision = (current.revision ?? 1) + 1;
     const preserved = current.stories.map((story) => ({ ...story, supersededAt: story.supersededAt ?? now }));
@@ -139,13 +167,18 @@ export class PortfolioCoordinator {
       assessmentId: input.assessment.id,
       repositorySha: input.assessment.commitSha,
       reason: 'manual',
-      material: false,
+      material: objectiveChanged,
       summary: input.summary,
       createdAt: now,
       approvedAt: null,
+      objectiveContentHash: contentHash,
+      objectiveSourceContent: input.content,
+      objectiveSourcePath: input.sourcePath,
     };
     let plan = this.save({
       ...current,
+      contentHash,
+      sourceContent: input.content,
       title: input.draft.title,
       objective: input.draft.objective,
       constraints: [...input.draft.constraints],
@@ -159,7 +192,12 @@ export class PortfolioCoordinator {
       coverage: structuredClone(input.assessment.coverage),
       revision: nextRevision,
       currentWave: 1,
-      revisions: [...(current.revisions ?? []), revision],
+      revisions: [...(current.revisions ?? []).map((prior) => ({
+        ...prior,
+        objectiveContentHash: prior.objectiveContentHash ?? current.contentHash,
+        objectiveSourceContent: prior.objectiveSourceContent ?? current.sourceContent,
+        objectiveSourcePath: prior.objectiveSourcePath ?? current.sourcePath,
+      })), revision],
       updatedAt: now,
     });
     plan = await this.publishDraft(plan);
@@ -168,12 +206,19 @@ export class PortfolioCoordinator {
       revision: nextRevision,
       assessmentId: input.assessment.id,
       storyCount: newStories.length,
+      objectiveChanged,
+      previousContentHash: current.contentHash,
+      contentHash,
+      phase: 'planning',
     }, `portfolio:redraft:${plan.id}:${nextRevision}`);
     return plan;
   }
 
-  async approve(planId: string): Promise<PortfolioPlan> {
+  async approve(planId: string, expected?: { revision: number; contentHash: string }): Promise<PortfolioPlan> {
     let plan = this.requirePlan(planId);
+    if (expected && ((plan.revision ?? 1) !== expected.revision || plan.contentHash !== expected.contentHash)) {
+      throw new Error('The program changed since review. Review the current revision before approving.');
+    }
     if (['done', 'delivered', 'maintaining', 'active'].includes(plan.status)) return plan;
     if (plan.status === 'blocked') {
       throw new Error(`Portfolio plan ${plan.id} is blocked; resolve its failed tasks before approving another revision`);
@@ -197,6 +242,9 @@ export class PortfolioCoordinator {
       throw new Error(
         `GitHub user ${actor} is not in intake.trustedAuthors; rerun setup/update with --trusted-author ${actor}`,
       );
+    }
+    if (this.config.program.enabled && !this.config.gates.some((gate) => gate.required && gate.kind !== 'security' && gate.id !== 'harness-security')) {
+      throw new Error('Program approval requires at least one required product verification gate. Configure checks for the proposed stack before approving; the harness can create their implementation in its first story. Drafting remains available.');
     }
 
     plan = await this.publishDraft(await this.recoverRemoteIssues(plan));
@@ -245,6 +293,7 @@ export class PortfolioCoordinator {
   }): Promise<PortfolioPlan> {
     const current = this.requirePlan(input.planId);
     if (!this.config.program.enabled) throw new Error('Program revision requires program.enabled');
+    const recoveryOrigins = this.recoveryOrigins(current, input.draft, input.assessment, input.material);
     const nextRevision = (current.revision ?? 1) + 1;
     const now = Date.now();
     const preserved = current.stories.map((story) =>
@@ -257,14 +306,9 @@ export class PortfolioCoordinator {
     const priorWaveKeys = input.reason === 'quarantine' ? [] : current.stories
       .filter((story) => (story.wave ?? 1) === (current.currentWave ?? 1) && !story.supersededAt)
       .map((story) => story.key);
-    const failureOriginIssueNumber = input.reason === 'quarantine'
-      ? current.stories
-          .filter((story) => (story.wave ?? 1) === (current.currentWave ?? 1))
-          .map((story) => story.normalizedIssueNumber)
-          .find((issueNumber) => issueNumber !== null && this.store.findByIssue(issueNumber)?.state === 'quarantined') ?? null
-      : null;
     const revisedDrafts = input.draft.stories.map((story) => ({
       ...story,
+      failureOriginIssueNumber: recoveryOrigins.get(story.key) ?? null,
       key: keyMap.get(story.key) as string,
       dependsOn: unique(story.dependsOn.map((key) => keyMap.get(key) ?? key)),
     }));
@@ -277,7 +321,7 @@ export class PortfolioCoordinator {
       ]),
       revision: nextRevision,
       supersededAt: null,
-      failureOriginIssueNumber: story.dependsOn.length === 0 ? failureOriginIssueNumber : null,
+      failureOriginIssueNumber: story.failureOriginIssueNumber,
       sourceIssueNumber: null,
       sourceIssueUrl: null,
       normalizedIssueNumber: null,
@@ -293,6 +337,12 @@ export class PortfolioCoordinator {
       createdAt: now,
       approvedAt: input.material && !input.approvedMaterial ? null : now,
       sourceSignalId: input.sourceSignalId ?? null,
+      ...(input.material ? { priorApprovedContract: {
+        approvedRevision: [...(current.revisions ?? [])].reverse().find((entry) => entry.approvedAt !== null && !entry.rejectedAt)?.number ?? current.revision ?? 1,
+        currentWave: current.currentWave ?? 1,
+        title: current.title, constraints: [...current.constraints], definitionOfDone: [...current.definitionOfDone],
+        technologyDecisions: structuredClone(current.technologyDecisions), deploymentDecisions: structuredClone(current.deploymentDecisions),
+      } } : {}),
     };
     let plan = this.save({
       ...current,
@@ -321,6 +371,131 @@ export class PortfolioCoordinator {
     }, `program:revision:${plan.id}:${nextRevision}`);
     if (!input.material || input.approvedMaterial) plan = await this.activateWave(plan.id, plan.currentWave ?? 1);
     return plan;
+  }
+
+  async rejectMaterialRevision(input: {
+    planId: string;
+    expected: { revision: number; contentHash: string };
+    operator: string;
+    reason: string;
+    legacyRecovery?: { contract: ApprovedProgramContract; provenance: string };
+  }): Promise<PortfolioPlan> {
+    const current = this.requirePlan(input.planId);
+    if (!this.config.program.enabled || current.status !== 'awaiting_material_approval') throw new Error('Only a pending material program revision can be rejected');
+    if (current.revision !== input.expected.revision || current.contentHash !== input.expected.contentHash) throw new Error('The program changed since review');
+    if (!input.operator.trim() || !input.reason.trim()) throw new Error('Rejection requires an operator and reason');
+    const pending = current.revisions?.find((entry) => entry.number === current.revision);
+    if (!pending?.material || pending.approvedAt !== null || pending.rejectedAt) throw new Error('Revision is not an unapproved material proposal');
+    const actor = await this.github.currentUser();
+    if (!this.config.intake.trustedAuthors.includes(actor)) throw new Error(`GitHub user ${actor} is not in intake.trustedAuthors`);
+    const contract = pending.priorApprovedContract ?? input.legacyRecovery?.contract;
+    const provenance = pending.priorApprovedContract ? 'Saved prior approved contract' : input.legacyRecovery?.provenance;
+    if (!contract || !provenance?.trim()) throw new Error('Legacy revision needs the complete verified prior approved contract and recovery provenance');
+    if (!Number.isSafeInteger(contract.currentWave) || contract.currentWave < 1) throw new Error('Recovery requires the prior approved current wave');
+    const approved = current.revisions?.find((entry) => entry.number === contract.approvedRevision && entry.approvedAt !== null && !entry.rejectedAt);
+    const latestApproved = [...(current.revisions ?? [])].reverse().find((entry) => entry.number < pending.number && entry.approvedAt !== null && !entry.rejectedAt);
+    if (!approved || approved.number !== latestApproved?.number) throw new Error('Recovery must reference the latest earlier approved revision');
+    const assessment = this.store.getRepositoryAssessment(approved.assessmentId);
+    if (!assessment || assessment.projectId !== current.projectId) throw new Error('Prior approved assessment is unavailable');
+    const proposed = current.stories.filter((story) => story.revision === pending.number);
+    const remote = await this.github.listOpenIssues();
+    if (proposed.some((story) => story.normalizedIssueNumber !== null ||
+      this.store.list().some((task) => task.body.includes(`${NORMALIZED_STORY_MARKER} ${current.id}:${story.key} -->`)) ||
+      remote.some((issue) => issue.body.includes(`${NORMALIZED_STORY_MARKER} ${current.id}:${story.key} -->`)))) {
+      throw new Error('Pending revision has normalized execution work; reconcile it before rejection');
+    }
+    if (JSON.stringify(this.requirePlan(current.id)) !== JSON.stringify(current)) throw new Error('The program changed during rejection; review again');
+    const now = Date.now();
+    const nextRevision = pending.number + 1;
+    const restored: PortfolioPlan = {
+      ...current, title: contract.title, constraints: [...contract.constraints], definitionOfDone: [...contract.definitionOfDone],
+      technologyDecisions: structuredClone(contract.technologyDecisions), deploymentDecisions: structuredClone(contract.deploymentDecisions),
+      assessmentId: approved.assessmentId, repositorySha: approved.repositorySha, coverage: structuredClone(assessment.coverage),
+      revision: nextRevision, currentWave: contract.currentWave, status: 'assessing', updatedAt: now,
+      stories: current.stories.map((story) => story.revision === pending.number ? { ...story, supersededAt: now }
+        : story.normalizedIssueNumber === null && story.supersededAt === pending.createdAt ? { ...story, supersededAt: null } : story),
+      revisions: [...(current.revisions ?? []).map((entry) => entry.number === pending.number
+        ? { ...entry, priorApprovedContract: structuredClone(contract), rejectedAt: now, rejection: { operator: input.operator, reason: input.reason, provenance } } : entry), {
+        number: nextRevision, assessmentId: approved.assessmentId, repositorySha: approved.repositorySha,
+        reason: 'manual', material: false, summary: `Rejected revision ${pending.number}; restored approved revision ${approved.number}: ${input.reason}`,
+        createdAt: now, approvedAt: approved.approvedAt, restoresRevision: approved.number,
+      }],
+    };
+    this.save(restored);
+    this.store.recordEvent('program.material_revision_rejected', null, {
+      planId: current.id, rejectedRevision: pending.number, revision: nextRevision, restoredRevision: approved.number,
+      operator: input.operator, actor, reason: input.reason, provenance,
+    }, `program:rejected:${current.id}:${pending.number}`);
+    await this.updateEpic(restored);
+    return restored;
+  }
+
+  private recoveryOrigins(current: PortfolioPlan, draft: PortfolioDraft, assessment: RepositoryAssessment, material: boolean): Map<string, number> {
+    const identity = (value: string) => value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+    const failed = (task: TaskRecord) => ['failed', 'quarantined'].includes(task.state);
+    const records = current.stories.flatMap((story) => {
+      const task = story.normalizedIssueNumber === null ? null : this.store.findByIssue(story.normalizedIssueNumber);
+      return task ? [{ story, task }] : [];
+    });
+    const failedIssues = records.filter(({ task }) => failed(task)).map(({ task }) => task.issueNumber);
+    const reject = (keys: string[], message: string, origins = failedIssues): never => {
+      throw new RecoveryLineageError(message, keys, unique(origins), assessment.id);
+    };
+    const historicalIds = new Map<string, Set<string>>();
+    const established = new Set<string>();
+    const coverageAt = (revision: number) => {
+      const record = current.revisions?.find((item) => item.number === revision);
+      const saved = record ? this.store.getRepositoryAssessment(record.assessmentId) : null;
+      return saved?.coverage ?? (revision === (current.revision ?? 1) ? current.coverage : undefined);
+    };
+    for (const revision of new Set([current.revision ?? 1, ...current.stories.map((story) => story.revision ?? 1)])) {
+      for (const entry of coverageAt(revision) ?? []) {
+        const requirement = identity(entry.requirement);
+        established.add(requirement);
+        const meanings = historicalIds.get(entry.id) ?? new Set<string>();
+        meanings.add(requirement); historicalIds.set(entry.id, meanings);
+      }
+    }
+    const latest = new Map<string, Array<{ story: PortfolioStory; task: TaskRecord }>>();
+    for (const record of records) {
+      // Merely publishing or starting a replacement is not successful recovery.
+      if (!failed(record.task) && record.task.state !== 'done') continue;
+      const coverage = coverageAt(record.story.revision ?? 1);
+      const requirements = record.story.coverageIds?.map((id) => coverage?.find((entry) => entry.id === id)?.requirement);
+      if (!requirements?.length || requirements.some((value) => !value)) {
+        if (failed(record.task)) reject(draft.stories.map((story) => story.key), `Cannot resolve requirement identity for failed issue #${record.task.issueNumber}. Restore its saved assessment before revising.`, [record.task.issueNumber]);
+        continue;
+      }
+      for (const requirement of requirements) {
+        const key = identity(requirement!);
+        const previous = latest.get(key) ?? [];
+        const revision = record.story.revision ?? 1;
+        const priorRevision = previous[0]?.story.revision ?? 1;
+        if (!previous.length || revision > priorRevision) latest.set(key, [record]);
+        else if (revision === priorRevision) previous.push(record);
+      }
+    }
+    const origins = new Map<string, number>();
+    for (const story of draft.stories) {
+      if (!story.coverageIds?.length) {
+        if (failedIssues.length) reject([story.key], `Story ${story.key} needs coverage identities before recovery can be revised.`);
+        continue;
+      }
+      const matches: TaskRecord[] = [];
+      for (const id of story.coverageIds) {
+        const entries = assessment.coverage.filter((entry) => entry.id === id);
+        if (entries.length !== 1) reject([story.key], `Story ${story.key} has unresolved or ambiguous coverage ${id}.`);
+        const requirement = identity(entries[0]!.requirement);
+        const meanings = historicalIds.get(id);
+        if (meanings && (meanings.size !== 1 || !meanings.has(requirement))) reject([story.key], `Coverage ${id} changes an existing requirement identity; preserve it before revising ${story.key}.`);
+        if (failedIssues.length && !established.has(requirement) && !material) reject([story.key], `Story ${story.key} has an unrecognized requirement identity; preserve established wording or request a material revision.`);
+        matches.push(...(latest.get(requirement) ?? []).filter(({ task }) => failed(task)).map(({ task }) => task));
+      }
+      const lineages = new Set(matches.map((task) => task.failureLineageId ?? task.id));
+      if (lineages.size > 1) reject([story.key], `Story ${story.key} combines multiple failure lineages; split it into independent repair stories.`, matches.map((task) => task.issueNumber));
+      if (matches.length) origins.set(story.key, Math.max(...matches.map((task) => task.issueNumber)));
+    }
+    return origins;
   }
 
   async updateProgramState(
@@ -435,7 +610,7 @@ export class PortfolioCoordinator {
       coverage: structuredClone(plan.coverage ?? []),
       latestDeploymentId: plan.latestDeploymentId ?? null,
       stories,
-      counts: countStates(stories.map((story) => story.state)),
+      counts: countStates(stories.filter((story) => !story.superseded).map((story) => story.state)),
     };
   }
 
@@ -608,7 +783,7 @@ export function matchesPortfolioTaskContract(
 
 function renderEpic(plan: PortfolioPlan, tasks: TaskRecord[]): string {
   const statusNote = ['draft', 'awaiting_initial_approval'].includes(plan.status)
-    ? 'Review-only draft. No story is executable until `qwen-harness plan-approve` is run explicitly.'
+    ? 'Review-only draft. No story is executable until `fern-harness plan-approve` is run explicitly.'
     : `Plan status: **${plan.status}**.`;
   return [
     statusNote,

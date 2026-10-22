@@ -56,6 +56,9 @@ export async function installWorkerService(
   <key>ProgramArguments</key><array>
     ${programArguments.map((argument) => `<string>${xml(argument)}</string>`).join('')}
   </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>${xml(process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin')}</string>
+  </dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${xml(path.join(stateRoot, 'logs', 'worker.log'))}</string>
   <key>StandardErrorPath</key><string>${xml(path.join(stateRoot, 'logs', 'worker.error.log'))}</string>
@@ -67,9 +70,15 @@ export async function installWorkerService(
       chmodSync(file, 0o600);
       await runProcess({ command: 'launchctl', args: ['bootout', `gui/${process.getuid?.() ?? 0}/${LAUNCHD_LABEL}`], cwd: os.homedir(), timeoutMs: 10_000 });
       await runProcess({ command: 'launchctl', args: ['bootout', `gui/${process.getuid?.() ?? 0}/${LEGACY_LAUNCHD_LABEL}`], cwd: os.homedir(), timeoutMs: 10_000 });
+      // bootout can return before launchd removes the registration. Do not
+      // bootstrap a replacement until both exact service labels are absent.
+      for (const label of [LAUNCHD_LABEL, LEGACY_LAUNCHD_LABEL]) {
+        const problem = await waitForLaunchdUnload(label);
+        if (problem) return { platform: process.platform, file, envFile, credentialsPersisted, installed: false, message: problem };
+      }
       if (existsSync(legacyFile)) rmSync(legacyFile);
       const loaded = await runProcess({ command: 'launchctl', args: ['bootstrap', `gui/${process.getuid?.() ?? 0}`, file], cwd: os.homedir(), timeoutMs: 10_000 });
-      if (loaded.exitCode !== 0) return { platform: process.platform, file, envFile, credentialsPersisted, installed: false, message: loaded.stderr.trim() };
+      if (loaded.exitCode !== 0) return { platform: process.platform, file, envFile, credentialsPersisted, installed: false, message: 'macOS could not start the shared worker. Return to Start or resume delivery and retry starting the worker. If it still fails, inspect the worker service logs. Do not run the harness with sudo.' };
     }
     return { platform: process.platform, file, envFile, credentialsPersisted, installed: !dryRun, message: dryRun ? 'would install launchd service' : 'launchd service installed' };
   }
@@ -116,6 +125,17 @@ WantedBy=default.target
   }
 
   return { platform: process.platform, file: '', envFile, credentialsPersisted, installed: false, message: 'automatic service installation is unsupported on this platform' };
+}
+
+async function waitForLaunchdUnload(label: string): Promise<string | undefined> {
+  const service = `gui/${process.getuid?.() ?? 0}/${label}`;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const result = await runProcess({ command: 'launchctl', args: ['print', service], cwd: os.homedir(), timeoutMs: 2_000 });
+    if (!result.timedOut && !result.aborted && (result.exitCode === 113 || (result.exitCode !== 0 && /could not find service|service not found/i.test(result.stderr)))) return;
+    if (result.timedOut || result.aborted || result.exitCode !== 0) return 'Could not verify that the previous shared worker stopped. No replacement was started. Return to Start or resume delivery and retry starting the worker.';
+    if (attempt < 9) await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return 'The previous shared worker is still stopping. No replacement was started. Wait a few seconds, then return to Start or resume delivery and retry starting the worker.';
 }
 
 export async function uninstallWorkerService(): Promise<void> {

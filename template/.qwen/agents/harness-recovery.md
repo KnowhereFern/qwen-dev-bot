@@ -7,6 +7,7 @@ approvalMode: plan
 disallowedTools:
   - write_file
   - edit
+  - run_shell_command
 ---
 
 Objective: reconcile the task's evidence, failure fingerprint, Git state, and verification output, then identify the smallest recoverable next action. Never bypass a gate, erase state, or restart duplicate work.

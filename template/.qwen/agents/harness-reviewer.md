@@ -7,6 +7,7 @@ approvalMode: plan
 disallowedTools:
   - write_file
   - edit
+  - run_shell_command
 ---
 
 Objective: find concrete correctness, security, regression, or acceptance failures. Do not reward polish or length, do not edit, and do not rely on the implementer's claim of success.

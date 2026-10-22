@@ -4,7 +4,7 @@ import { PersistentTaskStore } from '../src/core/persistent-store.js';
 import type { RepositoryAssessment } from '../src/core/types.js';
 import type { CheckSummary, GitHubControl, RemoteIssue, RemotePullRequest } from '../src/github/control-plane.js';
 import { parseNormalizedSpec } from '../src/intake/normalizer.js';
-import { matchesPortfolioTaskContract, PortfolioCoordinator } from '../src/portfolio/coordinator.js';
+import { matchesPortfolioTaskContract, PortfolioCoordinator, RecoveryLineageError } from '../src/portfolio/coordinator.js';
 import type { PortfolioDraft } from '../src/portfolio/planner.js';
 import { makeTmp } from './helpers.js';
 
@@ -82,6 +82,111 @@ function draft(): PortfolioDraft {
 }
 
 describe('PortfolioCoordinator', () => {
+  it.each(['snapshot', 'legacy', 'missing-proof', 'normalized', 'stale', 'concurrent'] as const)('rejects material revisions without losing approved history: %s', async (scenario) => {
+    const config = defaultProjectConfig(makeTmp('reject-root'), 'project', 'owner/project');
+    config.program.enabled = true; config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('reject-project', makeTmp('reject-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const assessment: RepositoryAssessment = { id: 'before', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false, detectedStacks: ['node'], files: [], analyses: [], coverage: [], createdAt: 1 };
+      store.saveRepositoryAssessment(assessment);
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: draft(), assessment });
+      const approved = await coordinator.approve(created.plan.id);
+      store.upsert({ issueNumber: approved.stories[0].normalizedIssueNumber!, title: 'done', state: 'done' });
+      const changed = draft(); changed.technologyDecisions = [{ ...changed.technologyDecisions[0], technology: 'Different hosting' }];
+      changed.constraints.push('New unapproved constraint'); changed.definitionOfDone.push('New unapproved criterion');
+      const nextAssessment = { ...assessment, id: 'after', commitSha: 'b'.repeat(40) }; store.saveRepositoryAssessment(nextAssessment);
+      let pending = await coordinator.revise({ planId: approved.id, draft: changed, assessment: nextAssessment, reason: 'wave-complete', material: true, summary: 'Unapproved scope change' });
+      const savedContract = pending.revisions!.at(-1)!.priorApprovedContract!;
+      expect(savedContract.technologyDecisions).toEqual(approved.technologyDecisions);
+      if (scenario === 'legacy' || scenario === 'missing-proof') {
+        pending = { ...pending, revisions: pending.revisions!.map((entry) => ({ ...entry, priorApprovedContract: undefined })) };
+        store.savePortfolioPlan(pending);
+      }
+      if (scenario === 'normalized') {
+        pending = { ...pending, stories: pending.stories.map((story) => story.revision === 2 ? { ...story, normalizedIssueNumber: 999 } : story) };
+        store.savePortfolioPlan(pending);
+      }
+      const issuesBefore = github.issues.size;
+      const request = { planId: pending.id, expected: { revision: scenario === 'stale' ? 1 : 2, contentHash: pending.contentHash }, operator: 'Test operator', reason: 'Preserve approved decisions',
+        ...(scenario === 'legacy' ? { legacyRecovery: { contract: savedContract, provenance: 'Verified master issue history at approved revision' } } : {}) };
+      if (scenario === 'concurrent') {
+        let release!: () => void;
+        let entered!: () => void;
+        const waiting = new Promise<void>((resolve) => { entered = resolve; });
+        const resume = new Promise<void>((resolve) => { release = resolve; });
+        github.listOpenIssues = async () => { entered(); await resume; return [...github.issues.values()]; };
+        const rejection = coordinator.rejectMaterialRevision(request);
+        await waiting;
+        const concurrentlyApproved = { ...pending, status: 'active' as const, updatedAt: pending.updatedAt + 1 };
+        store.savePortfolioPlan(concurrentlyApproved);
+        release();
+        await expect(rejection).rejects.toThrow('changed during rejection');
+        expect(store.getPortfolioPlan(pending.id)).toEqual(concurrentlyApproved);
+      } else if (['missing-proof', 'normalized', 'stale'].includes(scenario)) {
+        await expect(coordinator.rejectMaterialRevision(request)).rejects.toThrow();
+        expect(store.getPortfolioPlan(pending.id)).toEqual(pending);
+      } else {
+        const restored = await coordinator.rejectMaterialRevision(request);
+        expect(restored.revision).toBe(3); expect(restored.currentWave).toBe(1); expect(restored.status).toBe('assessing');
+        expect(restored.technologyDecisions).toEqual(approved.technologyDecisions);
+        expect(restored.constraints).toEqual(approved.constraints); expect(restored.definitionOfDone).toEqual(approved.definitionOfDone);
+        expect(restored.stories[0]).toEqual(approved.stories[0]);
+        expect(restored.stories[1].supersededAt).toBeNull();
+        expect(restored.stories.filter((story) => story.revision === 2).every((story) => story.supersededAt !== null)).toBe(true);
+        expect(restored.revisions![1].rejectedAt).toBeTypeOf('number');
+        expect(restored.revisions![2].restoresRevision).toBe(1);
+        expect(store.listEvents('program.material_revision_rejected')).toHaveLength(1);
+        expect(store.list()[0].state).toBe('done');
+        expect(github.issues.size).toBe(issuesBefore);
+        const remaining = draft(); remaining.stories = [{ ...remaining.stories[1], dependsOn: [] }];
+        const resumed = await coordinator.revise({ planId: restored.id, draft: remaining, assessment: nextAssessment, reason: 'wave-complete', material: false, summary: 'Continue approved work' });
+        const next = resumed.stories.find((story) => story.revision === 4)!;
+        expect(resumed.currentWave).toBe(2);
+        expect(next.dependsOn).toEqual([approved.stories[0].key]);
+        expect(next.normalizedIssueNumber).not.toBeNull();
+        expect(resumed.stories.find((story) => story.key === approved.stories[1].key)?.supersededAt).not.toBeNull();
+      }
+      if (!['snapshot', 'legacy'].includes(scenario)) expect(github.issues.size).toBe(issuesBefore);
+    } finally { store.close(); }
+  });
+
+  it.each(['empty', 'optional', 'security'])('keeps a program draft unapproved without required product gates: %s', async (kind) => {
+    const config = defaultProjectConfig(makeTmp('portfolio-gate-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = kind === 'empty' ? [] : [{ id: 'check', kind: kind === 'security' ? 'security' : 'unit', command: 'npm', args: ['test'], required: kind === 'security', timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('portfolio-gate-project', makeTmp('portfolio-gate-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: draft() });
+      const before = structuredClone(store.getPortfolioPlan(created.plan.id));
+      const issuesBefore = structuredClone([...github.issues.values()]);
+      await expect(coordinator.approve(created.plan.id)).rejects.toThrow('at least one required product verification gate');
+      expect(store.getPortfolioPlan(created.plan.id)).toEqual(before);
+      expect([...github.issues.values()]).toEqual(issuesBefore);
+      expect(store.list()).toEqual([]);
+      expect(before?.approvedAt).toBeNull();
+    } finally { store.close(); }
+  });
+
+  it.each(['active', 'done', 'delivered', 'maintaining'] as const)('preserves idempotent approval for an existing %s program with legacy empty gates', async (status) => {
+    const config = defaultProjectConfig(makeTmp('portfolio-existing-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.gates = [];
+    const store = new PersistentTaskStore('portfolio-existing', makeTmp('portfolio-existing-state'));
+    const coordinator = new PortfolioCoordinator(config, store, new PortfolioGitHub());
+    try {
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: draft() });
+      const existing = { ...created.plan, status, approvedAt: 1 };
+      store.savePortfolioPlan(existing);
+      expect(await coordinator.approve(existing.id)).toEqual(existing);
+    } finally { store.close(); }
+  });
+
   it('publishes idempotent review issues, then creates an exact dependency-aware normalized graph only after approval', async () => {
     const root = makeTmp('portfolio-root');
     const config = defaultProjectConfig(root, 'project', 'owner/project');
@@ -98,12 +203,17 @@ describe('PortfolioCoordinator', () => {
     expect([...github.issues.values()][0]?.labels).toEqual(['harness:plan']);
     expect([...github.issues.values()].slice(1).every((issue) => issue.labels.includes('harness:planned'))).toBe(true);
 
+    await expect(coordinator.approve(first.plan.id, { revision: 2, contentHash: first.plan.contentHash })).rejects.toThrow('program changed since review');
+    await expect(coordinator.approve(first.plan.id, { revision: 1, contentHash: 'stale-objective-hash' })).rejects.toThrow('program changed since review');
+    expect(github.issues).toHaveLength(3);
+    expect(store.getPortfolioPlan(first.plan.id)?.approvedAt).toBeNull();
+
     const duplicate = await coordinator.createDraft({ sourcePath: 'REQUIREMENTS.md', content: 'same requirements', draft: draft() });
     expect(duplicate.created).toBe(false);
     expect(duplicate.plan.id).toBe(first.plan.id);
     expect(github.issues).toHaveLength(3);
 
-    const approved = await coordinator.approve(first.plan.id);
+    const approved = await coordinator.approve(first.plan.id, { revision: 1, contentHash: first.plan.contentHash });
     expect(approved.status).toBe('active');
     expect(github.issues).toHaveLength(5);
     const firstSpec = parseNormalizedSpec((github.issues.get(4) as RemoteIssue).body);
@@ -171,7 +281,44 @@ describe('PortfolioCoordinator', () => {
     expect(redrafted.stories.find((story) => story.revision === 2)?.key).toMatch(/^R2_/);
     expect(redrafted.stories.filter((story) => story.revision === 2).every((story) => story.sourceIssueNumber !== null)).toBe(true);
     expect(redrafted.stories.every((story) => story.normalizedIssueNumber === null)).toBe(true);
+    expect(coordinator.status(redrafted).counts).toEqual({ 'awaiting-approval': 2 });
+    expect(coordinator.status(redrafted).stories).toHaveLength(4);
+    const changed = await coordinator.replaceUnapprovedDraft({
+      planId: redrafted.id, sourcePath: 'PROJECT.md', content: 'Complete the full delivery journey',
+      draft: replacement, assessment, summary: 'User revised the proposed objective', reviseObjective: true,
+      expected: { revision: 2, contentHash: redrafted.contentHash },
+    });
+    expect(changed.revision).toBe(3);
+    expect(changed.sourceContent).toBe('Complete the full delivery journey');
+    expect(changed.contentHash).not.toBe(redrafted.contentHash);
+    expect(changed.revisions?.[0]?.objectiveSourceContent).toBe('program objective');
+    expect(changed.revisions?.[1]?.objectiveContentHash).toBe(redrafted.contentHash);
+    expect(changed.revisions?.at(-1)?.material).toBe(true);
+    expect(changed.approvedAt).toBeNull();
+    expect(changed.status).toBe('awaiting_initial_approval');
+    expect(changed.stories.every((story) => story.normalizedIssueNumber === null)).toBe(true);
+    expect(store.getPortfolioPlan(changed.id)?.sourceContent).toBe(changed.sourceContent);
     store.close();
+  });
+
+  it('rejects implicit, stale, relocated or already-approved objective changes before planning', async () => {
+    const config = defaultProjectConfig(makeTmp('objective-guards'), 'project', 'owner/project');
+    config.program.enabled = true;
+    const store = new PersistentTaskStore('objective-guards', makeTmp('objective-guards-state'));
+    try {
+      const coordinator = new PortfolioCoordinator(config, store, new PortfolioGitHub());
+      const { plan } = await coordinator.createDraft({ sourcePath: 'OBJECTIVE.md', content: 'Original', draft: draft() });
+      const input = { planId: plan.id, sourcePath: plan.sourcePath, content: 'Revised objective' };
+      const expected = { revision: 1, contentHash: plan.contentHash };
+      expect(() => coordinator.assertCanRedraft(input)).toThrow('preserve the originally proposed objective');
+      expect(() => coordinator.assertCanRedraft({ ...input, reviseObjective: true })).toThrow('review guards');
+      expect(() => coordinator.assertCanRedraft({ ...input, reviseObjective: true, expected: { ...expected, revision: 2 } })).toThrow('changed since review');
+      expect(() => coordinator.assertCanRedraft({ ...input, reviseObjective: true, expected: { ...expected, contentHash: 'stale' } })).toThrow('changed since review');
+      expect(() => coordinator.assertCanRedraft({ ...input, sourcePath: 'OTHER.md', reviseObjective: true, expected })).toThrow('requirements file');
+      store.savePortfolioPlan({ ...plan, status: 'active', approvedAt: 1 });
+      expect(() => coordinator.assertCanRedraft({ ...input, reviseObjective: true, expected })).toThrow('before initial approval');
+      expect(store.list()).toHaveLength(0);
+    } finally { store.close(); }
   });
 
   it('activates only the current dependency wave in repository-aware program mode', async () => {
@@ -237,6 +384,7 @@ describe('PortfolioCoordinator', () => {
       createdAt: 1,
     };
     const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'program objective', draft: initial, assessment });
+    store.saveRepositoryAssessment(assessment);
     const approved = await coordinator.approve(created.plan.id);
     const failedIssue = approved.stories[0]?.normalizedIssueNumber as number;
     store.upsert({
@@ -257,6 +405,7 @@ describe('PortfolioCoordinator', () => {
     revisedDraft.stories[0]!.coverageIds = ['REQ1'];
     revisedDraft.stories[1]!.coverageIds = ['REQ2'];
     const nextAssessment = { ...assessment, id: 'assessment_next', commitSha: 'b'.repeat(40), createdAt: 2 };
+    store.saveRepositoryAssessment(nextAssessment);
     const revised = await coordinator.revise({
       planId: created.plan.id,
       draft: revisedDraft,
@@ -288,6 +437,72 @@ describe('PortfolioCoordinator', () => {
     expect(waveRoot?.dependsOn).toContain(priorWaveKey);
     expect(waveRoot?.normalizedIssueNumber).not.toBeNull();
     store.close();
+  });
+
+  it.each(['mapped', 'separate', 'ambiguous', 'missing', 'renamed', 'reinterpreted', 'material', 'completed', 'active'])('maps recovery by requirement identity before any published effects: %s', async (scenario) => {
+    const config = defaultProjectConfig(makeTmp('lineage-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    config.intake.trustedAuthors.push('owner');
+    const store = new PersistentTaskStore('lineage-project', makeTmp('lineage-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const initial = draft();
+      initial.stories[0]!.coverageIds = ['A'];
+      initial.stories[1]!.coverageIds = ['B'];
+      initial.stories[1]!.dependsOn = [];
+      const assessment: RepositoryAssessment = {
+        id: 'lineage-initial', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [], createdAt: 1,
+        coverage: ['Foundation', 'Feature', 'Independent'].map((requirement, index) => ({
+          id: ['A', 'B', 'C'][index], requirement, status: 'missing', requiredAction: 'implement', rationale: 'Missing', evidence: [],
+        })),
+      };
+      store.saveRepositoryAssessment(assessment);
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: initial, assessment });
+      let approved = await coordinator.approve(created.plan.id);
+      const origins = approved.stories.map((story) => story.normalizedIssueNumber as number);
+      origins.forEach((issueNumber) => store.upsert({ issueNumber, title: 'failed work', state: 'quarantined' }));
+      if (scenario === 'completed' || scenario === 'active') {
+        const recovery = { ...approved.stories[0]!, key: 'RECOVERY', revision: 2, normalizedIssueNumber: 999 };
+        store.upsert({ issueNumber: 999, title: 'later recovery', state: scenario === 'completed' ? 'done' : 'active' });
+        const second = { ...assessment, id: 'lineage-second' };
+        store.saveRepositoryAssessment(second);
+        approved = { ...approved, revision: 2, stories: [...approved.stories, recovery], revisions: [...approved.revisions!, { ...approved.revisions![0], number: 2, assessmentId: second.id }] };
+        store.savePortfolioPlan(approved);
+      }
+      const replacement = draft();
+      replacement.stories[0]!.coverageIds = ['C'];
+      replacement.stories[1]!.coverageIds = ['NEW_A']; // A nonroot repair must inherit A, not independent C.
+      const next = { ...assessment, id: 'lineage-next', coverage: [...assessment.coverage, { ...assessment.coverage[0], id: 'NEW_A', requirement: '  FOUNDATION  ' }] };
+      if (scenario === 'separate') {
+        replacement.stories[0]!.coverageIds = ['NEW_A'];
+        replacement.stories[1]!.coverageIds = ['B'];
+      }
+      if (scenario === 'missing') replacement.stories[1]!.coverageIds = [];
+      if (scenario === 'ambiguous') replacement.stories[1]!.coverageIds = ['NEW_A', 'B'];
+      if (scenario === 'renamed' || scenario === 'material') next.coverage[next.coverage.length - 1].requirement = 'A genuinely new or unresolvable requirement';
+      if (scenario === 'reinterpreted') {
+        replacement.stories[1]!.coverageIds = ['A'];
+        next.coverage = next.coverage.map((entry) => entry.id === 'A' ? { ...entry, requirement: 'Different meaning' } : entry);
+      }
+      const before = store.getPortfolioPlan(approved.id);
+      const issueCount = github.issues.size;
+      const revise = () => coordinator.revise({ planId: approved.id, draft: replacement, assessment: next, reason: 'manual', material: scenario === 'material', summary: 'Recovery mapping' });
+      if (['ambiguous', 'missing', 'renamed', 'reinterpreted'].includes(scenario)) {
+        await expect(revise()).rejects.toMatchObject({ name: 'RecoveryLineageError', storyKeys: ['S2'], assessmentId: next.id });
+        expect(github.issues.size).toBe(issueCount);
+        expect(store.getPortfolioPlan(approved.id)).toEqual(before);
+      } else {
+        const revised = await revise();
+        const added = revised.stories.filter((story) => story.revision === (approved.revision ?? 1) + 1);
+        expect(added[0].failureOriginIssueNumber).toBe(scenario === 'separate' ? origins[0] : null);
+        expect(added[1].failureOriginIssueNumber).toBe(scenario === 'separate' ? origins[1] : ['mapped', 'active'].includes(scenario) ? origins[0] : null);
+        if (scenario === 'material') expect(revised.status).toBe('awaiting_material_approval');
+      }
+      expect(new RecoveryLineageError('reason', ['S1'], origins, assessment.id)).toBeInstanceOf(Error);
+    } finally { store.close(); }
   });
 
   it('refuses approval when the authenticated GitHub actor is not trusted', async () => {
