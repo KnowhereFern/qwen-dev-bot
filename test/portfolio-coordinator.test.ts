@@ -11,13 +11,15 @@ import { makeTmp } from './helpers.js';
 class PortfolioGitHub implements GitHubControl {
   readonly repoSlug = 'owner/project';
   readonly issues = new Map<number, RemoteIssue>();
+  readonly updateCalls: number[] = [];
+  readonly readCalls: number[] = [];
   private nextIssue = 1;
 
   constructor(private readonly login = 'owner') {}
 
   async currentUser(): Promise<string> { return this.login; }
-  async listOpenIssues(): Promise<RemoteIssue[]> { return [...this.issues.values()]; }
-  async getIssue(number: number): Promise<RemoteIssue> { return this.issues.get(number) as RemoteIssue; }
+  async listOpenIssues(): Promise<RemoteIssue[]> { this.readCalls.push(-1); return [...this.issues.values()]; }
+  async getIssue(number: number): Promise<RemoteIssue> { this.readCalls.push(number); return this.issues.get(number) as RemoteIssue; }
   async createIssue(input: { title: string; body: string; labels: string[] }): Promise<RemoteIssue> {
     const number = this.nextIssue++;
     const issue = {
@@ -32,6 +34,7 @@ class PortfolioGitHub implements GitHubControl {
     return issue;
   }
   async updateIssue(number: number, input: { title?: string; body?: string }): Promise<RemoteIssue> {
+    this.updateCalls.push(number);
     const issue = this.issues.get(number) as RemoteIssue;
     if (input.title !== undefined) issue.title = input.title;
     if (input.body !== undefined) issue.body = input.body;
@@ -515,5 +518,132 @@ describe('PortfolioCoordinator', () => {
     await expect(coordinator.approve(created.plan.id)).rejects.toThrow(/not in intake.trustedAuthors/);
     expect(store.getPortfolioPlan(created.plan.id)?.status).toBe('draft');
     store.close();
+  });
+
+  it('observes a projected blocked-to-active recovery without remote or store mutations', async () => {
+    const root = makeTmp('portfolio-observe-root');
+    const config = defaultProjectConfig(root, 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('portfolio-observe', makeTmp('portfolio-observe-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: draft() });
+      const approved = await coordinator.approve(created.plan.id);
+      const foundationIssue = approved.stories[0]!.normalizedIssueNumber!;
+      const featureIssue = approved.stories[1]!.normalizedIssueNumber!;
+
+      store.upsert({ issueNumber: foundationIssue, title: 'Foundation', state: 'failed' });
+      const [blocked] = await coordinator.refresh(created.plan.id);
+      expect(blocked?.status).toBe('blocked');
+      expect(github.updateCalls).toContain(approved.epicIssueNumber);
+      const epicBody = (github.issues.get(approved.epicIssueNumber!) as RemoteIssue).body;
+      expect(epicBody).toContain('failed');
+
+      // An approved recovery revision supersedes the failed wave story and
+      // normalizes a replacement whose task is ready; the saved plan status is
+      // still 'blocked' until reconciliation persists the recovery.
+      const recoveryStory = {
+        ...approved.stories[0]!, key: 'R2_S1', revision: 2, wave: 2, supersededAt: null as number | null,
+        normalizedIssueNumber: 999, normalizedIssueUrl: 'https://github.test/owner/project/issues/999',
+        sourceIssueNumber: 6, sourceIssueUrl: 'https://github.test/owner/project/issues/6',
+      };
+      store.savePortfolioPlan({
+        ...approved,
+        status: 'blocked',
+        currentWave: 2,
+        stories: [
+          { ...approved.stories[0]!, supersededAt: Date.now() },
+          approved.stories[1]!,
+          recoveryStory,
+        ],
+      });
+      store.upsert({ issueNumber: 999, title: 'Recovered foundation', state: 'ready' });
+      const issuesBefore = structuredClone([...github.issues.values()]);
+      const planBefore = structuredClone(store.getPortfolioPlan(created.plan.id));
+      const eventsBefore = store.listEvents().length;
+      github.updateCalls.length = 0;
+      github.readCalls.length = 0;
+
+      const [view] = coordinator.observe(created.plan.id);
+      expect(view?.status).toBe('active');
+      expect(view?.counts).toEqual({ ready: 1, 'awaiting-approval': 1 });
+      expect(store.getPortfolioPlan(created.plan.id)).toEqual(planBefore);
+      expect(store.listEvents()).toHaveLength(eventsBefore);
+      expect([...github.issues.values()]).toEqual(issuesBefore);
+      expect((github.issues.get(approved.epicIssueNumber!) as RemoteIssue).body).toBe(epicBody);
+      expect(github.updateCalls).toHaveLength(0);
+      expect(github.readCalls).toHaveLength(0);
+
+      // The saved status stays untouched until an approved reconciliation path runs.
+      expect(store.getPortfolioPlan(created.plan.id)?.status).toBe('blocked');
+      const [reconciled] = await coordinator.refresh(created.plan.id);
+      expect(reconciled?.status).toBe('active');
+      expect(store.getPortfolioPlan(created.plan.id)?.status).toBe('active');
+      void featureIssue;
+    } finally { store.close(); }
+  });
+
+  it('observes an all-done program wave as assessing without persisting it', async () => {
+    const root = makeTmp('portfolio-observe-wave-root');
+    const config = defaultProjectConfig(root, 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('portfolio-observe-wave', makeTmp('portfolio-observe-wave-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const programDraft = draft();
+      programDraft.stories[0]!.coverageIds = ['REQ1'];
+      programDraft.stories[1]!.coverageIds = ['REQ2'];
+      const assessment: RepositoryAssessment = {
+        id: 'observe_wave', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [],
+        coverage: ['Foundation', 'Feature'].map((requirement, index) => ({
+          id: `REQ${index + 1}`, requirement, status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [],
+        })),
+        createdAt: 1,
+      };
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: programDraft, assessment });
+      const approved = await coordinator.approve(created.plan.id);
+      const waveIssue = approved.stories[0]!.normalizedIssueNumber!;
+      store.upsert({ issueNumber: waveIssue, title: 'Foundation', state: 'done' });
+
+      const planBefore = structuredClone(store.getPortfolioPlan(created.plan.id))!;
+      expect(planBefore.status).toBe('active');
+      const eventsBefore = store.listEvents().length;
+      github.updateCalls.length = 0;
+
+      const [view] = coordinator.observe(created.plan.id);
+      expect(view?.status).toBe('assessing');
+      expect(view?.counts).toEqual({ done: 1, 'awaiting-approval': 1 });
+      expect(store.getPortfolioPlan(created.plan.id)).toEqual(planBefore);
+      expect(store.listEvents()).toHaveLength(eventsBefore);
+      expect(github.updateCalls).toHaveLength(0);
+
+      // The saved status stays untouched until an approved reconciliation path runs.
+      expect((await coordinator.refresh(created.plan.id))[0]?.status).toBe('assessing');
+      expect(store.getPortfolioPlan(created.plan.id)?.status).toBe('assessing');
+    } finally { store.close(); }
+  });
+
+  it('observe() keeps absent-plan errors and reads only the requested plan', async () => {
+    const root = makeTmp('portfolio-observe-filter-root');
+    const config = defaultProjectConfig(root, 'project', 'owner/project');
+    const store = new PersistentTaskStore('portfolio-observe-filter', makeTmp('portfolio-observe-filter-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const first = await coordinator.createDraft({ sourcePath: 'A.md', content: 'first objective', draft: draft() });
+      const second = await coordinator.createDraft({ sourcePath: 'B.md', content: 'second objective', draft: draft() });
+      const observed = coordinator.observe().map((view) => view.id);
+      expect(observed).toHaveLength(2);
+      expect(observed).toEqual(expect.arrayContaining([first.plan.id, second.plan.id]));
+      expect(coordinator.observe(second.plan.id).map((view) => view.id)).toEqual([second.plan.id]);
+      expect(() => coordinator.observe('plan_missing')).toThrow('Unknown portfolio plan: plan_missing');
+    } finally { store.close(); }
   });
 });
