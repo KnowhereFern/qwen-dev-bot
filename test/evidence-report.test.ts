@@ -68,6 +68,13 @@ describe('program evidence report', () => {
       'program.external_commit_observed', 'program.manual_intervention_observed', 'task.recovery_authorized', 'controller.promoted',
     ]);
     expect(report.interventions[1]?.payload.autonomousDeliveryCredit).toBe(false);
+    expect(report.interventions.every((event) => event.taskId === null || event.taskId !== unrelated.id)).toBe(true);
+    for (const event of report.interventions) {
+      if (event.taskId === null) expect(event.issueNumber).toBeNull();
+    }
+    const recovery = report.interventions.find((event) => event.type === 'task.recovery_authorized');
+    expect(recovery?.taskId).toBe(primary.id);
+    expect(recovery?.issueNumber).toBe(10);
     expect(report.metrics.waitingMs).toBe(report.metrics.elapsedMs - report.metrics.activeMs);
     const records = report.postMergeVerifications;
     expect(records.map((entry) => entry.runId)).toEqual(['run-fail-1', 'run-fail-2', 'run-pass']);
@@ -104,6 +111,41 @@ describe('program evidence report', () => {
     expect(markdown).toContain('lint=ok@hash-lint-optional (optional)');
     expect(markdown).toContain('smoke=fail@hash-smoke-skipped (skipped-required)');
     expect(markdown).toContain('not current acceptance authority');
+    expect(markdown).toContain(`task.recovery_authorized; task=${primary.id} (issue #10):`);
+    store.close();
+  });
+
+  it('links task-scoped interventions to their task and issue while non-task interventions stay null', () => {
+    const store = new PersistentTaskStore('evidence-linkage', makeTmp('evidence-report-linkage'));
+    const inScope = store.upsert({ issueNumber: 11, title: 'in-scope', state: 'done', spec: spec('https://github.test/issues/11') });
+    const outOfScope = store.upsert({ issueNumber: 99, title: 'out-of-scope', state: 'failed', spec: spec('https://github.test/issues/99') });
+    store.recordEvent('task.recovery_authorized', inScope.id, { additionalAttempts: 2 });
+    store.recordEvent('task.recovery_authorized', outOfScope.id, { additionalAttempts: 5, issueNumber: 11 });
+    store.recordEvent('program.approved', null, { issueNumber: 11 });
+    const plan: PortfolioPlan = {
+      id: 'plan_link', projectId: store.projectId, sourcePath: 'PROJECT.md', contentHash: 'objective', sourceContent: 'Build it',
+      title: 'Linkage', objective: 'Build it', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [],
+      status: 'maintaining', epicIssueNumber: 10, epicIssueUrl: 'https://github.test/issues/10',
+      stories: [{
+        key: 'S1', title: 'In scope', goal: 'Build', acceptanceCriteria: ['Done'], constraints: [], requiredGateIds: [], rewardCriterionIds: [],
+        risk: 'low', dependsOn: [], rollback: 'Revert', technologyDecisionIds: [], deploymentDecisionIds: [], sourceIssueNumber: 11,
+        sourceIssueUrl: 'https://github.test/issues/11', normalizedIssueNumber: 11, normalizedIssueUrl: 'https://github.test/issues/11',
+      }],
+      coverage: [], createdAt: 1_000, updatedAt: 2_000, approvedAt: 1_100, deliveredAt: 2_000,
+    };
+    const report = buildEvidenceReport(store, plan, 3_000);
+    expect(report.interventions).toHaveLength(2);
+    const recovery = report.interventions.find((event) => event.type === 'task.recovery_authorized');
+    expect(recovery).toMatchObject({ taskId: inScope.id, issueNumber: 11 });
+    expect(recovery?.payload).toEqual({ additionalAttempts: 2 });
+    const approved = report.interventions.find((event) => event.type === 'program.approved');
+    expect(approved?.taskId).toBeNull();
+    expect(approved?.issueNumber).toBeNull();
+    expect(report.interventions.some((event) => event.taskId === outOfScope.id)).toBe(false);
+    const markdown = formatEvidenceReport(report);
+    expect(markdown).toContain(`task.recovery_authorized; task=${inScope.id} (issue #11):`);
+    expect(markdown).toContain('program.approved:');
+    expect(markdown).not.toContain(outOfScope.id);
     store.close();
   });
 });

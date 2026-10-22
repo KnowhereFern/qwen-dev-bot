@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.82] - 2026-10-22
+
+- Link task-scoped intervention records to their task and issue in exported delivery evidence.
+
 ## [1.0.0-rc.81] - 2026-10-22
 
 - Defer program reassessment until required exact-commit checks finish, and require successful checks before objective delivery.
