@@ -23,7 +23,7 @@ import type { QwenCodeRunInput, QwenCodeRunResult, QwenExecutor } from '../src/q
 import { UniversalRewardEngine, type EvaluatorResult, type RewardEvaluator } from '../src/rewards/engine.js';
 import { ExecutionEvaluator } from '../src/rewards/evaluators.js';
 import { GateRunner } from '../src/rewards/gates.js';
-import { HarnessSupervisor } from '../src/supervisor.js';
+import { HarnessSupervisor, parseProviderResetAt, providerFallbackWaitMs } from '../src/supervisor.js';
 import { runProcess } from '../src/runtime/safe-process.js';
 import { createGitFixture } from './fixtures/git.js';
 import { makeTmp, silentLogger } from './helpers.js';
@@ -625,6 +625,111 @@ describe('production supervisor trace', () => {
 
     await supervisor.tick();
     expect(store.findByIssue(2)).toMatchObject({ state: 'ready', attempts: 1, continuations: 1 });
+    store.close();
+  });
+
+  it('keeps a task eligible when many provider waits precede one budget pause', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    config.worker.maxContinuations = 2;
+    const state = makeTmp('provider-then-budget-state');
+    const store = new PersistentTaskStore('provider-then-budget-project', state);
+    const executor = new ProviderWaitingQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-provider-then-budget',
+    );
+
+    for (let wait = 1; wait <= 3; wait += 1) {
+      await supervisor.tick();
+      expect(store.findByIssue(2)).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0 });
+      store.patch(store.findByIssue(2)?.id as string, { resumeAfter: Date.now() - 1 });
+    }
+    execute.mockImplementationOnce(async () => ({
+      sessionId: 'qwen-session-provider-wait', workflowRunId: null, summary: 'turn budget reached',
+      goalState: 'paused', goalReason: 'turn budget limit', needsContinuation: true,
+      continuationKind: 'budget', usage: {}, durationMs: 1,
+    }));
+    await supervisor.tick();
+
+    // One budget pause after three provider waits: budget continuations are
+    // 4 total - 3 provider waits = 1, below the bound of 2. The task stays
+    // eligible for repair with its full continuation history preserved.
+    expect(store.findByIssue(2)).toMatchObject({ state: 'ready', attempts: 0, continuations: 4 });
+    expect(store.countTaskEvents(store.findByIssue(2)?.id as string, 'task.provider_wait')).toBe(3);
+    store.close();
+  });
+
+  it('reports the bounded budget count and total/provider split when provider waits precede the budget bound', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    config.worker.maxContinuations = 2;
+    const state = makeTmp('provider-then-budget-bound-state');
+    const store = new PersistentTaskStore('provider-then-budget-bound-project', state);
+    const executor = new ProviderWaitingQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-provider-then-budget-bound',
+    );
+
+    for (let wait = 1; wait <= 2; wait += 1) {
+      await supervisor.tick();
+      expect(store.findByIssue(2)).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0 });
+      store.patch(store.findByIssue(2)?.id as string, { resumeAfter: Date.now() - 1 });
+    }
+    // First budget pause: 3 total - 2 provider waits = 1 budget continuation.
+    execute.mockImplementationOnce(async () => ({
+      sessionId: 'qwen-session-provider-wait', workflowRunId: null, summary: 'turn budget reached',
+      goalState: 'paused', goalReason: 'turn budget limit', needsContinuation: true,
+      continuationKind: 'budget', usage: {}, durationMs: 1,
+    }));
+    await supervisor.tick();
+    expect(store.findByIssue(2)).toMatchObject({ state: 'ready', attempts: 0, continuations: 3 });
+    // Second budget pause: 4 total - 2 provider waits = 2, at the bound of 2.
+    execute.mockImplementationOnce(async () => ({
+      sessionId: 'qwen-session-provider-wait', workflowRunId: null, summary: 'turn budget reached',
+      goalState: 'paused', goalReason: 'turn budget limit', needsContinuation: true,
+      continuationKind: 'budget', usage: {}, durationMs: 1,
+    }));
+    await supervisor.tick();
+
+    const task = store.findByIssue(2);
+    expect(task).toMatchObject({ state: 'ready', attempts: 1, continuations: 4 });
+    expect(task?.lastError).toBe(
+      'Qwen reached the configured budget-continuation limit of 2 after 2 budget continuations ' +
+      '(4 total continuations, 2 provider waits); last reason: turn budget limit',
+    );
+    store.close();
+  });
+
+  it('still fails repeated actual budget pauses at the original bound', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    config.worker.maxContinuations = 2;
+    const state = makeTmp('repeated-budget-state');
+    const store = new PersistentTaskStore('repeated-budget-project', state);
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      new BudgetPausedQwenExecutor(), new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-repeated-budget',
+    );
+
+    await supervisor.tick();
+    expect(store.findByIssue(2)).toMatchObject({ state: 'ready', attempts: 0, continuations: 1 });
+    await supervisor.tick();
+    // Two genuine budget pauses with zero provider waits hit the bound of 2
+    // and convert into the single bounded repair attempt.
+    expect(store.findByIssue(2)).toMatchObject({ state: 'ready', attempts: 1, continuations: 2 });
     store.close();
   });
 
@@ -1667,4 +1772,186 @@ describe('production supervisor trace', () => {
       }
     }, 60_000,
   );
+
+  const padUtc = (value: number): string => String(value).padStart(2, '0');
+
+  const utcParts = (timestamp: number): string => {
+    const date = new Date(timestamp);
+    return `${padUtc(date.getUTCMonth() + 1)}-${padUtc(date.getUTCDate())} ` +
+      `${padUtc(date.getUTCHours())}:${padUtc(date.getUTCMinutes())}:${padUtc(date.getUTCSeconds())}`;
+  };
+
+  it('parses strict provider reset timestamps from structured goal reasons', () => {
+    const now = Date.UTC(2026, 9, 22, 18, 4, 0);
+    // Actual yearless quota string built from the current dynamic clock, ~10 days out.
+    const dynamicNow = Date.now();
+    const target = dynamicNow + 10 * 24 * 60 * 60 * 1_000;
+    const yearlessReason =
+      'Quota exhausted: Your token-plan 1-month quota has been exhausted. ' +
+      `The quota will reset at ${utcParts(target)} UTC.`;
+    const targetParts = new Date(target);
+    expect(parseProviderResetAt(yearlessReason, dynamicNow)).toBe(Date.UTC(
+      targetParts.getUTCFullYear(), targetParts.getUTCMonth(), targetParts.getUTCDate(),
+      targetParts.getUTCHours(), targetParts.getUTCMinutes(), targetParts.getUTCSeconds(),
+    ));
+
+    // Static assertion for the exact observed token-plan quota phrase with a
+    // fixed clock: yearless 11-05 from 2026-10-22 resolves to 2026-11-05.
+    expect(parseProviderResetAt('The quota will reset at 11-05 16:00:00 UTC', Date.UTC(2026, 9, 22, 18, 4, 0)))
+      .toBe(Date.UTC(2026, 10, 5, 16, 0, 0));
+
+    // Full-year forms, with seconds, without seconds, and date-only.
+    expect(parseProviderResetAt('The quota will reset at 2026-11-05 16:00:00 UTC.', now))
+      .toBe(Date.UTC(2026, 10, 5, 16, 0, 0));
+    expect(parseProviderResetAt('reset at 2026-11-05 16:00 UTC', now)).toBe(Date.UTC(2026, 10, 5, 16, 0, 0));
+    expect(parseProviderResetAt('reset at 2026-11-05 UTC', now)).toBe(Date.UTC(2026, 10, 5));
+    // Just inside the 32-day admitted window.
+    expect(parseProviderResetAt('reset at 2026-11-20 18:04:00 UTC', now)).toBe(Date.UTC(2026, 10, 20, 18, 4, 0));
+    // The cap admits only resets at 32 days MINUS the safety margin, so
+    // resetAt + margin always fits under the wait cap and a capped resume
+    // never lands at or before the reset itself.
+    // Exactly at the margin-subtracted bound: still admitted.
+    expect(parseProviderResetAt('reset at 2026-11-23 17:59:00 UTC', now))
+      .toBe(Date.UTC(2026, 10, 23, 17, 59, 0));
+    // One minute further out (inside the margin band): rejected.
+    expect(parseProviderResetAt('reset at 2026-11-23 18:00:00 UTC', now)).toBeNull();
+    // Exactly 32 days out: rejected.
+    expect(parseProviderResetAt('reset at 2026-11-23 18:04:00 UTC', now)).toBeNull();
+    expect(parseProviderResetAt(`The quota will reset at ${utcParts(now + 32 * 24 * 60 * 60 * 1_000)} UTC.`, now)).toBeNull();
+
+    // Invalid calendar moments, formats, zones, and absences.
+    expect(parseProviderResetAt('reset at 02-30 16:00:00 UTC', now)).toBeNull();
+    expect(parseProviderResetAt('reset at 2026-02-30 16:00:00 UTC', now)).toBeNull();
+    expect(parseProviderResetAt('reset at 13-05 16:00:00 UTC', now)).toBeNull();
+    expect(parseProviderResetAt('reset at 11-05 25:00:00 UTC', now)).toBeNull();
+    expect(parseProviderResetAt('reset at 11-05 16:00:00 PST', now)).toBeNull();
+    expect(parseProviderResetAt('reset at 11/05 16:00:00 UTC', now)).toBeNull();
+    expect(parseProviderResetAt('no reset mentioned here', now)).toBeNull();
+    expect(parseProviderResetAt(null, now)).toBeNull();
+    expect(parseProviderResetAt(`reset at ${'x'.repeat(2_001)}`, now)).toBeNull();
+
+    // Past and far-future resets are never admitted.
+    const past = now - 24 * 60 * 60 * 1_000;
+    expect(parseProviderResetAt(`The quota will reset at ${utcParts(past)} UTC.`, now)).toBeNull();
+    expect(parseProviderResetAt('reset at 2026-10-21 18:04:00 UTC', now)).toBeNull();
+    const far = now + 40 * 24 * 60 * 60 * 1_000;
+    expect(parseProviderResetAt(`The quota will reset at ${utcParts(far)} UTC.`, now)).toBeNull();
+    expect(parseProviderResetAt('reset at 2030-01-01 00:00:00 UTC', now)).toBeNull();
+  });
+
+  it('bounds exponential provider fallback without overflow', () => {
+    expect(providerFallbackWaitMs(30_000, 1)).toBe(30_000);
+    expect(providerFallbackWaitMs(30_000, 2)).toBe(60_000);
+    expect(providerFallbackWaitMs(30_000, 3)).toBe(120_000);
+    expect(providerFallbackWaitMs(30_000, 20)).toBe(24 * 60 * 60 * 1_000);
+    expect(providerFallbackWaitMs(30_000, 100)).toBe(24 * 60 * 60 * 1_000);
+    expect(providerFallbackWaitMs(30_000, Number.MAX_SAFE_INTEGER)).toBe(24 * 60 * 60 * 1_000);
+    expect(Number.isFinite(providerFallbackWaitMs(30_000, Number.MAX_SAFE_INTEGER))).toBe(true);
+    expect(providerFallbackWaitMs(30_000, 0)).toBe(30_000);
+  });
+
+  it('waits until an admitted provider reset plus a safety margin and preserves the wait across restart', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const resetAt = Date.now() + 2 * 60 * 60 * 1_000;
+    class QuotaResetQwenExecutor implements QwenExecutor {
+      async execute(input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
+        input.onSession?.('qwen-session-quota-reset');
+        return {
+          sessionId: 'qwen-session-quota-reset', workflowRunId: null, summary: 'quota exhausted',
+          goalState: 'usage_limited', needsContinuation: true, continuationKind: 'provider',
+          goalReason:
+            'Quota exhausted: Your token-plan 1-month quota has been exhausted. ' +
+            `The quota will reset at ${utcParts(resetAt)} UTC.`,
+          usage: {}, durationMs: 1,
+        };
+      }
+    }
+    const state = makeTmp('provider-reset-state');
+    const store = new PersistentTaskStore('provider-reset-project', state);
+    const executor = new QuotaResetQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
+    const build = (taskStore: PersistentTaskStore): HarnessSupervisor => new HarnessSupervisor(
+      config, taskStore, new MockGitHub(), new GitWorkspace(repo, state, config),
+      executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-provider-reset',
+    );
+    try {
+      const before = Date.now();
+      await build(store).tick();
+      const after = Date.now();
+      const task = store.findByIssue(2)!;
+      expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0, continuations: 1, lastError: null });
+      // The wait extends past the parsed reset itself, not merely the default poll interval.
+      expect(task.resumeAfter).toBeGreaterThan(resetAt);
+      expect(task.resumeAfter as number).toBeGreaterThanOrEqual(resetAt + 60_000);
+      expect(task.resumeAfter as number).toBeLessThanOrEqual(before + 32 * 24 * 60 * 60 * 1_000);
+      const waitEvent = store.listEvents('task.provider_wait').at(-1)!;
+      const parsedReset = parseProviderResetAt(
+        waitEvent.payload.reason as string, before,
+      );
+      expect(parsedReset).not.toBeNull();
+      expect(waitEvent.payload.resetAt).toBe(parsedReset);
+      expect(waitEvent.payload.resumeAfter).toBe(task.resumeAfter);
+
+      // Restart preservation: a fresh store and supervisor must not resume the
+      // still-durable wait or shorten it.
+      store.close();
+    } catch (error) {
+      store.close();
+      throw error;
+    }
+    const reopened = new PersistentTaskStore('provider-reset-project', state);
+    try {
+      const preserved = reopened.findByIssue(2)!.resumeAfter;
+      expect(typeof preserved).toBe('number');
+      await build(reopened).tick();
+      const still = reopened.findByIssue(2)!;
+      expect(still).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0, continuations: 1 });
+      expect(still.resumeAfter).toBe(preserved);
+      expect(reopened.listEvents('task.provider_resumed')).toHaveLength(0);
+      expect(execute).toHaveBeenCalledTimes(1);
+    } finally {
+      reopened.close();
+    }
+  }, 30_000);
+
+  it('grows provider waits exponentially when no reset timestamp is parseable', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('provider-fallback-state');
+    const store = new PersistentTaskStore('provider-fallback-project', state);
+    const executor = new ProviderWaitingQwenExecutor();
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-provider-fallback',
+    );
+    try {
+      const started = Date.now();
+      await supervisor.tick();
+      let task = store.findByIssue(2)!;
+      expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', continuations: 1 });
+      const firstWait = (task.resumeAfter as number) - started;
+      expect(firstWait).toBeGreaterThanOrEqual(Math.max(config.worker.pollIntervalMs, 30_000));
+      const firstEvent = store.listEvents('task.provider_wait').at(-1)!;
+      expect(firstEvent.payload.resetAt).toBeNull();
+
+      store.patch(task.id, { resumeAfter: Date.now() - 1 });
+      const secondStarted = Date.now();
+      await supervisor.tick();
+      task = store.findByIssue(2)!;
+      expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', continuations: 2 });
+      const secondWait = (task.resumeAfter as number) - secondStarted;
+      expect(secondWait).toBeGreaterThan(firstWait * 1.5);
+      expect(secondWait).toBeLessThanOrEqual(24 * 60 * 60 * 1_000);
+      expect(store.listEvents('task.provider_resumed')).toHaveLength(1);
+    } finally {
+      store.close();
+    }
+  }, 30_000);
 });

@@ -269,4 +269,134 @@ describe('Qwen execution session isolation', () => {
     outcome(exitCode, 'paused', { reason: quotaReason, aborted });
     await expect(execute([])).rejects.toThrow();
   });
+
+  const contextExhaustionReason =
+    'Context is too large to send safely after automatic compression. Estimated prompt tokens ~979k; hard limit 977000; compression status: NOOP. Start a new session or reduce the resumed history before continuing.';
+
+  it('classifies the exact exit-1 context-exhaustion pause as a local process boundary', async () => {
+    outcome(1, 'paused', { reason: contextExhaustionReason });
+    const before = structuredClone(task);
+    const result = await execute([]);
+    expect(result).toMatchObject({
+      sessionId: 'prior-session',
+      workflowRunId: 'prior-workflow',
+      needsContinuation: true,
+      continuationKind: 'budget',
+      automaticStop: { sessionId: 'prior-session', workflowRunId: 'prior-workflow', kind: 'context-exhausted' },
+    });
+    expect(task).toEqual(before);
+  });
+
+  it('also accepts a clean exit-0 context-exhaustion pause on a known session', async () => {
+    outcome(0, 'waiting', { reason: contextExhaustionReason });
+    const result = await execute([]);
+    expect(result).toMatchObject({
+      needsContinuation: true,
+      continuationKind: 'budget',
+      automaticStop: { sessionId: 'prior-session', workflowRunId: 'prior-workflow', kind: 'context-exhausted' },
+    });
+  });
+
+  it('keeps a verified context-exhaustion pause a budget boundary even when the reason also carries provider/quota wording', async () => {
+    // Regression: the structured context-exhaustion message may also mention
+    // quota/provider limits. The verified contextExhaustedExit must take
+    // precedence over isProviderWaiting in both classifyGoalDisposition and
+    // continuationKind, so the run is a budget continuation with a
+    // context-exhausted automatic stop and the next run starts a fresh Goal.
+    const mixedReason = `${contextExhaustionReason} Provider quota exhausted: retry when the service is available.`;
+    outcome(1, 'paused', { reason: mixedReason });
+    const result = await execute([]);
+    expect(result).toMatchObject({
+      sessionId: 'prior-session',
+      workflowRunId: 'prior-workflow',
+      needsContinuation: true,
+      continuationKind: 'budget',
+      automaticStop: { sessionId: 'prior-session', workflowRunId: 'prior-workflow', kind: 'context-exhausted' },
+    });
+    // The persisted stop makes the next execution a fresh local Goal, never a
+    // resume of the unresumable session.
+    const stoppedTask: TaskRecord = {
+      ...task,
+      qwenSessionId: result.sessionId,
+      qwenWorkflowRunId: result.workflowRunId,
+      qwenAutomaticStop: result.automaticStop,
+    };
+    await execute([], stoppedTask);
+    const args = vi.mocked(runProcess).mock.calls.at(-1)![0].args!;
+    expect(args).not.toContain('--resume');
+    const prompt = args[args.indexOf('--prompt') + 1]!;
+    expect(prompt).toMatch(/^\/goal You are/);
+    expect(prompt).toContain('context-exhausted local process boundary');
+  });
+
+  it('rejects the context-exhaustion reason without a known session ID', async () => {
+    outcome(1, 'paused', { reason: contextExhaustionReason, newSession: undefined });
+    await expect(execute([], { ...task, qwenSessionId: null, qwenWorkflowRunId: null })).rejects.toThrow();
+  });
+
+  it('keeps exit 1 fail-closed for an oversized context-exhaustion reason', async () => {
+    // Same multi-marker content, but padded past the accepted length cap so
+    // the untrusted structured reason is never scanned unbounded.
+    const oversized = `${contextExhaustionReason} ${'x'.repeat(2_100)}`;
+    expect(oversized.length).toBeGreaterThan(2_000);
+    outcome(1, 'paused', { reason: oversized });
+    await expect(execute([])).rejects.toThrow();
+    // A reason exactly at the cap is still admitted when every marker matches.
+    const atCap = contextExhaustionReason + ' '.repeat(2_000 - contextExhaustionReason.length);
+    expect(atCap.length).toBe(2_000);
+    outcome(1, 'paused', { reason: atCap });
+    await expect(execute([])).resolves.toMatchObject({ needsContinuation: true });
+  });
+
+  it.each([
+    'Context is too large to send safely. Start a new session.',
+    'Estimated prompt tokens ~979k; hard limit 977000; compression status: NOOP.',
+    'Context is too large to send safely after automatic compression. Reduce the resumed history.',
+    contextExhaustionReason.replace('Start a new session', 'Begin another session'),
+    `${contextExhaustionReason} Interrupted by the user.`,
+  ])('keeps exit 1 fail-closed for near-miss or conflicting reasons %j', async reason => {
+    outcome(1, 'paused', { reason });
+    await expect(execute([])).rejects.toThrow();
+  });
+
+  it.each([
+    { exitCode: 1, state: 'failed' },
+    { exitCode: 1, state: 'cancelled' },
+    { exitCode: 1, state: 'blocked' },
+    { exitCode: 2, state: 'paused' },
+    { exitCode: 130, state: 'paused' },
+  ])('keeps other states and exits fail-closed despite the exact reason %j', async ({ exitCode, state }) => {
+    outcome(exitCode, state, { reason: contextExhaustionReason });
+    await expect(execute([])).rejects.toThrow();
+  });
+
+  it('never treats a completed or missing goal_state as context exhaustion', async () => {
+    outcome(1, 'complete', { reason: contextExhaustionReason });
+    await expect(execute([])).rejects.toThrow();
+    outcome(1, null, { reason: contextExhaustionReason });
+    await expect(execute([])).rejects.toThrow();
+  });
+
+  it('starts a subsequent fresh local Goal without resume after a context-exhausted stop', async () => {
+    const stoppedTask: TaskRecord = { ...task, continuations: 3, qwenAutomaticStop: { sessionId: task.qwenSessionId!, workflowRunId: task.qwenWorkflowRunId, kind: 'context-exhausted' } };
+    const before = structuredClone(stoppedTask);
+    const result = await execute([], stoppedTask);
+    const options = vi.mocked(runProcess).mock.calls[0]![0];
+    expect(options.args).not.toContain('--resume');
+    const prompt = options.args![options.args!.indexOf('--prompt') + 1]!;
+    expect(prompt).toMatch(/^\/goal You are/);
+    expect(prompt).toContain('automatic context-boundary continuation in a fresh local Goal');
+    expect(prompt).toContain('context-exhausted local process boundary');
+    expect(prompt).toContain('can no longer be resumed');
+    expect(prompt).toContain('same worktree');
+    expect(prompt).toContain('attempt and continuation counters');
+    expect(prompt).toContain('does not override genuine user instructions to stop');
+    expect(prompt).toContain('fresh, without resumeFromRunId');
+    expect(prompt).not.toContain('automatic budget continuation');
+    expect(prompt).not.toContain('may resume its workflow');
+    expect(result.sessionId).toBeNull();
+    expect(result.workflowRunId).toBeNull();
+    expect(result.automaticStop).toBeNull();
+    expect(stoppedTask).toEqual(before);
+  });
 });

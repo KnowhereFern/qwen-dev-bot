@@ -202,6 +202,24 @@ describe('PersistentTaskStore', () => {
     store.close();
   });
 
+  it('counts task events by type, including across a reopen', () => {
+    const dir = makeTmp('event-count-state');
+    let store = new PersistentTaskStore('project-count', dir);
+    const task = store.upsert({ issueNumber: 1, title: 'counting', state: 'ready' });
+    store.recordEvent('task.provider_wait', task.id, { n: 1 });
+    store.recordEvent('task.provider_wait', task.id, { n: 2 });
+    store.recordEvent('task.transition', task.id, { from: 'ready', to: 'leased' });
+    store.recordEvent('task.provider_wait', 'task_other', { n: 3 });
+    expect(store.countTaskEvents(task.id, 'task.provider_wait')).toBe(2);
+    expect(store.countTaskEvents(task.id, 'task.transition')).toBe(1);
+    expect(store.countTaskEvents(task.id, 'task.unknown_type')).toBe(0);
+    store.close();
+
+    store = new PersistentTaskStore('project-count', dir);
+    expect(store.countTaskEvents(task.id, 'task.provider_wait')).toBe(2);
+    store.close();
+  });
+
   it('quarantines the third identical failure while allowing distinct repair attempts', () => {
     const store = new PersistentTaskStore('project-b', makeTmp('persistent-failure'));
     const task = store.upsert({ issueNumber: 1, title: 'flaky', state: 'normalized', maxAttempts: 5 });

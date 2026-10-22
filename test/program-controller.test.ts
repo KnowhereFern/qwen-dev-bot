@@ -12,7 +12,7 @@ import { Logger, type LogRecord } from '../src/logger.js';
 import type { CheckSummary, GitHubControl, RemoteIssue, RemotePullRequest } from '../src/github/control-plane.js';
 import { PortfolioPlanner, type PortfolioPlanningModel } from '../src/portfolio/planner.js';
 import { PortfolioCoordinator, RecoveryLineageError } from '../src/portfolio/coordinator.js';
-import { materialRevision, preserveDecisionIdentities, ProgramController } from '../src/program/controller.js';
+import { materialRevision, preserveDecisionIdentities, ProgramController, type ProgramTickResult } from '../src/program/controller.js';
 import { AssessmentContractError, RepositoryAssessor } from '../src/program/repository-assessor.js';
 import { createGitFixture } from './fixtures/git.js';
 import { makeTmp } from './helpers.js';
@@ -96,6 +96,64 @@ describe('ProgramController', () => {
     expect(fixture.store.getPortfolioPlan('recovery')?.revision).toBe(1);
     expect(fixture.store.findByIssue(10)).toMatchObject({ state, attempts: 5, lineageFailures: 5 });
     fixture.store.close();
+  });
+
+  it('does not consume a quarantine reassessment when pending checks escalate past an hour, and retries after CI succeeds', async () => {
+    const fixture = recoveryFixture('quarantined', 3);
+    const escalated: ProgramTickResult = {
+      action: 'recovery-blocked',
+      planId: 'recovery',
+      detail: 'Required exact-commit checks have been pending for over an hour for aaaa; recovery stays blocked until the required checks complete',
+      cause: 'pending-checks-escalation',
+    };
+    const reassess = vi.spyOn(fixture.controller, 'reassess')
+      .mockResolvedValueOnce(escalated)
+      .mockResolvedValueOnce({ action: 'reassessed', planId: 'recovery', detail: 'revision 2' });
+    try {
+      const blocked = await fixture.controller.tick();
+      expect(blocked).toMatchObject({ action: 'recovery-blocked', planId: 'recovery' });
+      expect(fixture.store.listEvents('program.quarantine_processed')).toHaveLength(0);
+      // The required checks complete: the same quarantine path must retry the
+      // reassessment instead of being permanently consumed.
+      const retried = await fixture.controller.tick();
+      expect(retried).toMatchObject({ action: 'reassessed', planId: 'recovery' });
+      expect(reassess).toHaveBeenCalledTimes(2);
+      expect(fixture.store.listEvents('program.quarantine_processed')).toHaveLength(1);
+      expect(fixture.store.listEvents('program.quarantine_processed')[0]?.payload).toMatchObject({ result: 'reassessed' });
+      // The processed marker is only recorded after success: further ticks idle.
+      expect((await fixture.controller.tick()).action).toBe('idle');
+      expect(reassess).toHaveBeenCalledTimes(2);
+    } finally {
+      reassess.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('does not consume an accepted signal when pending checks escalate past an hour, and retries after CI succeeds', async () => {
+    const fixture = maintainingFixture();
+    const escalated: ProgramTickResult = {
+      action: 'recovery-blocked',
+      planId: 'maintain',
+      detail: 'Required exact-commit checks have been pending for over an hour for aaaa; recovery stays blocked until the required checks complete',
+      cause: 'pending-checks-escalation',
+    };
+    const reassess = vi.spyOn(fixture.controller, 'reassess')
+      .mockResolvedValueOnce(escalated)
+      .mockResolvedValueOnce({ action: 'reassessed', planId: 'maintain', detail: 'revision 2' });
+    try {
+      const blocked = await fixture.controller.tick();
+      expect(blocked).toMatchObject({ action: 'recovery-blocked', planId: 'maintain' });
+      expect(fixture.store.listEvents('program.signal_processed')).toHaveLength(0);
+      // The required checks complete: the same accepted signal must be
+      // reassessed instead of being permanently consumed.
+      const retried = await fixture.controller.tick();
+      expect(retried).toMatchObject({ action: 'reassessed', planId: 'maintain' });
+      expect(reassess).toHaveBeenCalledTimes(2);
+      const processed = fixture.store.listEvents('program.signal_processed');
+      expect(processed).toHaveLength(1);
+      expect(processed[0]?.payload).toMatchObject({ signalId: 'signal_pending_ci', result: 'reassessed' });
+    } finally {
+      reassess.mockRestore(); fixture.store.close();
+    }
   });
 
   it('records a rejected recovery once across controller restarts, retaining approved work', async () => {
@@ -472,6 +530,142 @@ describe('ProgramController', () => {
     }
   });
 
+  it('defers reassessment while required exact-commit checks are pending, then succeeds on retry', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Absent', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [], doneTasks: [],
+      checkSummary: { complete: false, successful: false, pending: ['Fern Delivery Harness / CI'], failed: [] },
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockResolvedValue(gapDraft());
+    try {
+      // Nonthrowing deferral: the daemon tick still completes and records the
+      // pending-check event instead of skipping its remaining work on an error.
+      const deferred = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(deferred).toMatchObject({ action: 'checks-pending', planId: 'repeat_plan' });
+      expect(deferred.detail).toMatch(/incomplete \(pending: Fern Delivery Harness \/ CI\).*deferred/);
+      // The pending-check event is deduplicated across repeated deferrals.
+      await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      const pendingEvents = fixture.store.listEvents('program.reassessment_checks_pending');
+      expect(pendingEvents).toHaveLength(1);
+      expect(pendingEvents[0]).toMatchObject({
+        taskId: null,
+        payload: { planId: 'repeat_plan', commitSha: repo.docsSha, pending: ['Fern Delivery Harness / CI'] },
+      });
+      expect(fixture.store.listEvents('program.reassessment_checks_escalated')).toHaveLength(0);
+      fixture.github.checkSummary = { complete: true, successful: true, pending: [], failed: [] };
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(result).toMatchObject({ action: 'reassessed', planId: 'repeat_plan' });
+      expect(assess).toHaveBeenCalledOnce();
+      expect(fixture.store.getPortfolioPlan('repeat_plan')?.revision).toBe(2);
+      // Completion leaves exactly one pending-check observation; no escalation fired.
+      expect(fixture.store.listEvents('program.reassessment_checks_pending')).toHaveLength(1);
+      expect(fixture.store.listEvents('program.reassessment_checks_escalated')).toHaveLength(0);
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('escalates to recovery-blocked when the same required checks stay pending for over an hour', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Absent', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [], doneTasks: [],
+      checkSummary: { complete: false, successful: false, pending: ['Fern Delivery Harness / CI'], failed: [] },
+    });
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess');
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const first = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(first.action).toBe('checks-pending');
+      // One hour later the same required checks are still incomplete.
+      vi.setSystemTime(Date.now() + 60 * 60 * 1_000 + 1_000);
+      const escalated = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(escalated.action).toBe('recovery-blocked');
+      expect(escalated.planId).toBe('repeat_plan');
+      expect(escalated.detail).toMatch(/pending for over an hour/);
+      // The escalation event is deduplicated across further ticks, and the
+      // pending observation is never refreshed into a new deferral window.
+      const again = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(again.action).toBe('recovery-blocked');
+      expect(fixture.store.listEvents('program.reassessment_checks_escalated')).toHaveLength(1);
+      expect(fixture.store.listEvents('program.reassessment_checks_pending')).toHaveLength(1);
+      // Required checks are never weakened: no assessment ran and the plan's
+      // approval/state are untouched.
+      expect(assess).not.toHaveBeenCalled();
+      const updated = fixture.store.getPortfolioPlan('repeat_plan');
+      expect(updated?.status).toBe('assessing');
+      expect(updated?.approvedAt).toBe(fixture.plan.approvedAt);
+      expect(updated?.revision).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      assess.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('does not deliver when complete required exact-commit checks failed, even if the audit reports implemented', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Verified', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [], doneTasks: [],
+      checkSummary: { complete: true, successful: false, pending: [], failed: ['Fern Delivery Harness / CI'] },
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan');
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(result.action).not.toBe('delivered');
+      const updated = fixture.store.getPortfolioPlan('repeat_plan');
+      expect(updated?.status).not.toBe('delivered');
+      expect(updated?.status).not.toBe('maintaining');
+      expect(updated?.deliveredAt).toBeNull();
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
+      expect(planning).not.toHaveBeenCalled();
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('persists no assessment or revision while required exact-commit checks are pending', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Absent', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [], doneTasks: [],
+      checkSummary: { complete: false, successful: false, pending: ['Fern Delivery Harness / CI'], failed: [] },
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const save = vi.spyOn(fixture.store, 'saveRepositoryAssessment');
+    try {
+      const deferred = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(deferred.action).toBe('checks-pending');
+      expect(assess).not.toHaveBeenCalled();
+      expect(save).not.toHaveBeenCalled();
+      expect(fixture.store.getRepositoryAssessment(assessment.id)).toBeNull();
+      const updated = fixture.store.getPortfolioPlan('repeat_plan');
+      expect(updated?.revision).toBe(1);
+      expect(updated?.revisions).toHaveLength(1);
+      expect(updated?.status).toBe('assessing');
+    } finally {
+      assess.mockRestore(); save.mockRestore(); fixture.store.close();
+    }
+  });
+
   it('reports no plannable work and blocks when every coverage entry is already satisfied', async () => {
     const repo = await committedRepeatRepo();
     const coverage: ObjectiveCoverage[] = [
@@ -580,7 +774,7 @@ function buildRepeatProgram(input: {
     config, store, github, new RepositoryAssessor(config, model), new PortfolioPlanner(config, model),
     new EvolutionSignalCollector(config, store, github, model),
   );
-  return { config, store, plan, controller };
+  return { config, store, plan, controller, github };
 }
 
 class RecordingGitHub implements GitHubControl {
@@ -609,6 +803,30 @@ class RecordingGitHub implements GitHubControl {
   async checksForRef(_sha: string, _requiredNames: string[]): Promise<CheckSummary> { return this.checkSummary; }
   async publishCheck(): Promise<void> {}
   async mergePullRequest(): Promise<{ merged: boolean; sha: string | null; message: string }> { throw new Error('not used'); }
+}
+
+function maintainingFixture(directory = makeTmp('signal-pending-ci')) {
+  const config = defaultProjectConfig(directory, 'fixture', 'owner/fixture');
+  config.program.enabled = true; config.evolution.enabled = false;
+  const store = new PersistentTaskStore(projectIdFor(config), directory);
+  store.savePortfolioPlan({
+    id: 'maintain', projectId: store.projectId, sourcePath: 'OBJECTIVE.md', contentHash: 'approved', sourceContent: 'Deliver',
+    title: 'Maintain', objective: 'Deliver', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [],
+    status: 'maintaining', epicIssueNumber: null, epicIssueUrl: null, createdAt: 1, updatedAt: 1, approvedAt: 1,
+    revision: 1, currentWave: 1, maintenanceStartedAt: 1, revisions: [],
+    stories: [{ key: 'S1', title: 'Deliver', goal: 'Deliver', acceptanceCriteria: ['Verified'], constraints: [], requiredGateIds: [], rewardCriterionIds: [],
+      risk: 'low', workType: 'implement', dependsOn: [], rollback: 'Revert', technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['REQ1'],
+      sourceIssueNumber: 1, sourceIssueUrl: 'https://github.test/issues/1', normalizedIssueNumber: 10, normalizedIssueUrl: 'https://github.test/issues/10', wave: 1 }],
+  });
+  store.saveSignal({
+    id: 'signal_pending_ci', projectId: store.projectId, source: 'ci', sourceKey: 'task:t1:aaaa',
+    contentHash: 'hash', title: 'Delivery failure', summary: 'CI failed', evidence: [], status: 'accepted',
+    material: false, observedAt: 1, updatedAt: 1,
+  });
+  const github = new EmptyGitHub();
+  const model = new ImplementedAssessmentModel('unit');
+  const controller = new ProgramController(config, store, github, new RepositoryAssessor(config, model), new PortfolioPlanner(config, model), new EvolutionSignalCollector(config, store, github, model));
+  return { controller, store, directory };
 }
 
 function recoveryFixture(state: 'failed' | 'quarantined', failures: number, directory = makeTmp('recovery-budget-controller'), logger?: Logger) {

@@ -18,10 +18,19 @@ import { PortfolioPlanner, readRequirementsDocument } from '../portfolio/planner
 import { runProcess } from '../runtime/safe-process.js';
 import { AssessmentContractError, RepositoryAssessor } from './repository-assessor.js';
 
+/** Same required checks pending longer than this after their first
+ * observation escalate to recovery-blocked. */
+const PENDING_CHECKS_ESCALATION_MS = 60 * 60 * 1_000;
+
 export interface ProgramTickResult {
-  action: 'disabled' | 'idle' | 'deployed' | 'deployment-failed' | 'reassessed' | 'recovery-blocked' | 'awaiting-material-approval' | 'delivered' | 'maintaining';
+  action: 'disabled' | 'idle' | 'deployed' | 'deployment-failed' | 'reassessed' | 'recovery-blocked' | 'checks-pending' | 'awaiting-material-approval' | 'delivered' | 'maintaining';
   planId: string | null;
   detail?: string;
+  /** Explicit transient cause for otherwise terminal actions. A
+   * recovery-blocked result caused by the pending-checks escalation is
+   * retryable: it must not consume quarantine or signal triggers the way
+   * lineage/contract recovery-blocked outcomes do. */
+  cause?: 'pending-checks-escalation';
 }
 
 export class ProgramController {
@@ -83,7 +92,13 @@ export class ProgramController {
           }, `${key}:rejected`);
           result = { action: 'recovery-blocked', planId: plan.id, detail: error.message };
         }
-        this.store.recordEvent('program.quarantine_processed', quarantine.id, { planId: plan.id, result: result.action }, key);
+        // A checks-pending deferral or its over-an-hour escalation must not
+        // consume the quarantine or its reassessment request; leave it
+        // unprocessed so a later completed check run can retry. Other
+        // recovery-blocked outcomes (lineage/contract) stay consumed.
+        if (result.action !== 'checks-pending' && result.cause !== 'pending-checks-escalation') {
+          this.store.recordEvent('program.quarantine_processed', quarantine.id, { planId: plan.id, result: result.action }, key);
+        }
         return result;
       }
     }
@@ -109,7 +124,13 @@ export class ProgramController {
         }
         this.store.recordEvent('program.reassessment_requested', null, { planId: plan.id, signalId: accepted.id });
         const result = await this.reassess(plan, 'signal', signal, accepted.material, undefined, accepted.id);
-        this.store.recordEvent('program.signal_processed', null, { planId: plan.id, signalId: accepted.id, result: result.action }, `program:signal:${plan.id}:${accepted.id}`);
+        // A checks-pending deferral or its over-an-hour escalation must not
+        // consume the accepted signal; leave it unprocessed so the next tick
+        // retries the reassessment. Other recovery-blocked outcomes stay
+        // consumed.
+        if (result.action !== 'checks-pending' && result.cause !== 'pending-checks-escalation') {
+          this.store.recordEvent('program.signal_processed', null, { planId: plan.id, signalId: accepted.id, result: result.action }, `program:signal:${plan.id}:${accepted.id}`);
+        }
         return result;
       }
       return { action: 'maintaining', planId: plan.id };
@@ -143,6 +164,14 @@ export class ProgramController {
     const targetCommitSha = repositorySha ?? await this.remoteHead(signal);
     const deployment = plan.latestDeploymentId ? this.store.getDeployment(plan.latestDeploymentId) : null;
     const checks = await this.github.checksForRef(targetCommitSha, [...REQUIRED_POST_MERGE_GITHUB_CHECKS]);
+    signal?.throwIfAborted();
+    if (!checks.complete) {
+      // Transient: the exact-commit verification evidence does not exist yet. Defer to the next supervisor tick
+      // instead of polling here or persisting an assessment/revision built without it. This returns a
+      // nonthrowing result (never a throw) so the daemon loop still records it and runs its self-hosting tick.
+      // Zero assessment/revision mutations occur and the exact commit binding is preserved in the event key.
+      return this.deferForPendingChecks(plan, targetCommitSha, checks.pending);
+    }
     const checkEvidence = checks.complete && checks.successful
       ? this.config.gates.filter((gate) => gate.required).map((gate) => ({
           kind: 'test' as const,
@@ -165,7 +194,8 @@ export class ProgramController {
     this.store.saveRepositoryAssessment(assessment);
     await this.recordExternalCommits(plan, assessment.commitSha, signal);
     signal?.throwIfAborted();
-    const auditComplete = assessment.coverage.length > 0 && assessment.coverage.every((entry) => entry.status === 'implemented');
+    const auditComplete = checks.complete && checks.successful &&
+      assessment.coverage.length > 0 && assessment.coverage.every((entry) => entry.status === 'implemented');
     if (auditComplete) {
       const now = Date.now();
       const delivered = await this.coordinator.updateProgramState(plan.id, 'delivered', {
@@ -240,6 +270,57 @@ export class ProgramController {
       planId: revised.id,
       detail: `revision ${revised.revision ?? 1}`,
     };
+  }
+
+  /**
+   * Nonthrowing deferral for incomplete required exact-commit checks. Records
+   * a deduplicated pending-check event keyed by plan + commit + pending
+   * checks for visibility, mutates no assessment/revision/program state, and
+   * never weakens the required checks. If the same required checks have
+   * stayed incomplete for more than an hour after their first observation,
+   * returns recovery-blocked with a deduplicated escalation event.
+   */
+  private deferForPendingChecks(
+    plan: PortfolioPlan,
+    commitSha: string,
+    pending: string[],
+  ): ProgramTickResult {
+    const normalized = [...new Set(pending)].sort();
+    const pendingToken = normalized.join('|') || 'unknown';
+    const detail = `Required exact-commit checks for ${commitSha} are incomplete (pending: ${normalized.join(', ') || 'unknown'}); reassessment deferred to the next supervisor tick`;
+    const key = `program:checks-pending:${plan.id}:${commitSha}:${pendingToken}`;
+    if (!this.store.hasIdempotencyKey(key)) {
+      this.store.recordEvent('program.reassessment_checks_pending', null, {
+        planId: plan.id,
+        commitSha,
+        pending: normalized,
+      }, key);
+    }
+    const expected = JSON.stringify(normalized);
+    const firstObservedAt = this.store.listEvents('program.reassessment_checks_pending')
+      .filter((event) =>
+        event.payload.planId === plan.id &&
+        event.payload.commitSha === commitSha &&
+        JSON.stringify(event.payload.pending ?? []) === expected)
+      .reduce((earliest, event) => Math.min(earliest, event.createdAt), Number.POSITIVE_INFINITY);
+    if (Number.isFinite(firstObservedAt) && Date.now() - firstObservedAt > PENDING_CHECKS_ESCALATION_MS) {
+      const escalationKey = `program:checks-pending-escalated:${plan.id}:${commitSha}:${pendingToken}`;
+      if (!this.store.hasIdempotencyKey(escalationKey)) {
+        this.store.recordEvent('program.reassessment_checks_escalated', null, {
+          planId: plan.id,
+          commitSha,
+          pending: normalized,
+          firstObservedAt,
+        }, escalationKey);
+      }
+      return {
+        action: 'recovery-blocked',
+        planId: plan.id,
+        detail: `Required exact-commit checks have been pending for over an hour for ${commitSha} (pending: ${normalized.join(', ') || 'unknown'}); recovery stays blocked until the required checks complete`,
+        cause: 'pending-checks-escalation',
+      };
+    }
+    return { action: 'checks-pending', planId: plan.id, detail };
   }
 
   private async planningOnlyAssessment(

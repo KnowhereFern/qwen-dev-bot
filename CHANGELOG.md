@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.81] - 2026-10-22
+
+- Defer program reassessment until required exact-commit checks finish, and require successful checks before objective delivery.
+- Honor a provider-reported quota reset with bounded waiting, keep provider waits out of the budget-continuation limit, and resume a verified context-exhausted Qwen session in a fresh local Goal without discarding candidate work.
+
 ## [1.0.0-rc.80] - 2026-10-12
 
 - Safely carry an in-flight implementation across a review-findings-only config opt-in followed by a controller-managed workflow update, preserving candidate bytes and restart recovery while rejecting other config changes.

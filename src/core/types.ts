@@ -254,7 +254,7 @@ export interface TaskRecord {
   qwenAutomaticStop?: {
     sessionId: string;
     workflowRunId: string | null;
-    kind: 'turn-limit' | 'budget-limit' | 'process-timeout';
+    kind: 'turn-limit' | 'budget-limit' | 'process-timeout' | 'context-exhausted';
   } | null;
   prNumber: number | null;
   prUrl: string | null;

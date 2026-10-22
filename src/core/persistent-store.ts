@@ -108,6 +108,8 @@ export class PersistentTaskStore {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS events_idempotency_idx
         ON events(project_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS events_task_type_idx
+        ON events(task_id, type);
       CREATE TABLE IF NOT EXISTS checkpoints (
         task_id TEXT NOT NULL,
         phase TEXT NOT NULL,
@@ -405,6 +407,13 @@ export class PersistentTaskStore {
   listControllerReleases(): ControllerRelease[] {
     const rows = this.db.prepare('SELECT data FROM controller_releases WHERE project_id = ? ORDER BY updated_at DESC, id DESC').all(this.projectId) as Array<{ data: string }>;
     return rows.map((row) => JSON.parse(row.data) as ControllerRelease);
+  }
+
+  countTaskEvents(taskId: string, type: string): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS total FROM events WHERE project_id = ? AND task_id = ? AND type = ?')
+      .get(this.projectId, taskId, type) as { total?: number | bigint } | undefined;
+    return Number(row?.total ?? 0);
   }
 
   listEvents(type?: string): HarnessEvent[] {
