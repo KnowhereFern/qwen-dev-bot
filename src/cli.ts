@@ -11,7 +11,7 @@ import { formatDoctor, runDoctor } from './doctor.js';
 import { createProductionHarness } from './factory.js';
 import { OctokitControlPlane, resolveGitHubToken } from './github/control-plane.js';
 import { installProject, uninstallProject } from './installer/installer.js';
-import { PortfolioCoordinator, formatPortfolioPlan } from './portfolio/coordinator.js';
+import { PortfolioCoordinator, formatPortfolioPlan, offlineGitHubControl } from './portfolio/coordinator.js';
 import {
   DEFAULT_MAX_PORTFOLIO_STORIES,
   PortfolioPlanner,
@@ -27,7 +27,7 @@ import { readIntakeSource } from './intake/source.js';
 import { intakeConnection } from './intake/connection.js';
 import { draftSpecification, loadSpecification, renderSpecification, specificationDocument } from './intake/specification.js';
 
-const VERSION = '1.0.0-rc.82';
+const VERSION = '1.0.0-rc.83';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? (process.stdin.isTTY && process.stdout.isTTY ? 'interactive' : 'help');
@@ -429,13 +429,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const planId = valueOf(args, '--plan');
       const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
       try {
-        const github = new OctokitControlPlane({
-          repo: config.project.githubRepo,
-          token: await resolveGitHubToken(root),
-        });
-        const coordinator = new PortfolioCoordinator(config, store, github);
-        const plans = await coordinator.refresh(planId);
-        const views = plans.map((plan) => coordinator.status(plan));
+        // Observational only: no GitHub token resolution, no remote reads or
+        // writes, and no plan/task state changes or events. Status is projected in memory
+        // from the locally saved plan and task state.
+        const coordinator = new PortfolioCoordinator(config, store, offlineGitHubControl());
+        const views = coordinator.observe(planId);
         console.log(
           json
             ? JSON.stringify(views, null, 2)
@@ -698,7 +696,7 @@ Commands:
   plan                 Turn a requirements file into a review-only delivery graph
   plan-redraft         Replace an unapproved draft while retaining its superseded history
   plan-approve         Approve one plan and create executable normalized tasks
-  plan-status          Refresh the master issue and show story/task progress
+  plan-status          Show projected story/task progress; observational only
   plan-reassess        Reassess the approved objective against the current repository
   plan-approve-revision Approve a material program revision
   signals              List or scan normalized evolution signals

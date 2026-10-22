@@ -562,20 +562,29 @@ export class PortfolioCoordinator {
     const refreshed: PortfolioPlan[] = [];
     for (const existing of plans) {
       let plan = await this.recoverRemoteIssues(existing);
-      if (['active', 'blocked'].includes(plan.status)) {
-        const activeStories = this.config.program.enabled
-          ? plan.stories.filter((story) => !story.supersededAt && (story.wave ?? 1) === (plan.currentWave ?? 1))
-          : plan.stories;
-        const storyStates = activeStories.map((story) => taskForStory(story, tasks)?.state ?? null);
-        const failures = storyStates.some((state) => state !== null && ['failed', 'quarantined', 'cancelled'].includes(state));
-        const allDone = storyStates.length > 0 && storyStates.every((state) => state === 'done');
-        const status = allDone ? (this.config.program.enabled ? 'assessing' : 'done') : failures ? 'blocked' : 'active';
-        if (status !== plan.status) plan = this.save({ ...plan, status, updatedAt: Date.now() });
+      const projected = projectPlanStatus(plan, tasks, this.config.program.enabled);
+      if (projected !== null && projected !== plan.status) {
+        plan = this.save({ ...plan, status: projected, updatedAt: Date.now() });
       }
       await this.updateEpic(plan, tasks);
       refreshed.push(plan);
     }
     return refreshed;
+  }
+
+  /**
+   * Observational projection of the saved program state: derives the same
+   * active/blocked/assessing/done status refresh() would persist, in memory,
+   * without contacting GitHub, changing plan/task state, recording events, or
+   * dispatching tasks. Read-only by construction.
+   */
+  observe(planId?: string): PortfolioPlanView[] {
+    const plans = planId ? [this.requirePlan(planId)] : this.store.listPortfolioPlans();
+    const tasks = this.store.list();
+    return plans.map((plan) => {
+      const projected = projectPlanStatus(plan, tasks, this.config.program.enabled);
+      return this.status(projected === null ? plan : { ...plan, status: projected }, tasks);
+    });
   }
 
   status(plan: PortfolioPlan, tasks = this.store.list()): PortfolioPlanView {
@@ -906,6 +915,54 @@ function taskForStory(story: PortfolioStory, tasks: TaskRecord[]): TaskRecord | 
   return story.normalizedIssueNumber === null
     ? undefined
     : tasks.find((task) => task.issueNumber === story.normalizedIssueNumber);
+}
+
+/**
+ * Pure in-memory projection of a plan's executable status from locally saved
+ * plan+task state. Returns null when the saved status needs no reevaluation
+ * (only 'active' and 'blocked' programs are reprojected).
+ */
+export function projectPlanStatus(
+  plan: Pick<PortfolioPlan, 'status' | 'stories' | 'currentWave'>,
+  tasks: TaskRecord[],
+  programEnabled: boolean,
+): PortfolioPlan['status'] | null {
+  if (!['active', 'blocked'].includes(plan.status)) return null;
+  const activeStories = programEnabled
+    ? plan.stories.filter((story) => !story.supersededAt && (story.wave ?? 1) === (plan.currentWave ?? 1))
+    : plan.stories;
+  const storyStates = activeStories.map((story) => taskForStory(story, tasks)?.state ?? null);
+  const failures = storyStates.some((state) => state !== null && ['failed', 'quarantined', 'cancelled'].includes(state));
+  const allDone = storyStates.length > 0 && storyStates.every((state) => state === 'done');
+  return allDone ? (programEnabled ? 'assessing' : 'done') : failures ? 'blocked' : 'active';
+}
+
+/**
+ * A GitHubControl substitute for observational commands. Every method throws so
+ * any accidental remote access in a read-only code path fails loudly instead of
+ * silently patching issues or resolving tokens.
+ */
+export function offlineGitHubControl(): GitHubControl {
+  const refuse = (method: string): (() => never) => () => {
+    throw new Error(`Observational plan status must not contact GitHub (${method})`);
+  };
+  return {
+    repoSlug: 'offline',
+    currentUser: refuse('currentUser'),
+    listOpenIssues: refuse('listOpenIssues'),
+    getIssue: refuse('getIssue'),
+    createIssue: refuse('createIssue'),
+    updateIssue: refuse('updateIssue'),
+    comment: refuse('comment'),
+    addLabels: refuse('addLabels'),
+    removeLabel: refuse('removeLabel'),
+    findPullRequestByHead: refuse('findPullRequestByHead'),
+    createPullRequest: refuse('createPullRequest'),
+    getPullRequest: refuse('getPullRequest'),
+    checksForRef: refuse('checksForRef'),
+    publishCheck: refuse('publishCheck'),
+    mergePullRequest: refuse('mergePullRequest'),
+  };
 }
 
 function countStates(states: string[]): Record<string, number> {
