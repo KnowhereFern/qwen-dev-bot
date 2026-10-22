@@ -20,7 +20,13 @@ export interface ProgramEvidenceReport {
     elapsedMs: number;
     activeTaskMs: number;
   };
-  interventions: Array<{ type: string; createdAt: number; payload: Record<string, unknown> }>;
+  interventions: Array<{
+    type: string;
+    createdAt: number;
+    payload: Record<string, unknown>;
+    taskId: string | null;
+    issueNumber: number | null;
+  }>;
   metrics: {
     verifiedCapabilities: number;
     regressions: number;
@@ -128,7 +134,16 @@ export function buildEvidenceReport(store: PersistentTaskStore, plan: PortfolioP
       elapsedMs,
       activeTaskMs: activeMs,
     },
-    interventions: interventions.map((event) => ({ type: event.type, createdAt: event.createdAt, payload: event.payload })),
+    interventions: interventions.map((event) => {
+      const planTask = event.taskId === null ? undefined : planTasks.find((task) => task.id === event.taskId);
+      return {
+        type: event.type,
+        createdAt: event.createdAt,
+        payload: event.payload,
+        taskId: event.taskId,
+        issueNumber: planTask?.issueNumber ?? null,
+      };
+    }),
     metrics: {
       verifiedCapabilities: (plan.coverage ?? []).filter((entry) => entry.status === 'implemented').length,
       regressions: store.listDeployments(plan.id).filter((deployment) => ['failed', 'rolled_back'].includes(deployment.status)).length +
@@ -201,7 +216,12 @@ export function formatEvidenceReport(report: ProgramEvidenceReport): string {
     '',
     '## Human and governance interventions',
     '',
-    ...(report.interventions.length ? report.interventions.map((event) => `- ${new Date(event.createdAt).toISOString()} ${event.type}: ${JSON.stringify(event.payload)}`) : ['- None recorded.']),
+    ...(report.interventions.length ? report.interventions.map((event) => {
+      const linkage = event.taskId === null
+        ? ''
+        : `; task=${event.taskId}${event.issueNumber === null ? '' : ` (issue #${event.issueNumber})`}`;
+      return `- ${new Date(event.createdAt).toISOString()} ${event.type}${linkage}: ${JSON.stringify(event.payload)}`;
+    }) : ['- None recorded.']),
   ].join('\n');
 }
 
