@@ -1,8 +1,11 @@
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
 import { PersistentTaskStore } from '../src/core/persistent-store.js';
+import { projectIdFor, projectStateDir } from '../src/core/state-paths.js';
+import { ObservedTokenBudget, UsageBudgetActiveError, UsageLedger } from '../src/core/usage-ledger.js';
+import { createProductionHarness } from '../src/factory.js';
 import type { GateDefinition, GateResult, ProjectConfig, RewardCriterionConfig, TaskSpec } from '../src/core/types.js';
 import { GitWorkspace } from '../src/git/git-workspace.js';
 import type {
@@ -20,6 +23,8 @@ import { EvolutionSignalCollector } from '../src/evolution/signals.js';
 import { StagingDeploymentController } from '../src/deployment/controller.js';
 import { Logger } from '../src/logger.js';
 import type { QwenCodeRunInput, QwenCodeRunResult, QwenExecutor } from '../src/qwen/qwen-code-executor.js';
+import type { QwenApiClient } from '../src/qwen/qwen-api.js';
+import { ProviderQuotaHold, providerRouteFromConfig, QuotaHoldActiveError, type QuotaHoldController } from '../src/qwen/quota-hold.js';
 import { UniversalRewardEngine, type EvaluatorResult, type RewardEvaluator } from '../src/rewards/engine.js';
 import { ExecutionEvaluator } from '../src/rewards/evaluators.js';
 import { GateRunner } from '../src/rewards/gates.js';
@@ -87,6 +92,69 @@ class BudgetPausedQwenExecutor implements QwenExecutor {
       automaticStop: { sessionId: 'qwen-session-budget', workflowRunId: null, kind: 'turn-limit' },
     };
   }
+}
+
+/** Confirmed monthly token-plan quota exhaustion carrying a strict reset. */
+class QuotaExhaustedQwenExecutor implements QwenExecutor {
+  constructor(readonly resetReason: string) {}
+  async execute(input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
+    input.onSession?.('qwen-session-quota');
+    return {
+      sessionId: 'qwen-session-quota', workflowRunId: null, summary: 'quota exhausted',
+      goalState: 'usage_limited', goalReason: this.resetReason, needsContinuation: true,
+      continuationKind: 'provider', usage: {}, durationMs: 1,
+    };
+  }
+}
+
+/** Simulates the executor's pre-spawn hold check racing in after the claim. */
+class HeldRouteRacingExecutor implements QwenExecutor {
+  constructor(readonly heldUntil: number) {}
+  async execute(_input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
+    throw new QuotaHoldActiveError(this.heldUntil);
+  }
+}
+
+/**
+ * Simulates the quota-hold signal racing a lease takeover: by the time the
+ * supervisor's catch block runs, another worker already owns the lease.
+ */
+class LeaseLostHeldRouteExecutor implements QwenExecutor {
+  constructor(
+    private readonly store: PersistentTaskStore,
+    readonly heldUntil: number,
+  ) {}
+  async execute(_input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
+    const active = this.store.list(['active'])[0];
+    if (active) {
+      this.store.patch(active.id, { leaseOwner: 'other-worker', leaseExpiresAt: Date.now() + 60_000 });
+    }
+    throw new QuotaHoldActiveError(this.heldUntil);
+  }
+}
+
+/** Simulates the executor's pre-spawn observed-token budget check racing in after the claim. */
+class UsageBudgetRacingExecutor implements QwenExecutor {
+  constructor(readonly reason: 'limit-reached' | 'unmetered-observation' | 'anomaly-observed') {}
+  async execute(_input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
+    throw new UsageBudgetActiveError({ blocked: true, reason: this.reason, maxObservedTokens: 10, observedTotalTokens: 10 });
+  }
+}
+
+/** Simulates the usage-budget signal racing a lease takeover by another worker. */
+class LeaseLostUsageBudgetExecutor implements QwenExecutor {
+  constructor(private readonly store: PersistentTaskStore) {}
+  async execute(_input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
+    const active = this.store.list(['active'])[0];
+    if (active) {
+      this.store.patch(active.id, { leaseOwner: 'other-worker', leaseExpiresAt: Date.now() + 60_000 });
+    }
+    throw new UsageBudgetActiveError({ blocked: true, reason: 'limit-reached', maxObservedTokens: 10, observedTotalTokens: 10 });
+  }
+}
+
+function twoDigit(value: number): string {
+  return String(value).padStart(2, '0');
 }
 
 class MockNormalizer implements TaskNormalizer {
@@ -608,6 +676,224 @@ describe('production supervisor trace', () => {
     expect(waitEvents.map((event) => event.payload.reason)).toEqual(['provider temporarily overloaded', 'provider temporarily overloaded']);
     store.close();
   });
+
+  it('applies a durable cross-project quota hold from a confirmed Qwen Code quota result', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('quota-hold-state');
+    const holdRootDir = makeTmp('quota-hold-root');
+    const store = new PersistentTaskStore('quota-hold-project', state);
+    const quotaHold = new ProviderQuotaHold(holdRootDir);
+    const resetAt = Math.floor((Date.now() + 2 * 60 * 60_000) / 1_000) * 1_000;
+    const resetReason =
+      'Quota exhausted: Your token-plan 1-month quota has been exhausted. ' +
+      `reset at ${twoDigit(new Date(resetAt).getUTCMonth() + 1)}-${twoDigit(new Date(resetAt).getUTCDate())} ` +
+      `${twoDigit(new Date(resetAt).getUTCHours())}:${twoDigit(new Date(resetAt).getUTCMinutes())}:${twoDigit(new Date(resetAt).getUTCSeconds())} UTC`;
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      new QuotaExhaustedQwenExecutor(resetReason), new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-quota-hold', undefined, quotaHold,
+    );
+
+    try {
+      await supervisor.tick();
+      const task = store.findByIssue(2);
+      expect(task).toMatchObject({ state: 'waiting', waitKind: 'provider', attempts: 0, continuations: 1 });
+      // Hold lasts until the admitted reset plus the five-minute margin.
+      const heldUntil = quotaHold.heldUntil(providerRouteFromConfig(config.qwen));
+      expect(heldUntil).toBe(resetAt + 5 * 60_000);
+      expect(heldUntil).toBeGreaterThanOrEqual(Number(task?.resumeAfter));
+      // The hold is durable across restart and shared cross-project: a
+      // second project with its own store on the same route skips claiming.
+      quotaHold.close();
+      const reopened = new ProviderQuotaHold(holdRootDir);
+      const otherStore = new PersistentTaskStore('quota-hold-other-project', makeTmp('quota-hold-other-state'));
+      try {
+        otherStore.upsert({ issueNumber: 1, title: 'Other project ready task', state: 'ready' });
+        const other = new HarnessSupervisor(
+          config, otherStore, new MockGitHub(), new GitWorkspace(repo, otherStore.stateDir, config),
+          new MockQwenExecutor(), new MockNormalizer(), new GateRunner(), new UniversalRewardEngine([]),
+          silentLogger, 'worker-quota-hold-other', undefined, reopened,
+        );
+        const result = await other.tick();
+        expect(result.action).toMatch(/^provider-quota-hold:/);
+        expect(otherStore.findByIssue(1)).toMatchObject({ state: 'ready', attempts: 0, leaseOwner: null });
+      } finally { otherStore.close(); reopened.close(); }
+    } finally { store.close(); }
+  }, 30_000);
+
+  it('skips claiming tasks while the provider route is held, without leasing or failing them', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('quota-skip-state');
+    const store = new PersistentTaskStore('quota-skip-project', state);
+    const quotaHold = new ProviderQuotaHold(makeTmp('quota-skip-root'));
+    const executor = new MockQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
+    const heldUntil = quotaHold.applyHold(providerRouteFromConfig(config.qwen), {
+      resetAt: Date.now() + 60 * 60_000,
+      kind: 'insufficient_quota',
+    });
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-quota-skip', undefined, quotaHold,
+    );
+
+    try {
+      const result = await supervisor.tick();
+      expect(result.action).toBe(`provider-quota-hold:${heldUntil}`);
+      expect(result.processedTaskId).toBeNull();
+      expect(execute).not.toHaveBeenCalled();
+      // No lease or attempt was recorded; the ready task stays untouched.
+      expect(store.list(['ready'])).toHaveLength(1);
+      const task = store.findByIssue(2);
+      expect(task).toMatchObject({ state: 'ready', attempts: 0, leaseOwner: null, leaseExpiresAt: null });
+    } finally { store.close(); quotaHold.close(); }
+  }, 30_000);
+
+  it('parks a task whose claim raced the quota hold, without recording a failure', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('quota-race-state');
+    const store = new PersistentTaskStore('quota-race-project', state);
+    const heldUntil = Date.now() + 90 * 60_000;
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      new HeldRouteRacingExecutor(heldUntil), new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-quota-race', undefined, { heldUntil: () => null, applyHold: () => 0 } as QuotaHoldController,
+    );
+
+    await supervisor.tick();
+    const task = store.findByIssue(2);
+    expect(task).toMatchObject({
+      state: 'waiting', waitKind: 'provider', attempts: 0,
+      leaseOwner: null, leaseExpiresAt: null, lastError: null,
+    });
+    expect(task?.resumeAfter).toBe(heldUntil);
+    expect(store.listEvents('task.provider_hold_parked')).toHaveLength(1);
+    expect(store.listEvents('task.interrupted')).toHaveLength(0);
+    store.close();
+  }, 30_000);
+
+  it('never parks or mutates a task on a quota hold after this worker lost its live lease', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('quota-lost-lease-state');
+    const store = new PersistentTaskStore('quota-lost-lease-project', state);
+    const heldUntil = Date.now() + 90 * 60_000;
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      new LeaseLostHeldRouteExecutor(store, heldUntil), new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-quota-lost-lease', undefined, { heldUntil: () => null, applyHold: () => 0 } as QuotaHoldController,
+    );
+
+    await supervisor.tick();
+    // The other worker's lease and state survive untouched: no parking, no
+    // failure, no retry-history mutation, no interrupted release.
+    const task = store.findByIssue(2);
+    expect(task).toMatchObject({
+      state: 'active', leaseOwner: 'other-worker', attempts: 0, lastError: null,
+    });
+    expect(store.listEvents('task.provider_hold_parked')).toHaveLength(0);
+    expect(store.listEvents('task.interrupted')).toHaveLength(0);
+    expect(store.countTaskEvents(task!.id, 'task.failed')).toBe(0);
+    store.close();
+  }, 30_000);
+
+  it('skips claiming tasks while the observed-token budget blocks, without leasing or failing them', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    config.usage = { maxObservedTokens: 1_000 };
+    const state = makeTmp('usage-skip-state');
+    const store = new PersistentTaskStore('usage-skip-project', state);
+    const ledger = new UsageLedger('usage-skip-project', state);
+    // Uncertainty fail-closed: an unmetered observation blocks even below the limit.
+    ledger.recordDirectApiUsage('seed', undefined);
+    const budget = new ObservedTokenBudget(1_000, ledger);
+    const executor = new MockQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-usage-skip', undefined, undefined, budget,
+    );
+
+    try {
+      const result = await supervisor.tick();
+      expect(result.action).toBe('usage-budget-blocked:unmetered-observation');
+      expect(result.processedTaskId).toBeNull();
+      expect(execute).not.toHaveBeenCalled();
+      // No lease or attempt was recorded; the ready task stays untouched.
+      expect(store.list(['ready'])).toHaveLength(1);
+      const task = store.findByIssue(2);
+      expect(task).toMatchObject({ state: 'ready', attempts: 0, leaseOwner: null, leaseExpiresAt: null });
+      expect(store.listEvents('task.usage_budget_released')).toHaveLength(0);
+    } finally { store.close(); ledger.close(); }
+  }, 30_000);
+
+  it('returns a task to ready without attempt or failure mutation when the budget races the claim', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('usage-race-state');
+    const store = new PersistentTaskStore('usage-race-project', state);
+    // The supervisor-level budget stays off so the pre-claim skip does not
+    // fire; only the executor's own pre-spawn check races in.
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      new UsageBudgetRacingExecutor('limit-reached'), new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-usage-race',
+    );
+
+    await supervisor.tick();
+    const task = store.findByIssue(2);
+    expect(task).toMatchObject({
+      state: 'ready', attempts: 0, continuations: 0,
+      leaseOwner: null, leaseExpiresAt: null, lastError: null,
+    });
+    expect(store.listEvents('task.usage_budget_released')).toHaveLength(1);
+    expect(store.listEvents('task.interrupted')).toHaveLength(0);
+    expect(store.countTaskEvents(task!.id, 'task.failed')).toBe(0);
+    store.close();
+  }, 30_000);
+
+  it('never releases or mutates a task on a usage-budget block after this worker lost its live lease', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('usage-lost-lease-state');
+    const store = new PersistentTaskStore('usage-lost-lease-project', state);
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      new LeaseLostUsageBudgetExecutor(store), new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-usage-lost-lease',
+    );
+
+    await supervisor.tick();
+    // The other worker's lease and state survive untouched: no release, no
+    // failure, no retry-history mutation, no interrupted release.
+    const task = store.findByIssue(2);
+    expect(task).toMatchObject({
+      state: 'active', leaseOwner: 'other-worker', attempts: 0, lastError: null,
+    });
+    expect(store.listEvents('task.usage_budget_released')).toHaveLength(0);
+    expect(store.listEvents('task.interrupted')).toHaveLength(0);
+    expect(store.countTaskEvents(task!.id, 'task.failed')).toBe(0);
+    store.close();
+  }, 30_000);
 
   it('converts repeated budget-only continuations into a bounded repair attempt', async () => {
     const { repo } = await createGitFixture();
@@ -1799,6 +2085,9 @@ describe('production supervisor trace', () => {
     // fixed clock: yearless 11-05 from 2026-10-22 resolves to 2026-11-05.
     expect(parseProviderResetAt('The quota will reset at 11-05 16:00:00 UTC', Date.UTC(2026, 9, 22, 18, 4, 0)))
       .toBe(Date.UTC(2026, 10, 5, 16, 0, 0));
+    // Capitalized "Reset at" parses identically (case-insensitive marker).
+    expect(parseProviderResetAt('The quota will Reset at 11-05 16:00:00 UTC', now))
+      .toBe(Date.UTC(2026, 10, 5, 16, 0, 0));
 
     // Full-year forms, with seconds, without seconds, and date-only.
     expect(parseProviderResetAt('The quota will reset at 2026-11-05 16:00:00 UTC.', now))
@@ -1952,6 +2241,48 @@ describe('production supervisor trace', () => {
       expect(store.listEvents('task.provider_resumed')).toHaveLength(1);
     } finally {
       store.close();
+    }
+  }, 30_000);
+});
+
+describe('production harness usage ledger wiring', () => {
+  it('creates one project usage ledger, closes it on success and failure, and preserves it across restart', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    const stateRoot = makeTmp('factory-usage-root');
+    const priorStateDir = process.env.QWEN_HARNESS_STATE_DIR;
+    process.env.QWEN_HARNESS_STATE_DIR = stateRoot;
+    try {
+      const stateDir = projectStateDir(config);
+      // Seed prior usage: factory construction must be additive, never reset it.
+      const seed = new UsageLedger(projectIdFor(config), stateDir);
+      seed.recordDirectApiUsage('seed-call', { total_tokens: 5 });
+      seed.close();
+
+      const github = new MockGitHub();
+      const qwenApi = { completeJson: async () => { throw new Error('not invoked during construction'); } } as unknown as QwenApiClient;
+      const harness = await createProductionHarness(config, { github, qwenApi, logger: silentLogger });
+      expect(existsSync(path.join(stateDir, 'usage.sqlite3'))).toBe(true);
+      harness.close();
+
+      // After close, the ledger reopens cleanly (cross-restart) with prior data intact.
+      const reopened = new UsageLedger(projectIdFor(config), stateDir);
+      try {
+        expect(reopened.summary()).toMatchObject({ projectId: projectIdFor(config), directCallCount: 1, observedTotalTokens: 5, unmeteredCount: 0 });
+      } finally { reopened.close(); }
+
+      // Failure path: a non-git project root fails workspace readiness after
+      // the ledger was created; construction rejects and the ledger it opened
+      // is closed, leaving a valid openable database behind.
+      const badConfig = defaultProjectConfig(makeTmp('factory-usage-bad-root'), 'bad', 'owner/fixture');
+      await expect(createProductionHarness(badConfig, { github, qwenApi, logger: silentLogger })).rejects.toThrow();
+      const afterFailure = new UsageLedger(projectIdFor(badConfig), projectStateDir(badConfig));
+      try {
+        expect(afterFailure.summary()).toMatchObject({ directCallCount: 0, observedTotalTokens: 0 });
+      } finally { afterFailure.close(); }
+    } finally {
+      if (priorStateDir === undefined) delete process.env.QWEN_HARNESS_STATE_DIR;
+      else process.env.QWEN_HARNESS_STATE_DIR = priorStateDir;
     }
   }, 30_000);
 });

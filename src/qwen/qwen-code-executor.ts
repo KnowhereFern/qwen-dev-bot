@@ -1,5 +1,6 @@
 import path from 'node:path';
 import type { ProjectConfig, TaskRecord, TaskSpec } from '../core/types.js';
+import { UsageBudgetActiveError, type UsageBudgetController, type UsageLedger } from '../core/usage-ledger.js';
 import { redactText } from '../core/ledger.js';
 import { formatProcessFailure, runProcess } from '../runtime/safe-process.js';
 import { qwenWriterGuardEnvironment, WRITER_GUARD_FAILURE } from './writer-guard.js';
@@ -14,6 +15,7 @@ import {
   qwenWorkflowEnvironment,
   type QwenRuntimeCredential,
 } from './runtime-compat.js';
+import { QuotaHoldActiveError, providerRouteFromConfig, type QuotaHoldController } from './quota-hold.js';
 
 export interface QwenCodeRunInput {
   task: TaskRecord;
@@ -67,6 +69,9 @@ export class QwenCodeExecutor implements QwenExecutor {
   constructor(
     private readonly config: ProjectConfig,
     private readonly credential?: QwenRuntimeCredential | null,
+    private readonly quotaHold?: QuotaHoldController,
+    private readonly usageLedger?: UsageLedger | null,
+    private readonly usageBudget?: UsageBudgetController | null,
   ) {}
 
   async execute(input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
@@ -125,12 +130,26 @@ export class QwenCodeExecutor implements QwenExecutor {
       goalLimitKind: null,
       workflowRunId: freshSession ? null : input.task.qwenWorkflowRunId,
     };
+    // Session identity established by a stream event in THIS run. A result
+    // event may omit session_id after an earlier event carried it; that
+    // earlier identity — and only a stream-observed one, never the resumed
+    // task record — meters the snapshot instead of marking it unmetered.
+    let streamSessionId: string | null = null;
     const acceptEvent = (event: StreamEvent): void => {
       if (event.session_id) {
         latest.sessionId = event.session_id;
+        streamSessionId = event.session_id;
         input.onSession?.(event.session_id);
       }
-      if (event.type === 'result') latest.resultEvent = event;
+      if (event.type === 'result') {
+        latest.resultEvent = event;
+        // Record cumulative session usage as each result event streams in,
+        // including runs that later fail. A missing session id with no
+        // stream-observed identity, or missing usage, marks the observation
+        // unmetered inside the ledger, never zero; repeated snapshots of one
+        // session count only the maximum.
+        this.usageLedger?.recordQwenSessionSnapshot(event.session_id ?? streamSessionId, event.usage);
+      }
       if (event.event?.type === 'goal_state') {
         const details = goalDetailsFromStreamEvent(event);
         latest.goalState = details?.state ?? null;
@@ -156,6 +175,23 @@ export class QwenCodeExecutor implements QwenExecutor {
       baseUrl: this.config.qwen.baseUrl,
       envKey: this.config.qwen.credentialEnvKey,
     });
+    // Durable provider-wide quota hold: never spawn a Qwen Code process
+    // against a held route. The supervisor parks the task on this signal
+    // without recording a failure or changing retry history.
+    const heldUntil = this.quotaHold?.heldUntil(providerRouteFromConfig(this.config.qwen));
+    if (heldUntil !== null && heldUntil !== undefined) {
+      selection.cleanup();
+      throw new QuotaHoldActiveError(heldUntil);
+    }
+    // Configured observed-token budget: never spawn a Qwen Code process
+    // once the project's observed usage reached the limit or any unmetered
+    // or anomalous observation arrived. The supervisor parks the task on
+    // this signal without recording a failure or changing retry history.
+    const budget = this.usageBudget?.status();
+    if (budget?.blocked) {
+      selection.cleanup();
+      throw new UsageBudgetActiveError(budget);
+    }
     const receipt = await runProcess({
       command: this.config.qwen.command,
       args,
@@ -183,6 +219,13 @@ export class QwenCodeExecutor implements QwenExecutor {
     if (buffered.trim()) {
       const parsed = parseEvent(buffered);
       if (parsed) acceptEvent(parsed);
+    }
+    if (!latest.resultEvent && this.usageLedger) {
+      // No result event reached the host in this run: record exactly one
+      // unmetered event for it at process end, so the run is never silently
+      // counted as zero usage. This runs before any outcome classification
+      // so failed and aborted runs are covered too.
+      this.usageLedger.recordQwenSessionSnapshot(null, undefined);
     }
 
     if (receipt.aborted) throw new Error(formatProcessFailure(receipt));

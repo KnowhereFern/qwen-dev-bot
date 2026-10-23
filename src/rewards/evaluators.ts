@@ -3,9 +3,12 @@ import { globSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { RewardCriterionConfig, RewardEvidence } from '../core/types.js';
 import { redactText } from '../core/ledger.js';
+import { type UsageBudgetController, type UsageLedger, UsageBudgetActiveError } from '../core/usage-ledger.js';
 import { QwenApiClient } from '../qwen/qwen-api.js';
 import { QwenStructuredResultCollector } from '../qwen/structured-result.js';
 import { createQwenModelSelection } from '../qwen/model-selection.js';
+import { isMonthlyQuotaExhaustion, parseProviderResetAt } from '../qwen/provider-reset.js';
+import { providerRouteFromConfig, QuotaHoldActiveError, type QuotaHoldController } from '../qwen/quota-hold.js';
 import {
   qwenEnvironment,
   qwenMcpArgs,
@@ -93,13 +96,31 @@ export class QwenRubricEvaluator implements RewardEvaluator {
   }
 }
 
+/** Optional metering and gating surface for a spawned reviewer process:
+ * durable provider quota hold, project usage ledger, and observed-token
+ * budget. All parts are optional so unrelated callers stay unchanged. */
+interface ReviewerMetering {
+  quotaHold?: QuotaHoldController | null;
+  usageLedger?: UsageLedger | null;
+  usageBudget?: UsageBudgetController | null;
+}
+
 export class QwenAgenticEvaluator implements RewardEvaluator {
   readonly modality = 'agentic' as const;
 
-  constructor(private readonly credential?: QwenRuntimeCredential | null) {}
+  constructor(
+    private readonly credential?: QwenRuntimeCredential | null,
+    private readonly quotaHold?: QuotaHoldController | null,
+    private readonly usageLedger?: UsageLedger | null,
+    private readonly usageBudget?: UsageBudgetController | null,
+  ) {}
 
   async evaluate(criterion: RewardCriterionConfig, context: RewardContext): Promise<EvaluatorResult> {
-    return evaluateRepositoryCriterion(criterion, context, this.credential, 'agentic');
+    return evaluateRepositoryCriterion(criterion, context, this.credential, 'agentic', {
+      quotaHold: this.quotaHold,
+      usageLedger: this.usageLedger,
+      usageBudget: this.usageBudget,
+    });
   }
 }
 
@@ -108,6 +129,7 @@ async function evaluateRepositoryCriterion(
   context: RewardContext,
   credential: QwenRuntimeCredential | null | undefined,
   modality: 'rubric' | 'agentic',
+  metering?: ReviewerMetering,
 ): Promise<EvaluatorResult> {
   const schema = JSON.stringify({
     type: 'object',
@@ -129,13 +151,36 @@ async function evaluateRepositoryCriterion(
     'Passing build or type checks alone do not prove behavior, provider integration, deployment, or user journeys. Missing required behavioral evidence must remain a blocking finding. Do not invent a change requirement or waive an explicit requirement to change behavior.',
     renderReviewInput(criterion, context),
   ].join('\n\n');
-  const outputStream = new QwenStructuredResultCollector();
+  // Meter streamed result events into the project ledger as they arrive:
+  // cumulative usage under the event's session_id or the stream-established
+  // identity; missing usage or session id marks the observation unmetered
+  // inside the ledger, never zero. The verdict payload itself never reaches
+  // the metering callback.
+  const recordSnapshot = (sessionId: string | null, usage: unknown): void => {
+    metering?.usageLedger?.recordQwenSessionSnapshot(sessionId, usage);
+  };
+  const outputStream = new QwenStructuredResultCollector(
+    metering?.usageLedger ? (event) => recordSnapshot(event.sessionId, event.usage) : undefined,
+  );
   const selection = createQwenModelSelection({
     model: context.config.qwen.model,
     baseUrl: context.config.qwen.baseUrl,
     envKey: context.config.qwen.credentialEnvKey,
   });
-  const receipt = await runProcess({
+  let receipt: Awaited<ReturnType<typeof runProcess>>;
+  try {
+    // Durable provider-wide quota hold: never spawn a reviewer process
+    // against a held route. Callers treat this as a parking signal, never a
+    // task failure.
+    const route = providerRouteFromConfig(context.config.qwen);
+    const heldUntil = metering?.quotaHold?.heldUntil(route);
+    if (heldUntil !== null && heldUntil !== undefined) throw new QuotaHoldActiveError(heldUntil);
+    // Configured observed-token budget: never spawn a reviewer process once
+    // the project's observed usage reached the limit or any unmetered or
+    // anomalous observation arrived. Also a parking signal.
+    const budget = metering?.usageBudget?.status();
+    if (budget?.blocked) throw new UsageBudgetActiveError(budget);
+    receipt = await runProcess({
     command: context.config.qwen.command,
     args: [
       '--safe-mode',
@@ -173,8 +218,30 @@ async function evaluateRepositoryCriterion(
       QWEN_SANDBOX: 'true',
       QWEN_CODE_UNATTENDED_RETRY: '1',
     },
-  }).finally(() => selection.cleanup());
-  if (receipt.exitCode !== 0 || receipt.aborted || receipt.timedOut) throw new Error(`Qwen independent review failed (exit=${String(receipt.exitCode)}, aborted=${receipt.aborted}, timedOut=${receipt.timedOut}): ${redactText(receipt.stderr).slice(-1_000)}`);
+  });
+  } finally {
+    selection.cleanup();
+  }
+  // Flush any trailing unterminated event line, then guarantee an unmetered
+  // observation for a run with no result event at all — failed, aborted, and
+  // timed-out runs included — before any outcome classification, so the run
+  // is never silently counted as zero usage.
+  outputStream.endInput();
+  if (!outputStream.hasResultEvent()) recordSnapshot(null, undefined);
+  if (receipt.exitCode !== 0 || receipt.aborted || receipt.timedOut) {
+    // A confirmed monthly-quota exhaustion reported by the reviewer process
+    // (bounded structured reason or bounded stderr tail, classified by the
+    // shared narrow classifier) applies the durable global hold on this
+    // route. The resulting parking signal must not count as task code
+    // failure; generic rate-limit or overload wording stays a process failure.
+    const quotaReason = monthlyQuotaExhaustionReason(outputStream.structuredErrorReason(), receipt.stderr);
+    if (quotaReason !== null) {
+      const resetAt = parseProviderResetAt(quotaReason, Date.now());
+      const heldUntil = metering?.quotaHold?.applyHold(providerRouteFromConfig(context.config.qwen), { resetAt, kind: 'qwen_code_quota' }) ?? null;
+      throw new QuotaHoldActiveError(heldUntil);
+    }
+    throw new Error(`Qwen independent review failed (exit=${String(receipt.exitCode)}, aborted=${receipt.aborted}, timedOut=${receipt.timedOut}): ${redactText(receipt.stderr).slice(-1_000)}`);
+  }
   const result = outputStream.finish();
   let output: JudgeOutput;
   try {
@@ -276,6 +343,16 @@ export function resolveVisualArtifacts(worktree: string, patterns: string[]): st
     }
   }
   return [...files].sort();
+}
+
+/** Bounded candidates for the shared monthly-quota classifier: the structured
+ * result-event reason first, then the capped stderr tail. Generic rate-limit,
+ * overload, or incidental quota wording never matches. */
+function monthlyQuotaExhaustionReason(structured: string | null, stderr: string): string | null {
+  for (const candidate of [structured ?? '', stderr.slice(-2_000)]) {
+    if (candidate && isMonthlyQuotaExhaustion(candidate)) return candidate;
+  }
+  return null;
 }
 
 function judgeSystem(modality: string): string {

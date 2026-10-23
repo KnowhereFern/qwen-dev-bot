@@ -134,6 +134,16 @@ export interface ProjectConfig {
     identicalFailureLimit: number;
     autoMerge: boolean;
   };
+  usage?: {
+    /**
+     * Opt-in cumulative observed-token budget for this project (config v2
+     * only). null — the default — keeps the budget off. When set to a
+     * positive safe integer, new Qwen calls are blocked once the project's
+     * observed ledger total reaches the limit, or on any unmetered or
+     * anomalous observation since ledger activation.
+     */
+    maxObservedTokens: number | null;
+  };
   intake: {
     readyLabel: string;
     approvalLabel: string;

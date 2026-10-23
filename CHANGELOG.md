@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.84] - 2026-10-22
+
+- Hold Qwen requests across projects after confirmed monthly quota exhaustion without consuming task retry history.
+- Count observed Qwen session and direct API tokens without adding repeated cumulative snapshots; show uncertainty and an opt-in project budget.
+- Apply the same quota and budget gates to independent reviews, planning, specification intake, and live readiness checks.
+
 ## [1.0.0-rc.83] - 2026-10-22
 
 - Make `plan-status` observational: project current-wave status from saved tasks without GitHub calls or plan/task state changes.
