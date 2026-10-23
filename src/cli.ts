@@ -3,7 +3,8 @@ import path from 'node:path';
 import { CommunityCollector } from './community/collector.js';
 import { loadProjectConfig, PROJECT_CONFIG_PATH } from './core/config.js';
 import { projectIdFor, projectStateDir } from './core/state-paths.js';
-import type { ControllerRelease, DeploymentRecord, EvolutionSignal, PortfolioPlan, QwenBillingPlan } from './core/types.js';
+import type { ControllerRelease, DeploymentRecord, EvolutionSignal, PortfolioPlan, ProjectConfig, QwenBillingPlan } from './core/types.js';
+import { budgetStatus, ObservedTokenBudget, UsageLedger } from './core/usage-ledger.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
 import { runDaemon } from './daemon.js';
@@ -27,7 +28,7 @@ import { readIntakeSource } from './intake/source.js';
 import { intakeConnection } from './intake/connection.js';
 import { draftSpecification, loadSpecification, renderSpecification, specificationDocument } from './intake/specification.js';
 
-const VERSION = '1.0.0-rc.83';
+const VERSION = '1.0.0-rc.84';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? (process.stdin.isTTY && process.stdout.isTTY ? 'interactive' : 'help');
@@ -60,11 +61,16 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const config = existsSync(path.join(root, PROJECT_CONFIG_PATH)) ? loadProjectConfig(root) : intakeConnection(root);
       const credential = resolveQwenCredential(config);
       if (credential) assertQwenCredentialCompatibility(config, credential);
-      const model = new QwenApiClient({ model: config.qwen.model, baseUrl: config.qwen.baseUrl, credentialEnvKey: config.qwen.credentialEnvKey, apiKey: credential?.apiKey, timeoutMs: 9 * 60_000, maxAttempts: 1, structuredOutputMode: 'json_object' });
-      console.error(`Read ${source.sections.length} source section(s). Draft only; no delivery is authorized.`);
-      const result = await draftSpecification({ root, source, model, modelName: config.qwen.model, baseUrl: config.qwen.baseUrl, onProgress: (message) => console.error(message) });
-      console.log(json ? JSON.stringify(result, null, 2) : `${result.markdown}\nPrivate draft: ${result.documentFile}\nPrivate record: ${result.file}\n${result.reused ? 'Reused the existing draft for this exact input.' : 'Draft saved.'} No issues, approvals, or execution were created.\nReview with: fern-harness spec-status ${root} --spec ${result.record.id}`);
-      return 0;
+      const { ledger, budget } = openUsageGuard(config);
+      try {
+        const model = new QwenApiClient({ model: config.qwen.model, baseUrl: config.qwen.baseUrl, credentialEnvKey: config.qwen.credentialEnvKey, apiKey: credential?.apiKey, timeoutMs: 9 * 60_000, maxAttempts: 1, structuredOutputMode: 'json_object', usageLedger: ledger, usageBudget: budget });
+        console.error(`Read ${source.sections.length} source section(s). Draft only; no delivery is authorized.`);
+        const result = await draftSpecification({ root, source, model, modelName: config.qwen.model, baseUrl: config.qwen.baseUrl, onProgress: (message) => console.error(message) });
+        console.log(json ? JSON.stringify(result, null, 2) : `${result.markdown}\nPrivate draft: ${result.documentFile}\nPrivate record: ${result.file}\n${result.reused ? 'Reused the existing draft for this exact input.' : 'Draft saved.'} No issues, approvals, or execution were created.\nReview with: fern-harness spec-status ${root} --spec ${result.record.id}`);
+        return 0;
+      } finally {
+        ledger.close();
+      }
     }
     case 'spec-status': {
       const id = strictValueOf(args, '--spec');
@@ -182,6 +188,49 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       }
       return 0;
     }
+    case 'usage-status': {
+      // Read-only operator visibility into the project-local usage ledger.
+      // No network, approvals, or task/plan state changes: only the ledger is
+      // opened (which materializes its database) and immediately closed.
+      const config = loadProjectConfig(root);
+      const ledger = new UsageLedger(projectIdFor(config), projectStateDir(config));
+      try {
+        const summary = ledger.summary();
+        const maxObservedTokens = config.configVersion === 1 ? null : config.usage?.maxObservedTokens ?? null;
+        const budget = budgetStatus(summary, maxObservedTokens);
+        if (json) {
+          console.log(JSON.stringify({
+            projectId: summary.projectId,
+            ledgerFile: ledger.databaseFile,
+            observedTotalTokens: summary.observedTotalTokens,
+            qwenSessionCount: summary.qwenSessionCount,
+            directCallCount: summary.directCallCount,
+            anomalyCount: summary.anomalyCount,
+            unmeteredCount: summary.unmeteredCount,
+            maxObservedTokens,
+            budget: { blocked: budget.blocked, reason: budget.reason },
+            note: 'Observed tokens are a lower bound covering only usage recorded by this project ledger; they are NOT Alibaba account Credits.',
+          }, null, 2));
+        } else {
+          console.log([
+            `Project: ${summary.projectId}`,
+            `Ledger: ${ledger.databaseFile}`,
+            `Observed tokens (lower bound, this ledger only): ${summary.observedTotalTokens}`,
+            `Qwen Code sessions counted: ${summary.qwenSessionCount}`,
+            `Direct API calls counted: ${summary.directCallCount}`,
+            `Unmetered observations: ${summary.unmeteredCount}`,
+            `Anomalous observations: ${summary.anomalyCount}`,
+            `Configured observed-token limit: ${maxObservedTokens ?? 'none (budget off)'}`,
+            `Budget: ${budget.blocked ? `BLOCKED (${budget.reason})` : budget.reason === 'ok' ? 'ok (calls allowed)' : 'disabled (no limit configured)'}`,
+            '',
+            'Observed tokens are a lower bound starting only with this ledger; they are NOT Alibaba account Credits.',
+          ].join('\n'));
+        }
+        return 0;
+      } finally {
+        ledger.close();
+      }
+    }
     case 'recovery-authorize': {
       const issue = integerValue(args, '--issue');
       const additionalAttempts = integerValue(args, '--additional-attempts');
@@ -241,7 +290,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const credential = resolveQwenCredential(config);
       if (credential) assertQwenCredentialCompatibility(config, credential);
       const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      let ledger: UsageLedger | null = null;
       try {
+        const guard = openUsageGuard(config);
+        ledger = guard.ledger;
+        const { budget } = guard;
         const github = new OctokitControlPlane({
           repo: config.project.githubRepo,
           token: await resolveGitHubToken(root),
@@ -255,6 +308,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
             baseUrl: config.qwen.baseUrl,
             credentialEnvKey: config.qwen.credentialEnvKey,
             apiKey: credential?.apiKey,
+            usageLedger: ledger,
+            usageBudget: budget,
           }),
         );
         const result = await collector.scan({ force: hasFlag(args, '--force') });
@@ -265,6 +320,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         );
         return 0;
       } finally {
+        ledger?.close();
         store.close();
       }
     }
@@ -277,7 +333,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const credential = resolveQwenCredential(config);
       if (credential) assertQwenCredentialCompatibility(config, credential);
       const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      let ledger: UsageLedger | null = null;
       try {
+        const guard = openUsageGuard(config);
+        ledger = guard.ledger;
+        const { budget } = guard;
         const document = specId ? specificationDocument(loadSpecification(root, specId)) : readRequirementsDocument(config.project.root, requirementsPath!);
         const github = new OctokitControlPlane({
           repo: config.project.githubRepo,
@@ -294,6 +354,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
             baseUrl: config.qwen.baseUrl,
             credentialEnvKey: config.qwen.credentialEnvKey,
             apiKey: credential?.apiKey,
+            usageLedger: ledger,
+            usageBudget: budget,
           });
           const assessment = config.program.enabled
             ? await new RepositoryAssessor(config, qwenApi).assess(document)
@@ -314,6 +376,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         }
         return 0;
       } finally {
+        ledger?.close();
         store.close();
       }
     }
@@ -352,7 +415,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const credential = resolveQwenCredential(config);
       if (credential) assertQwenCredentialCompatibility(config, credential);
       const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      let ledger: UsageLedger | null = null;
       try {
+        const guard = openUsageGuard(config);
+        ledger = guard.ledger;
+        const { budget } = guard;
         const document = specId ? specificationDocument(loadSpecification(root, specId)) : readRequirementsDocument(config.project.root, requirementsPath!);
         const feedback = feedbackPath ? readRequirementsDocument(config.project.root, feedbackPath) : null;
         const github = new OctokitControlPlane({
@@ -366,6 +433,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           baseUrl: config.qwen.baseUrl,
           credentialEnvKey: config.qwen.credentialEnvKey,
           apiKey: credential?.apiKey,
+          usageLedger: ledger,
+          usageBudget: budget,
         });
         const assessor = new RepositoryAssessor(config, qwenApi);
         const previousAssessment = assessmentId ? store.getRepositoryAssessment(assessmentId) : null;
@@ -388,6 +457,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         console.log(json ? JSON.stringify(view, null, 2) : formatPortfolioPlan(view));
         return 0;
       } finally {
+        ledger?.close();
         store.close();
       }
     }
@@ -609,6 +679,17 @@ function formatControllerReleases(releases: ControllerRelease[]): string {
   ).join('\n');
 }
 
+/**
+ * Open the project-local usage ledger and its opt-in observed-token budget
+ * for a direct CLI model call. v1 configs never carry usage-budget authority.
+ * The caller must close the ledger on success and failure paths.
+ */
+function openUsageGuard(config: ProjectConfig): { ledger: UsageLedger; budget: ObservedTokenBudget } {
+  const ledger = new UsageLedger(projectIdFor(config), projectStateDir(config));
+  const budget = new ObservedTokenBudget(config.configVersion === 1 ? null : config.usage?.maxObservedTokens ?? null, ledger);
+  return { ledger, budget };
+}
+
 function firstPositional(args: string[]): string | undefined {
   const valueOptions = new Set(['--input', '--idea', '--pages', '--spec', '--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment', '--additional-attempts', '--authorization', '--authorized-by', '--reason']);
   for (let index = 0; index < args.length; index += 1) {
@@ -687,6 +768,7 @@ Commands:
   run | reconcile      Run one bounded project supervisor tick
   worker [--once]      Run the persistent multi-project worker
   status [--json]      Show tasks, leases, sessions, PRs, and rewards
+  usage-status [--json] Read-only project usage ledger summary and budget state
   recovery-authorize   Record an explicit bounded recovery authorization; never reset history
   logs [--lines N]     Tail the redacted append-only event ledger
   reward               Show the latest stored universal reward scorecard
@@ -733,6 +815,7 @@ Plan options:
   plan-reassess PROJECT --plan PLAN_ID [--json]
   plan-approve-revision PROJECT --plan PLAN_ID [--revision N --hash HASH] [--json]
   signals PROJECT [--scan] [--accept ID | --reject ID] [--json]
+  usage-status PROJECT [--json]
   deploy-status PROJECT [--plan PLAN_ID] [--json]
   evidence-report PROJECT --plan PLAN_ID [--json]
   controller-status PROJECT [--json]

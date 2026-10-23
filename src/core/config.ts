@@ -41,6 +41,7 @@ export function defaultProjectConfig(root: string, name = path.basename(root), g
       identicalFailureLimit: 3,
       autoMerge: true,
     },
+    usage: { maxObservedTokens: null },
     intake: {
       readyLabel: 'harness:ready',
       approvalLabel: 'harness:accept',
@@ -233,6 +234,11 @@ export function loadProjectConfig(rootOrFile: string): ProjectConfig {
     project: { ...defaults.project, ...project },
     qwen: { ...defaults.qwen, ...parsed.qwen },
     worker: { ...defaults.worker, ...parsed.worker },
+    usage: {
+      // A v1 config never carries usage-budget authority: even when the
+      // field is supplied, loading an old config must not expand authority.
+      maxObservedTokens: parsed.configVersion === 1 ? null : (parsed.usage?.maxObservedTokens ?? null),
+    },
     intake: {
       ...defaults.intake,
       ...parsed.intake,
@@ -367,6 +373,10 @@ export function validateProjectConfig(value: unknown, source = 'project config')
   }
   if (config.worker.maxConcurrentMutations !== 1) {
     throw new Error(`${source}: worker.maxConcurrentMutations must remain 1 to preserve the single-writer invariant`);
+  }
+  const maxObservedTokens = config.usage?.maxObservedTokens ?? null;
+  if (maxObservedTokens !== null && !isPositiveInteger(maxObservedTokens)) {
+    throw new Error(`${source}: usage.maxObservedTokens must be a positive safe integer or null`);
   }
   for (const [key, number] of Object.entries({
     pollIntervalMs: config.worker.pollIntervalMs,

@@ -232,6 +232,7 @@ fern-harness doctor /path/to/project [--live]
 fern-harness run /path/to/project
 fern-harness worker [--once]
 fern-harness status /path/to/project [--json]
+fern-harness usage-status /path/to/project [--json]
 fern-harness logs /path/to/project [--lines 100]
 fern-harness reward /path/to/project [--task TASK_ID | --issue N]
 fern-harness community /path/to/project [--force]
@@ -251,6 +252,12 @@ fern-harness controller-rollback /path/to/project --release RELEASE_ID
 fern-harness update /path/to/project
 fern-harness uninstall /path/to/project --yes [--remove-service]
 ```
+
+### Usage ledger and observed-token budget
+
+Every direct Qwen API call the CLI makes (`spec`, `community`, `plan`, `plan-redraft`, and `doctor --live`) is counted in a project-local usage ledger under the harness state directory, alongside Qwen Code implementation and independent-review session snapshots. `fern-harness usage-status PROJECT [--json]` shows totals, counted sessions and calls, unmetered/anomalous observations, the configured limit, and the current budget state. It makes no network call or task change, though its first run creates an empty local ledger if none exists. Observed tokens are a lower bound starting only with this ledger; they are NOT Alibaba account Credits.
+
+Set `usage.maxObservedTokens` in `.qwen-harness/project.yml` (config version 2 only; v1 configs never carry usage-budget authority) to an opt-in cumulative limit. `null` — the default — keeps the budget off. Once the observed total reaches the limit, or any unmetered or anomalous observation is recorded since ledger activation, new Qwen calls are blocked before any network attempt; only a configuration change or a fresh ledger lifts it.
 
 The Qwen extension also contributes `/harness:doctor`, `/harness:status`, and `/harness:implement`, the `harness-reward` skill, and six specialized subagents.
 

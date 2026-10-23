@@ -1,5 +1,17 @@
+import { randomUUID } from 'node:crypto';
 import type { ReasoningEffort, StructuredOutputSchema } from '../core/types.js';
+import { redactText } from '../core/ledger.js';
+import { UsageBudgetActiveError, type UsageBudgetController, type UsageLedger } from '../core/usage-ledger.js';
+import { harnessStateRoot } from '../core/state-paths.js';
 import { DEFAULT_QWEN_BASE_URL, QWEN_HARNESS_MODEL } from './runtime-compat.js';
+import { isMonthlyQuotaExhaustion, parseProviderResetAt } from './provider-reset.js';
+import {
+  ProviderQuotaHold,
+  providerRouteKey,
+  QuotaHoldActiveError,
+  type ProviderRoute,
+  type QuotaHoldController,
+} from './quota-hold.js';
 
 export const DEFAULT_QWEN_API_TIMEOUT_MS = 5 * 60_000;
 
@@ -12,6 +24,9 @@ export interface QwenApiOptions {
   timeoutMs?: number;
   maxAttempts?: number;
   structuredOutputMode?: 'json_schema' | 'json_object';
+  quotaHold?: QuotaHoldController;
+  usageLedger?: UsageLedger;
+  usageBudget?: UsageBudgetController;
 }
 
 interface ChatResponse {
@@ -40,6 +55,11 @@ export class QwenApiClient {
   private readonly timeoutMs: number;
   private readonly maxAttempts: number;
   private readonly structuredOutputMode: 'json_schema' | 'json_object';
+  private readonly quotaHold?: QuotaHoldController;
+  private readonly usageLedger?: UsageLedger;
+  private readonly usageBudget?: UsageBudgetController;
+  private readonly usesInjectedFetch: boolean;
+  private readonly route: ProviderRoute;
 
   constructor(options: QwenApiOptions = {}) {
     const credentialEnvKey = options.credentialEnvKey ?? 'DASHSCOPE_API_KEY';
@@ -57,10 +77,17 @@ export class QwenApiClient {
     }
     this.model = options.model ?? QWEN_HARNESS_MODEL;
     if (this.model !== QWEN_HARNESS_MODEL) throw new Error(`Delivery harness model must be ${QWEN_HARNESS_MODEL}`);
+    this.usesInjectedFetch = options.fetchImpl !== undefined;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_QWEN_API_TIMEOUT_MS;
     this.maxAttempts = options.maxAttempts ?? 3;
     this.structuredOutputMode = options.structuredOutputMode ?? 'json_schema';
+    this.quotaHold = options.quotaHold;
+    this.usageLedger = options.usageLedger;
+    this.usageBudget = options.usageBudget;
+    this.route = { baseUrl: this.baseUrl, model: this.model, credentialEnvKey };
+    // Fail fast on a route key that cannot be sanitized safely.
+    providerRouteKey(this.route);
     if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs <= 0) throw new Error('Qwen API timeoutMs must be positive');
     if (!Number.isSafeInteger(this.maxAttempts) || this.maxAttempts <= 0) throw new Error('Qwen API maxAttempts must be positive');
   }
@@ -75,6 +102,10 @@ export class QwenApiClient {
   }): Promise<{ value: T; raw: string; reasoning: string; usage: Record<string, unknown> }> {
     const maxTokens = input.maxTokens ?? 4_096;
     if (!Number.isSafeInteger(maxTokens) || maxTokens <= 0) throw new Error('Qwen API maxTokens must be a positive integer');
+    // One opaque call id per invocation: every completed HTTP 200 response in
+    // this invocation is recorded against it, and duplicate recordings of the
+    // same id (retries, replays) count exactly once in the usage ledger.
+    const callId = randomUUID();
     const request = {
       model: this.model,
       messages: [
@@ -92,6 +123,14 @@ export class QwenApiClient {
     };
     for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
       if (input.signal?.aborted) throw new Error('Qwen API request aborted');
+      // A durable provider-wide quota hold blocks every direct request and
+      // retry on this route: fail fast before any network attempt.
+      const heldUntil = this.currentHoldUntil();
+      if (heldUntil !== null && heldUntil !== undefined) throw new QuotaHoldActiveError(heldUntil);
+      // A configured observed-token budget blocks every direct request and
+      // retry on this project: fail closed before any network attempt.
+      const budget = this.usageBudget?.status();
+      if (budget?.blocked) throw new UsageBudgetActiveError(budget);
       let response: Response;
       try {
         response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
@@ -108,20 +147,43 @@ export class QwenApiClient {
       } catch (error) {
         if (input.signal?.aborted) throw new Error('Qwen API request aborted');
         if (attempt === this.maxAttempts) {
-          throw new Error(`Qwen API request failed after ${attempt} attempt(s): ${error instanceof Error ? error.message : String(error)}`);
+          throw new Error(`Qwen API request failed after ${attempt} attempt(s): ${redactText(error instanceof Error ? error.message : String(error))}`);
         }
         await delay(250 * 2 ** (attempt - 1), input.signal);
         continue;
       }
       if (!response.ok) {
         const body = (await readBoundedResponse(response, 2 * 1024 * 1024)).slice(0, 2_000);
+        // Confirmed monthly quota exhaustion: persist the durable hold
+        // (using a strict reset timestamp when the provider supplied one)
+        // and never retry this route.
+        if (response.status === 429 && isMonthlyQuotaExhaustion(body)) {
+          const resetAt = parseProviderResetAt(body, Date.now());
+          const heldUntil = this.recordHold(resetAt);
+          throw new QuotaHoldActiveError(heldUntil ?? null);
+        }
         if (isRetryableStatus(response.status) && attempt < this.maxAttempts) {
           await delay(retryDelayMs(response, attempt), input.signal);
           continue;
         }
-        throw new Error(`Qwen API request failed: HTTP ${response.status} ${body}`);
+        throw new Error(`Qwen API request failed: HTTP ${response.status} ${redactText(body)}`);
       }
-      const data = JSON.parse(await readBoundedResponse(response, 10 * 1024 * 1024)) as ChatResponse;
+      const responseBody = await readBoundedResponse(response, 10 * 1024 * 1024);
+      let data: ChatResponse;
+      try {
+        data = JSON.parse(responseBody) as ChatResponse;
+      } catch (error) {
+        // A completed HTTP 200 with an unparsable body still consumed the
+        // call: record it as unmetered before failing.
+        this.usageLedger?.recordDirectApiUsage(callId, undefined);
+        throw error;
+      }
+      // Record usage immediately after a completed 200 response, BEFORE
+      // validating finish_reason or answer content, so malformed answers and
+      // output-budget failures are still counted. Missing or malformed usage
+      // is recorded as unmetered, never zero. Non-200 responses (including
+      // 429) produced no completed call and are never recorded as zero.
+      this.usageLedger?.recordDirectApiUsage(callId, data.usage);
       if (data.choices?.[0]?.finish_reason === 'length') throw new QwenOutputError('output_budget');
       const message = data.choices?.[0]?.message;
       const raw = message?.content?.trim() ?? '';
@@ -137,6 +199,35 @@ export class QwenApiClient {
       };
     }
     throw new Error('Qwen API request exhausted its retry budget');
+  }
+
+  /**
+   * Consult the quota hold for this route. An explicitly injected hold is
+   * always honored. Otherwise, on the real network boundary (no injected
+   * fetchImpl), the shared durable hold at the harness state root is opened
+   * per call and closed again so no database handle ever leaks; clients
+   * built with an injected fetchImpl (tests) stay fully isolated.
+   */
+  private currentHoldUntil(): number | null {
+    if (this.quotaHold) return this.quotaHold.heldUntil(this.route);
+    if (this.usesInjectedFetch) return null;
+    const hold = new ProviderQuotaHold(harnessStateRoot());
+    try {
+      return hold.heldUntil(this.route);
+    } finally {
+      hold.close();
+    }
+  }
+
+  private recordHold(resetAt: number | null): number | null {
+    if (this.quotaHold) return this.quotaHold.applyHold(this.route, { resetAt, kind: 'insufficient_quota' });
+    if (this.usesInjectedFetch) return null;
+    const hold = new ProviderQuotaHold(harnessStateRoot());
+    try {
+      return hold.applyHold(this.route, { resetAt, kind: 'insufficient_quota' });
+    } finally {
+      hold.close();
+    }
   }
 }
 
