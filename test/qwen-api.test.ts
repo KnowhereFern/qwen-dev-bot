@@ -3,6 +3,12 @@ import { DEFAULT_QWEN_API_TIMEOUT_MS, QwenApiClient } from '../src/qwen/qwen-api
 import { isMonthlyQuotaExhaustion, parseProviderResetAt } from '../src/qwen/provider-reset.js';
 import { ProviderQuotaHold, QuotaHoldActiveError } from '../src/qwen/quota-hold.js';
 import { UsageBudgetActiveError, ObservedTokenBudget, UsageLedger } from '../src/core/usage-ledger.js';
+import {
+  OPENROUTER_CROUTON_BASE_URL,
+  OPENROUTER_CROUTON_BILLING_PLAN,
+  OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
+  OPENROUTER_CROUTON_MODEL,
+} from '../src/qwen/openrouter-route.js';
 import { makeTmp } from './helpers.js';
 
 describe('monthly quota exhaustion classification', () => {
@@ -375,5 +381,69 @@ describe('Qwen API observed-token budget boundary', () => {
       await expect(complete(client)).resolves.toMatchObject({ value: { ok: true } });
       expect(fetchImpl).toHaveBeenCalledTimes(1);
     } finally { ledger.close(); }
+  });
+});
+
+describe('OpenRouter crouton route on the direct API client', () => {
+  const croutonOptions = {
+    apiKey: 'test-key',
+    model: OPENROUTER_CROUTON_MODEL,
+    baseUrl: OPENROUTER_CROUTON_BASE_URL,
+    credentialEnvKey: OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
+    billingPlan: OPENROUTER_CROUTON_BILLING_PLAN,
+  } as const;
+
+  it('sends the exact crouton body without Qwen-only thinking fields', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({ choices: [{ message: { content: '{"ok":true}' } }], usage: { total_tokens: 3 } }),
+    );
+    const client = new QwenApiClient({ ...croutonOptions, fetchImpl });
+    await expect(client.completeJson({
+      system: 'Return JSON.',
+      user: 'Confirm.',
+      reasoningEffort: 'medium',
+      jsonSchema: { name: 'test', schema: { type: 'object' } },
+    })).resolves.toMatchObject({ value: { ok: true } });
+
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe(`${OPENROUTER_CROUTON_BASE_URL}/chat/completions`);
+    const request = JSON.parse(String(init?.body));
+    expect(request).toEqual({
+      model: OPENROUTER_CROUTON_MODEL,
+      messages: expect.any(Array),
+      reasoning_effort: 'medium',
+      max_tokens: 4_096,
+      temperature: 0,
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'test', schema: { type: 'object' }, strict: true },
+      },
+    });
+    expect('enable_thinking' in request).toBe(false);
+    expect('preserve_thinking' in request).toBe(false);
+  });
+
+  it('rejects any route component mismatch at construction', () => {
+    expect(() => new QwenApiClient({ ...croutonOptions, fetchImpl: vi.fn() })).not.toThrow();
+    // Wrong endpoint.
+    expect(() => new QwenApiClient({ ...croutonOptions, baseUrl: 'https://api.openai.com/v1', fetchImpl: vi.fn() }))
+      .toThrow(/Crouton route requires endpoint/);
+    // Wrong credential env key (including the DASHSCOPE default).
+    expect(() => new QwenApiClient({ ...croutonOptions, credentialEnvKey: 'DASHSCOPE_API_KEY', fetchImpl: vi.fn() }))
+      .toThrow(/Crouton route requires credential key/);
+    // Wrong billing plan, including a missing one.
+    expect(() => new QwenApiClient({ ...croutonOptions, billingPlan: 'standard', fetchImpl: vi.fn() }))
+      .toThrow(/Crouton route requires billingPlan/);
+    const { billingPlan, ...withoutBilling } = croutonOptions;
+    expect(billingPlan).toBe('custom');
+    expect(() => new QwenApiClient({ ...withoutBilling, fetchImpl: vi.fn() }))
+      .toThrow(/Crouton route requires billingPlan/);
+    // Arbitrary non-Qwen models stay rejected.
+    expect(() => new QwenApiClient({ ...croutonOptions, model: 'openai/gpt-5', fetchImpl: vi.fn() }))
+      .toThrow(/Delivery harness model must be qwen3\.8-max/);
+    // No network attempt is ever made for a mismatched route.
+    const fetchImpl = vi.fn<typeof fetch>();
+    expect(() => new QwenApiClient({ ...croutonOptions, baseUrl: 'https://api.openai.com/v1', fetchImpl })).toThrow();
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });

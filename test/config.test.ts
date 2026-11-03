@@ -2,6 +2,12 @@ import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig, discoverGates, loadProjectConfig, validateProjectConfig } from '../src/core/config.js';
+import {
+  OPENROUTER_CROUTON_BASE_URL,
+  OPENROUTER_CROUTON_BILLING_PLAN,
+  OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
+  OPENROUTER_CROUTON_MODEL,
+} from '../src/qwen/openrouter-route.js';
 import { makeTmp } from './helpers.js';
 
 describe('project configuration invariants', () => {
@@ -173,5 +179,43 @@ describe('project configuration invariants', () => {
     config.selfHosting.candidateRoot = config.project.root;
     config.selfHosting.canaryCommands = [{ stack: 'node', command: 'node', args: ['--version'] }];
     expect(() => validateProjectConfig(config)).toThrow(/Node, Python, Go, and Rust canary/);
+  });
+
+  it('accepts only the exact opt-in OpenRouter crouton route on v2 and nothing else', () => {
+    const crouton = defaultProjectConfig(makeTmp('config-crouton'), 'fixture', 'owner/fixture');
+    crouton.qwen.model = OPENROUTER_CROUTON_MODEL;
+    crouton.qwen.baseUrl = OPENROUTER_CROUTON_BASE_URL;
+    crouton.qwen.credentialEnvKey = OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY;
+    crouton.qwen.billingPlan = OPENROUTER_CROUTON_BILLING_PLAN;
+    expect(validateProjectConfig(crouton)).toBe(crouton);
+
+    // v1 configs never gain the alternate route.
+    const v1 = defaultProjectConfig(makeTmp('config-crouton-v1'), 'fixture', 'owner/fixture');
+    v1.configVersion = 1;
+    v1.qwen = { ...crouton.qwen };
+    expect(() => validateProjectConfig(v1)).toThrow(/requires configVersion 2/);
+
+    // Arbitrary non-Qwen models stay rejected.
+    const otherModel = defaultProjectConfig(makeTmp('config-crouton-other'), 'fixture', 'owner/fixture');
+    otherModel.qwen.model = 'openai/gpt-5';
+    otherModel.qwen.baseUrl = OPENROUTER_CROUTON_BASE_URL;
+    otherModel.qwen.credentialEnvKey = OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY;
+    otherModel.qwen.billingPlan = OPENROUTER_CROUTON_BILLING_PLAN;
+    expect(() => validateProjectConfig(otherModel)).toThrow(/qwen.model to be "qwen3.8-max"/);
+
+    // Each mismatched route component is rejected on its own.
+    for (const mismatch of [
+      { baseUrl: 'https://api.openai.com/v1' },
+      { credentialEnvKey: 'OPENAI_API_KEY' },
+      { billingPlan: 'standard' as const },
+    ]) {
+      const config = defaultProjectConfig(makeTmp('config-crouton-mismatch'), 'fixture', 'owner/fixture');
+      config.qwen.model = OPENROUTER_CROUTON_MODEL;
+      config.qwen.baseUrl = OPENROUTER_CROUTON_BASE_URL;
+      config.qwen.credentialEnvKey = OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY;
+      config.qwen.billingPlan = OPENROUTER_CROUTON_BILLING_PLAN;
+      Object.assign(config.qwen, mismatch);
+      expect(() => validateProjectConfig(config)).toThrow(/Crouton route requires/);
+    }
   });
 });

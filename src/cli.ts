@@ -20,6 +20,12 @@ import {
 } from './portfolio/planner.js';
 import { QwenApiClient } from './qwen/qwen-api.js';
 import { assertQwenCredentialCompatibility, resolveQwenCredential } from './qwen/credential-resolver.js';
+import { QWEN_HARNESS_MODEL } from './qwen/runtime-compat.js';
+import {
+  OPENROUTER_CROUTON_BASE_URL,
+  OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
+  OPENROUTER_CROUTON_MODEL,
+} from './qwen/openrouter-route.js';
 import { ProjectRegistry } from './registry.js';
 import { RepositoryAssessor } from './program/repository-assessor.js';
 import { buildEvidenceReport, formatEvidenceReport } from './program/evidence-report.js';
@@ -63,7 +69,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       if (credential) assertQwenCredentialCompatibility(config, credential);
       const { ledger, budget } = openUsageGuard(config);
       try {
-        const model = new QwenApiClient({ model: config.qwen.model, baseUrl: config.qwen.baseUrl, credentialEnvKey: config.qwen.credentialEnvKey, apiKey: credential?.apiKey, timeoutMs: 9 * 60_000, maxAttempts: 1, structuredOutputMode: 'json_object', usageLedger: ledger, usageBudget: budget });
+        const model = new QwenApiClient({ model: config.qwen.model, baseUrl: config.qwen.baseUrl, credentialEnvKey: config.qwen.credentialEnvKey, billingPlan: config.qwen.billingPlan,
+          apiKey: credential?.apiKey, timeoutMs: 9 * 60_000, maxAttempts: 1, structuredOutputMode: 'json_object', usageLedger: ledger, usageBudget: budget });
         console.error(`Read ${source.sections.length} source section(s). Draft only; no delivery is authorized.`);
         const result = await draftSpecification({ root, source, model, modelName: config.qwen.model, baseUrl: config.qwen.baseUrl, onProgress: (message) => console.error(message) });
         console.log(json ? JSON.stringify(result, null, 2) : `${result.markdown}\nPrivate draft: ${result.documentFile}\nPrivate record: ${result.file}\n${result.reused ? 'Reused the existing draft for this exact input.' : 'Draft saved.'} No issues, approvals, or execution were created.\nReview with: fern-harness spec-status ${root} --spec ${result.record.id}`);
@@ -88,6 +95,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           projectName: valueOf(args, '--name'),
           githubRepo: valueOf(args, '--repo'),
           trustedAuthor: valueOf(args, '--trusted-author'),
+          qwenModel: modelValue(args),
           qwenBaseUrl: valueOf(args, '--base-url'),
           qwenCredentialEnvKey: valueOf(args, '--api-key-env'),
           qwenBillingPlan: billingPlanValue(args),
@@ -117,6 +125,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
     case 'update': {
       const current = loadProjectConfig(root);
+      // Explicit opt-in model selection: only the default Qwen3.8 route and
+      // the exact OpenRouter stealth/crouton-alpha route are accepted.
+      const model = modelValue(args, current.qwen.model);
+      const croutonRoute = model === OPENROUTER_CROUTON_MODEL;
       const result = await installProject({
         root,
         dryRun: hasFlag(args, '--dry-run'),
@@ -125,9 +137,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           projectName: current.project.name,
           githubRepo: current.project.githubRepo,
           trustedAuthor: current.intake.trustedAuthors.find((author) => author !== 'github-actions[bot]') ?? '',
-          qwenBaseUrl: valueOf(args, '--base-url') ?? current.qwen.baseUrl,
-          qwenCredentialEnvKey: valueOf(args, '--api-key-env') ?? current.qwen.credentialEnvKey,
-          qwenBillingPlan: billingPlanValue(args) ?? current.qwen.billingPlan,
+          qwenModel: model,
+          qwenBaseUrl: valueOf(args, '--base-url') ?? (croutonRoute ? OPENROUTER_CROUTON_BASE_URL : current.qwen.baseUrl),
+          qwenCredentialEnvKey: valueOf(args, '--api-key-env') ?? (croutonRoute ? OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY : current.qwen.credentialEnvKey),
+          qwenBillingPlan: billingPlanValue(args) ?? (croutonRoute ? 'custom' : current.qwen.billingPlan),
           autoMerge: toggleFlagValue(args, '--auto-merge', '--no-auto-merge') ?? current.worker.autoMerge,
           enableCommunity: current.intake.communityEnabled,
           enableProgram: toggleFlagValue(args, '--program', '--no-program') ?? current.program.enabled,
@@ -307,6 +320,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
             model: config.qwen.model,
             baseUrl: config.qwen.baseUrl,
             credentialEnvKey: config.qwen.credentialEnvKey,
+          billingPlan: config.qwen.billingPlan,
             apiKey: credential?.apiKey,
             usageLedger: ledger,
             usageBudget: budget,
@@ -353,6 +367,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
             model: config.qwen.model,
             baseUrl: config.qwen.baseUrl,
             credentialEnvKey: config.qwen.credentialEnvKey,
+          billingPlan: config.qwen.billingPlan,
             apiKey: credential?.apiKey,
             usageLedger: ledger,
             usageBudget: budget,
@@ -432,6 +447,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           model: config.qwen.model,
           baseUrl: config.qwen.baseUrl,
           credentialEnvKey: config.qwen.credentialEnvKey,
+          billingPlan: config.qwen.billingPlan,
           apiKey: credential?.apiKey,
           usageLedger: ledger,
           usageBudget: budget,
@@ -691,7 +707,7 @@ function openUsageGuard(config: ProjectConfig): { ledger: UsageLedger; budget: O
 }
 
 function firstPositional(args: string[]): string | undefined {
-  const valueOptions = new Set(['--input', '--idea', '--pages', '--spec', '--name', '--repo', '--trusted-author', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment', '--additional-attempts', '--authorization', '--authorized-by', '--reason']);
+  const valueOptions = new Set(['--input', '--idea', '--pages', '--spec', '--name', '--repo', '--trusted-author', '--model', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment', '--additional-attempts', '--authorization', '--authorized-by', '--reason']);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] as string;
     if (valueOptions.has(arg)) {
@@ -743,6 +759,20 @@ function billingPlanValue(args: string[]): QwenBillingPlan | undefined {
   return value as QwenBillingPlan;
 }
 
+/**
+ * Resolve --model against the current configuration. Only the default Qwen
+ * model and the exact OpenRouter stealth/crouton-alpha route are supported;
+ * every other model is rejected before any configuration is read or written.
+ */
+function modelValue(args: string[], current?: string): string | undefined {
+  const value = valueOf(args, '--model');
+  if (value === undefined) return current;
+  if (value !== QWEN_HARNESS_MODEL && value !== OPENROUTER_CROUTON_MODEL) {
+    throw new Error(`Invalid --model: ${value}. Only ${QWEN_HARNESS_MODEL} and ${OPENROUTER_CROUTON_MODEL} (OpenRouter, opt-in) are supported.`);
+  }
+  return value;
+}
+
 function approvalExpectation(args: string[]): { revision: number; contentHash: string } | undefined {
   const revision = integerValue(args, '--revision');
   const contentHash = valueOf(args, '--hash');
@@ -761,7 +791,7 @@ Commands:
   interactive | ui     Interactive project, program approval, and execution console
   init                 Guided, idempotent project setup
   update               Refresh installer-owned assets and migrations
-  doctor [--live]      Readiness matrix; --live performs a Qwen API call
+  doctor [--live]      Readiness matrix; --live tests the configured model
   verify               Alias for live doctor
   register             Register a project with the persistent worker
   unregister           Remove a project registration
@@ -797,9 +827,14 @@ Recovery authorization options (operator-only):
 
 Init options:
   --dry-run --yes --name NAME --repo OWNER/NAME --trusted-author LOGIN --billing-plan PLAN
-  --base-url URL --api-key-env NAME
+  --model qwen3.8-max|stealth/crouton-alpha --base-url URL --api-key-env NAME
   --auto-merge --no-auto-merge --community --program --no-program --configure-github --install-qwen --with-mm --with-browser --install-cli --persist-api-key
   --install-service --no-service --link-extension --no-link-extension --skip-dependencies
+
+Update options:
+  --dry-run --model qwen3.8-max|stealth/crouton-alpha --billing-plan PLAN --base-url URL --api-key-env NAME
+  --auto-merge --no-auto-merge --program --no-program --install-qwen --with-mm --with-browser --install-cli
+  --persist-api-key --configure-github --install-service --no-service --link-extension --no-link-extension --skip-dependencies
 
 Reward options:
   --task TASK_ID --issue NUMBER --json

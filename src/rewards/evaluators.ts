@@ -7,6 +7,8 @@ import { type UsageBudgetController, type UsageLedger, UsageBudgetActiveError } 
 import { QwenApiClient } from '../qwen/qwen-api.js';
 import { QwenStructuredResultCollector } from '../qwen/structured-result.js';
 import { createQwenModelSelection } from '../qwen/model-selection.js';
+import { isCroutonExecutionRoute, openRouterCroutonChildEnvironmentFromCredential } from '../qwen/qwen-code-executor.js';
+import { openRouterCroutonCliArgs } from '../qwen/openrouter-route.js';
 import { isMonthlyQuotaExhaustion, parseProviderResetAt } from '../qwen/provider-reset.js';
 import { providerRouteFromConfig, QuotaHoldActiveError, type QuotaHoldController } from '../qwen/quota-hold.js';
 import {
@@ -162,10 +164,16 @@ async function evaluateRepositoryCriterion(
   const outputStream = new QwenStructuredResultCollector(
     metering?.usageLedger ? (event) => recordSnapshot(event.sessionId, event.usage) : undefined,
   );
+  // Both the implementer and this independent reviewer must resolve the
+  // Crouton route identically: exact route match opts in, a partial match
+  // (model or endpoint without the full route) fails closed.
+  const crouton = isCroutonExecutionRoute(context.config.qwen);
   const selection = createQwenModelSelection({
     model: context.config.qwen.model,
     baseUrl: context.config.qwen.baseUrl,
-    envKey: context.config.qwen.credentialEnvKey,
+    // Crouton children read the key only from OPENAI_API_KEY on the pinned
+    // OpenAI-compatible endpoint; never a Qwen credential env key.
+    envKey: crouton ? 'OPENAI_API_KEY' : context.config.qwen.credentialEnvKey,
   });
   let receipt: Awaited<ReturnType<typeof runProcess>>;
   try {
@@ -186,6 +194,7 @@ async function evaluateRepositoryCriterion(
       '--safe-mode',
       '--model',
       context.config.qwen.model,
+      ...(crouton ? openRouterCroutonCliArgs() : []),
       '--prompt',
       prompt,
       '--approval-mode',
@@ -212,12 +221,23 @@ async function evaluateRepositoryCriterion(
     signal: context.signal,
     maxOutputBytes: 10 * 1024 * 1024,
     onStdout: (chunk) => outputStream.push(chunk),
-    env: {
-      ...qwenEnvironment(process.env, credential),
-      ...selection.env,
-      QWEN_SANDBOX: 'true',
-      QWEN_CODE_UNATTENDED_RETRY: '1',
-    },
+    env: crouton
+      // Crouton: the OpenRouter key reaches the reviewer ONLY as
+      // OPENAI_API_KEY with the endpoint pinned; no Qwen credential fallback.
+      // The harness-resolved credential supplies the key when it was not
+      // inherited through the process environment.
+      ? {
+        ...openRouterCroutonChildEnvironmentFromCredential(credential, process.env),
+        ...selection.env,
+        QWEN_SANDBOX: 'true',
+        QWEN_CODE_UNATTENDED_RETRY: '1',
+      }
+      : {
+        ...qwenEnvironment(process.env, credential),
+        ...selection.env,
+        QWEN_SANDBOX: 'true',
+        QWEN_CODE_UNATTENDED_RETRY: '1',
+      },
   });
   } finally {
     selection.cleanup();

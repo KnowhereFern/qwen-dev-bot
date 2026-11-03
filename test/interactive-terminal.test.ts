@@ -449,6 +449,26 @@ describe('interactive terminal', () => {
     expect(result.calls[0]).not.toContain('--model');
   });
 
+  it('selects the opt-in Crouton route with an explicit model, endpoint, and credential', async () => {
+    const current = fixture();
+    const result = await session(current, ['8', '1', '5', '1', '0']);
+    expect(result.calls).toEqual([['update', current.config.project.root, '--model', 'stealth/crouton-alpha', '--billing-plan', 'custom', '--base-url', 'https://openrouter.ai/api/v1', '--api-key-env', 'OPENROUTER_API_KEY', '--no-service', '--skip-dependencies']]);
+    expect(result.output).toContain('Model: stealth/crouton-alpha');
+    expect(result.output).toContain('Endpoint: https://openrouter.ai/api/v1');
+    expect(result.output).toContain('Credential: OPENROUTER_API_KEY');
+    expect(result.output).toContain('opt-in');
+  });
+
+  it('restores the default Qwen model when leaving the Crouton route', async () => {
+    const current = fixture();
+    current.config.qwen.model = 'stealth/crouton-alpha';
+    current.config.qwen.baseUrl = 'https://openrouter.ai/api/v1';
+    current.config.qwen.credentialEnvKey = 'OPENROUTER_API_KEY';
+    current.config.qwen.billingPlan = 'custom';
+    const result = await session(current, ['8', '1', '1', '', '', '1', '0']);
+    expect(result.calls[0]).toEqual(['update', current.config.project.root, '--model', 'qwen3.8-max', '--billing-plan', 'standard', '--base-url', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', '--api-key-env', 'DASHSCOPE_API_KEY', '--no-service', '--skip-dependencies']);
+  });
+
   it('never tests the live provider simply by viewing connection status', async () => {
     const viewed = await session(fixture(), ['8', '0', '0']);
     expect(viewed.calls).toEqual([]);
