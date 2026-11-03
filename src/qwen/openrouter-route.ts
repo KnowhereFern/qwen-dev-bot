@@ -133,3 +133,80 @@ export function openRouterCroutonRequestBody(
   body.model = OPENROUTER_CROUTON_MODEL;
   return body;
 }
+
+/** Sanitized durable-hold kind for a confirmed OpenRouter HTTP 402
+ * spending-limit capacity error on the exact Crouton route. Never carries
+ * raw provider text. */
+export const OPENROUTER_CROUTON_CAPACITY_HOLD_KIND = 'openrouter_capacity';
+
+/** limit_source values OpenRouter documents for HTTP 402 spending-limit
+ * responses. No other value (and no prose) confirms a capacity hold. */
+const OPENROUTER_402_LIMIT_SOURCES = new Set(['openrouter_key_limit', 'openrouter_credits']);
+
+/** Same length bound as the shared quota classifiers: never scan unbounded
+ * provider-written output for the structured 402 marker. */
+const OPENROUTER_CAPACITY_MAX_LENGTH = 2_000;
+
+/**
+ * True only for a confirmed OpenRouter HTTP 402 spending-limit capacity
+ * error: a structured `error.metadata.limit_source` of
+ * openrouter_key_limit or openrouter_credits, either as the parsed JSON
+ * body itself (direct API) or inside the outermost bounded JSON object
+ * embedded in CLI-wrapped output (structured reason / stderr tail).
+ * Generic 402 bodies and incidental prose never match. Direct API callers
+ * verify the HTTP status separately. CLI callers request a structured 402
+ * status too, since a failed process alone does not establish that status.
+ * Both callers must verify the exact stealth/crouton-alpha route. Pure.
+ */
+export function isOpenRouterCapacityExhaustion(
+  body: string | null | undefined,
+  requireStructured402 = false,
+): boolean {
+  if (typeof body !== 'string' || body.length === 0 || body.length > OPENROUTER_CAPACITY_MAX_LENGTH) {
+    return false;
+  }
+  if (admitsCapacityLimitSource(body, requireStructured402)) return true;
+  // CLI boundaries wrap the provider JSON in prose: admit the same strict
+  // structured marker only inside the outermost embedded JSON object.
+  const start = body.indexOf('{');
+  const end = body.lastIndexOf('}');
+  if (start < 0 || end <= start) return false;
+  return admitsCapacityLimitSource(body.slice(start, end + 1), requireStructured402);
+}
+
+/**
+ * Bounded candidates for the confirmed 402 capacity classifier: the
+ * structured reason first, then the capped stderr tail — mirroring the
+ * shared monthly-quota classifier. Returns the confirming candidate or
+ * null when neither confirms.
+ */
+export function openRouterCapacityExhaustionReason(
+  structured: string | null | undefined,
+  stderr: string,
+): string | null {
+  for (const candidate of [structured ?? '', stderr.slice(-2_000)]) {
+    if (candidate && isOpenRouterCapacityExhaustion(candidate, true)) return candidate;
+  }
+  return null;
+}
+
+function admitsCapacityLimitSource(text: string, requireStructured402: boolean): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  const error = (parsed as { error?: unknown }).error;
+  if (!error || typeof error !== 'object' || Array.isArray(error)) return false;
+  if (requireStructured402) {
+    const status = (error as { code?: unknown; status?: unknown }).code ??
+      (error as { status?: unknown }).status;
+    if (status !== 402 && status !== '402') return false;
+  }
+  const metadata = (error as { metadata?: unknown }).metadata;
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+  const limitSource = (metadata as { limit_source?: unknown }).limit_source;
+  return typeof limitSource === 'string' && OPENROUTER_402_LIMIT_SOURCES.has(limitSource);
+}

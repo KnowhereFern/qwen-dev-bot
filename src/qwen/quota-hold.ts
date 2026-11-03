@@ -16,8 +16,10 @@ export const QUOTA_HOLD_MAX_WAIT_MS = 24 * 60 * 60 * 1_000;
 /** Doubling stops here so the exponent can never overflow. */
 const QUOTA_HOLD_MAX_EXPONENT = 20;
 /** The only hold classifications applyHold accepts; raw provider text is
- * never persisted as a kind. */
-const QUOTA_HOLD_KINDS = new Set(['insufficient_quota', 'qwen_code_quota']);
+ * never persisted as a kind. openrouter_capacity covers a confirmed
+ * OpenRouter HTTP 402 spending-limit error on the exact Crouton route. */
+export type QuotaHoldKind = 'insufficient_quota' | 'qwen_code_quota' | 'openrouter_capacity';
+const QUOTA_HOLD_KINDS: ReadonlySet<string> = new Set<QuotaHoldKind>(['insufficient_quota', 'qwen_code_quota', 'openrouter_capacity']);
 
 /**
  * The sanitized provider route identity of a Qwen credential route: base
@@ -76,7 +78,8 @@ export interface QuotaHoldApplyInput {
   /** Admitted strict reset timestamp, when the provider supplied one. */
   resetAt?: number | null;
   /** Short, sanitized classification of the confirmed signal (no raw
-   * errors, prompts, or secrets). */
+   * errors, prompts, or secrets). Runtime-validated against the closed
+   * kind set above. */
   kind: string;
   now?: number;
 }

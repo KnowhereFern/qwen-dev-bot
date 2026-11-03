@@ -6,8 +6,10 @@ import { harnessStateRoot } from '../core/state-paths.js';
 import { DEFAULT_QWEN_BASE_URL, QWEN_HARNESS_MODEL } from './runtime-compat.js';
 import {
   OPENROUTER_CROUTON_BILLING_PLAN,
+  OPENROUTER_CROUTON_CAPACITY_HOLD_KIND,
   OPENROUTER_CROUTON_MODEL,
   assertOpenRouterCroutonRoute,
+  isOpenRouterCapacityExhaustion,
   openRouterCroutonRequestBody,
 } from './openrouter-route.js';
 import { isMonthlyQuotaExhaustion, parseProviderResetAt } from './provider-reset.js';
@@ -17,6 +19,7 @@ import {
   QuotaHoldActiveError,
   type ProviderRoute,
   type QuotaHoldController,
+  type QuotaHoldKind,
 } from './quota-hold.js';
 
 export const DEFAULT_QWEN_API_TIMEOUT_MS = 5 * 60_000;
@@ -185,6 +188,15 @@ export class QwenApiClient {
           const heldUntil = this.recordHold(resetAt);
           throw new QuotaHoldActiveError(heldUntil ?? null);
         }
+        // OpenRouter documents HTTP 402 for spending limits. On the exact
+        // Crouton route only, a confirmed structured 402 capacity error is a
+        // provider wait: persist the durable hold (bounded backoff; OpenRouter
+        // supplies no reset timestamp) and never retry or report a code
+        // failure. Generic 402 bodies stay fail-closed below.
+        if (response.status === 402 && this.croutonRoute && isOpenRouterCapacityExhaustion(body)) {
+          const heldUntil = this.recordHold(null, OPENROUTER_CROUTON_CAPACITY_HOLD_KIND);
+          throw new QuotaHoldActiveError(heldUntil ?? null);
+        }
         if (isRetryableStatus(response.status) && attempt < this.maxAttempts) {
           await delay(retryDelayMs(response, attempt), input.signal);
           continue;
@@ -242,12 +254,12 @@ export class QwenApiClient {
     }
   }
 
-  private recordHold(resetAt: number | null): number | null {
-    if (this.quotaHold) return this.quotaHold.applyHold(this.route, { resetAt, kind: 'insufficient_quota' });
+  private recordHold(resetAt: number | null, kind: QuotaHoldKind = 'insufficient_quota'): number | null {
+    if (this.quotaHold) return this.quotaHold.applyHold(this.route, { resetAt, kind });
     if (this.usesInjectedFetch) return null;
     const hold = new ProviderQuotaHold(harnessStateRoot());
     try {
-      return hold.applyHold(this.route, { resetAt, kind: 'insufficient_quota' });
+      return hold.applyHold(this.route, { resetAt, kind });
     } finally {
       hold.close();
     }

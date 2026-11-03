@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   OPENROUTER_CROUTON_BASE_URL,
+  OPENROUTER_CROUTON_CAPACITY_HOLD_KIND,
   OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
   OPENROUTER_CROUTON_MODEL,
   assertOpenRouterCroutonRoute,
+  isOpenRouterCapacityExhaustion,
   isOpenRouterCroutonRoute,
+  openRouterCapacityExhaustionReason,
   openRouterCroutonChildEnvironment,
   openRouterCroutonCliArgs,
   openRouterCroutonRequestBody,
@@ -132,5 +135,51 @@ describe('OpenRouter Crouton direct API body fields', () => {
     expect(JSON.stringify(body)).not.toContain('sk-');
     expect(body).not.toHaveProperty('api_key');
     expect(body).not.toHaveProperty('authorization');
+  });
+});
+
+describe('OpenRouter HTTP 402 capacity error classification', () => {
+  // OpenRouter's documented 402 spending-limit body shape.
+  const capacityBody = (limitSource: string) =>
+    `{"error":{"code":402,"message":"Payment required","metadata":{"limit_source":"${limitSource}","reason":"spending limit reached"}}}`;
+
+  it('keeps the hold kind sanitized', () => {
+    expect(OPENROUTER_CROUTON_CAPACITY_HOLD_KIND).toBe('openrouter_capacity');
+  });
+
+  it('confirms only the two documented structured limit_source values', () => {
+    expect(isOpenRouterCapacityExhaustion(capacityBody('openrouter_key_limit'))).toBe(true);
+    expect(isOpenRouterCapacityExhaustion(capacityBody('openrouter_credits'))).toBe(true);
+  });
+
+  it('confirms the structured marker embedded in bounded CLI-wrapped output', () => {
+    expect(isOpenRouterCapacityExhaustion(`Error: 402 ${capacityBody('openrouter_credits')} (request failed)`)).toBe(true);
+  });
+
+  it.each([
+    ['generic 402 without metadata', '{"error":{"code":402,"message":"Payment required"}}'],
+    ['undocumented limit_source', capacityBody('user_monthly_spend_limit')],
+    ['limit_source outside metadata', '{"error":{"code":402,"limit_source":"openrouter_credits"}}'],
+    ['array-position limit_source', '{"error":{"code":402,"metadata":["openrouter_credits"]}}'],
+    ['non-numeric limit_source', '{"error":{"code":402,"metadata":{"limit_source":402}}}'],
+    ['incidental prose', 'Payment required: your openrouter credits are exhausted, add funds'],
+    ['prose quoting the field without JSON', 'limit_source openrouter_credits mentioned in text'],
+    ['empty', ''],
+    ['oversized', `${capacityBody('openrouter_credits')} ${'x'.repeat(2_001)}`],
+  ])('fails closed for %s', (_name, body) => {
+    expect(isOpenRouterCapacityExhaustion(body)).toBe(false);
+  });
+
+  it('rejects null/undefined and confirms the shared reason helper order', () => {
+    expect(isOpenRouterCapacityExhaustion(null)).toBe(false);
+    expect(isOpenRouterCapacityExhaustion(undefined)).toBe(false);
+    // Structured reason wins over a non-matching stderr tail.
+    expect(openRouterCapacityExhaustionReason(capacityBody('openrouter_key_limit'), 'unrelated stderr')).toBe(capacityBody('openrouter_key_limit'));
+    // A structured marker inside the capped stderr tail confirms too.
+    expect(openRouterCapacityExhaustionReason(null, `wrap: ${capacityBody('openrouter_credits')}`)).toContain('openrouter_credits');
+    expect(openRouterCapacityExhaustionReason('{"error":{"metadata":{"limit_source":"openrouter_credits"}}}', '')).toBeNull();
+    // Neither candidate confirming stays null.
+    expect(openRouterCapacityExhaustionReason('generic pause', 'payment required prose')).toBeNull();
+    expect(openRouterCapacityExhaustionReason(null, '')).toBeNull();
   });
 });

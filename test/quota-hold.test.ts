@@ -163,6 +163,11 @@ describe('Provider quota hold', () => {
       // A past or non-finite reset likewise falls back.
       const past = hold.applyHold(route, { resetAt: now - 1_000, kind: 'qwen_code_quota', now });
       expect(past).toBeGreaterThan(now);
+      // The sanitized OpenRouter capacity kind is admitted with the same
+      // bounded backoff (no reset timestamp is available for a 402).
+      const capacity = hold.applyHold(route, { kind: 'openrouter_capacity', now: now + 10_000_000 });
+      expect(capacity).toBeGreaterThanOrEqual(now + 10_000_000 + QUOTA_HOLD_MIN_WAIT_MS);
+      expect(capacity - (now + 10_000_000)).toBeLessThanOrEqual(QUOTA_HOLD_MAX_WAIT_MS);
     } finally { hold.close(); }
   });
 

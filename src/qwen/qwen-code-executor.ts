@@ -19,8 +19,10 @@ import { QuotaHoldActiveError, providerRouteFromConfig, type QuotaHoldController
 import {
   isOpenRouterCroutonRoute,
   OPENROUTER_CROUTON_BASE_URL,
+  OPENROUTER_CROUTON_CAPACITY_HOLD_KIND,
   OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
   OPENROUTER_CROUTON_MODEL,
+  openRouterCapacityExhaustionReason,
   openRouterCroutonChildEnvironment,
   openRouterCroutonCliArgs,
 } from './openrouter-route.js';
@@ -99,6 +101,9 @@ export interface QwenExecutor {
 interface StreamEvent {
   type?: string;
   subtype?: string;
+  is_error?: boolean;
+  reason?: string;
+  error?: string;
   session_id?: string;
   result?: string;
   usage?: Record<string, unknown>;
@@ -307,6 +312,29 @@ export class QwenCodeExecutor implements QwenExecutor {
     }
 
     if (receipt.aborted) throw new Error(formatProcessFailure(receipt));
+    // OpenRouter documents HTTP 402 for spending limits. On the exact Crouton
+    // route only, a confirmed structured 402 capacity error from the bounded
+    // structured goal reason or the capped stderr tail parks the route behind
+    // the durable provider hold — a provider wait, never a code failure and
+    // never an unbounded resume loop (OpenRouter supplies no reset timestamp,
+    // so the hold uses bounded exponential backoff). Generic 402 wording or
+    // incidental prose stays fail-closed below.
+    const failedResult = latest.resultEvent?.type === 'result' &&
+      (latest.resultEvent.is_error === true || latest.resultEvent.subtype === 'error');
+    const resultReason = failedResult
+      ? latest.resultEvent?.reason ?? latest.resultEvent?.error ?? latest.resultEvent?.result
+      : null;
+    const capacityReason = crouton && receipt.exitCode !== 0 && !receipt.aborted && !receipt.timedOut
+      ? openRouterCapacityExhaustionReason(latest.goalReason, receipt.stderr) ??
+        openRouterCapacityExhaustionReason(resultReason, '')
+      : null;
+    if (capacityReason !== null) {
+      const heldUntil = this.quotaHold?.applyHold(providerRouteFromConfig(this.config.qwen), {
+        resetAt: null,
+        kind: OPENROUTER_CROUTON_CAPACITY_HOLD_KIND,
+      }) ?? null;
+      throw new QuotaHoldActiveError(heldUntil);
+    }
     const budgetExit = receipt.exitCode === 53 || receipt.exitCode === 55 || receipt.timedOut;
     // A narrow multi-marker context-exhaustion pause on a known session is a
     // local process boundary of this machine's run, not a task failure: the

@@ -199,6 +199,15 @@ describe('QwenAgenticEvaluator monthly quota hold from reviewer failure', () => 
     await expect(fixture({ quotaHold })()).rejects.toThrow('Qwen independent review failed');
     await expect(fixture({ quotaHold })()).rejects.not.toMatchObject({ name: 'QuotaHoldActiveError' });
   });
+
+  it('never applies a capacity hold for a structured 402 marker off the exact Crouton route', async () => {
+    // Default Qwen route: the documented OpenRouter 402 body in stderr stays
+    // a plain review failure; the capacity classifier is Crouton-route only.
+    output([''], 1, false, 'Error: 402 {"error":{"code":402,"message":"Payment required","metadata":{"limit_source":"openrouter_credits"}}}');
+    const quotaHold: QuotaHoldController = { heldUntil: () => null, applyHold: () => { throw new Error('hold must not be applied'); } };
+    await expect(fixture({ quotaHold })()).rejects.toThrow('Qwen independent review failed');
+    await expect(fixture({ quotaHold })()).rejects.not.toMatchObject({ name: 'QuotaHoldActiveError' });
+  });
 });
 
 describe('QwenAgenticEvaluator OpenRouter Crouton route', () => {
@@ -278,5 +287,35 @@ describe('QwenAgenticEvaluator OpenRouter Crouton route', () => {
     const wrongRoute = { envKey: 'DASHSCOPE_API_KEY', apiKey: 'sk-qwen-wrong-route-review-key' };
     await expect(croutonFixture({ credential: wrongRoute })()).rejects.toThrow('Crouton route requires OPENROUTER_API_KEY');
     expect(runProcess).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['bounded stderr capacity marker', 'stderr'],
+    ['bounded structured result-event reason', 'structured'],
+  ] as const)('parks a confirmed OpenRouter 402 capacity error from %s behind the durable hold', async (_name, source) => {
+    const capacityBody = '{"error":{"code":402,"message":"Payment required","metadata":{"limit_source":"openrouter_credits","reason":"spending limit reached"}}}';
+    if (source === 'stderr') output([''], 1, false, `Error: 402 ${capacityBody}`);
+    else output([`${JSON.stringify({ type: 'result', subtype: 'error', is_error: true, reason: capacityBody })}\n`], 1);
+    const calls: Array<{ kind: string; resetAt: number | null }> = [];
+    const quotaHold: QuotaHoldController = {
+      heldUntil: () => null,
+      applyHold: (_route, input) => {
+        calls.push({ kind: input.kind, resetAt: input.resetAt ?? null });
+        return Date.now() + 60 * 60_000;
+      },
+    };
+    await expect(croutonFixture({ quotaHold })()).rejects.toMatchObject({ name: 'QuotaHoldActiveError' });
+    expect(runProcess).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual([{ kind: 'openrouter_capacity', resetAt: null }]);
+  });
+
+  it.each([
+    'Error: 402 Payment required',
+    'payment required: your openrouter credits are exhausted',
+  ])('fails a generic 402 or incidental prose closed as a review failure without a hold (%s)', async (stderr) => {
+    output([''], 1, false, stderr);
+    const quotaHold: QuotaHoldController = { heldUntil: () => null, applyHold: () => { throw new Error('hold must not be applied'); } };
+    await expect(croutonFixture({ quotaHold })()).rejects.toThrow('Qwen independent review failed');
+    await expect(croutonFixture({ quotaHold })()).rejects.not.toMatchObject({ name: 'QuotaHoldActiveError' });
   });
 });

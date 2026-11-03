@@ -446,4 +446,60 @@ describe('OpenRouter crouton route on the direct API client', () => {
     expect(() => new QwenApiClient({ ...croutonOptions, baseUrl: 'https://api.openai.com/v1', fetchImpl })).toThrow();
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it('parks a confirmed OpenRouter 402 capacity error behind the durable hold and never retries', async () => {
+    const stateRoot = makeTmp('qwen-api-crouton-402');
+    const quotaHold = new ProviderQuotaHold(stateRoot);
+    try {
+      const capacityBody = '{"error":{"code":402,"message":"Payment required","metadata":{"limit_source":"openrouter_credits","reason":"spending limit reached"}}}';
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response(capacityBody, { status: 402 }));
+      const client = new QwenApiClient({ ...croutonOptions, fetchImpl, maxAttempts: 3, timeoutMs: 1_000, quotaHold });
+      await expect(
+        client.completeJson({ system: 'Return JSON.', user: 'Confirm.', reasoningEffort: 'low' }),
+      ).rejects.toMatchObject({ name: 'QuotaHoldActiveError' });
+      // A confirmed capacity error never retries.
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      // The persisted hold uses only the sanitized kind on the exact Crouton route.
+      const rows = quotaHold.inspect();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.kind).toBe('openrouter_capacity');
+      const route = { baseUrl: OPENROUTER_CROUTON_BASE_URL, model: OPENROUTER_CROUTON_MODEL, credentialEnvKey: OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY };
+      const heldUntil = quotaHold.heldUntil(route);
+      expect(heldUntil).not.toBeNull();
+      // The durable hold blocks the next request before any network attempt.
+      await expect(
+        client.completeJson({ system: 'Return JSON.', user: 'Confirm.', reasoningEffort: 'low' }),
+      ).rejects.toMatchObject({ name: 'QuotaHoldActiveError', heldUntil });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    } finally { quotaHold.close(); }
+  });
+
+  it('fails a generic 402 closed on the Crouton route without any hold', async () => {
+    const stateRoot = makeTmp('qwen-api-crouton-402-generic');
+    const quotaHold = new ProviderQuotaHold(stateRoot);
+    try {
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response('{"error":{"code":402,"message":"Payment required"}}', { status: 402 }));
+      const client = new QwenApiClient({ ...croutonOptions, fetchImpl, maxAttempts: 2, timeoutMs: 1_000, quotaHold });
+      await expect(
+        client.completeJson({ system: 'Return JSON.', user: 'Confirm.', reasoningEffort: 'low' }),
+      ).rejects.toThrow('HTTP 402');
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(quotaHold.inspect()).toHaveLength(0);
+    } finally { quotaHold.close(); }
+  });
+
+  it('never applies a capacity hold for a structured 402 off the Crouton route', async () => {
+    const stateRoot = makeTmp('qwen-api-qwen-402');
+    const quotaHold = new ProviderQuotaHold(stateRoot);
+    try {
+      const capacityBody = '{"error":{"code":402,"message":"Payment required","metadata":{"limit_source":"openrouter_key_limit"}}}';
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response(capacityBody, { status: 402 }));
+      const client = new QwenApiClient({ apiKey: 'test-key', fetchImpl, maxAttempts: 2, timeoutMs: 1_000, quotaHold });
+      await expect(
+        client.completeJson({ system: 'Return JSON.', user: 'Confirm.', reasoningEffort: 'low' }),
+      ).rejects.toThrow('HTTP 402');
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(quotaHold.inspect()).toHaveLength(0);
+    } finally { quotaHold.close(); }
+  });
 });

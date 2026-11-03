@@ -8,7 +8,11 @@ import { QwenApiClient } from '../qwen/qwen-api.js';
 import { QwenStructuredResultCollector } from '../qwen/structured-result.js';
 import { createQwenModelSelection } from '../qwen/model-selection.js';
 import { isCroutonExecutionRoute, openRouterCroutonChildEnvironmentFromCredential } from '../qwen/qwen-code-executor.js';
-import { openRouterCroutonCliArgs } from '../qwen/openrouter-route.js';
+import {
+  OPENROUTER_CROUTON_CAPACITY_HOLD_KIND,
+  openRouterCapacityExhaustionReason,
+  openRouterCroutonCliArgs,
+} from '../qwen/openrouter-route.js';
 import { isMonthlyQuotaExhaustion, parseProviderResetAt } from '../qwen/provider-reset.js';
 import { providerRouteFromConfig, QuotaHoldActiveError, type QuotaHoldController } from '../qwen/quota-hold.js';
 import {
@@ -259,6 +263,22 @@ async function evaluateRepositoryCriterion(
       const resetAt = parseProviderResetAt(quotaReason, Date.now());
       const heldUntil = metering?.quotaHold?.applyHold(providerRouteFromConfig(context.config.qwen), { resetAt, kind: 'qwen_code_quota' }) ?? null;
       throw new QuotaHoldActiveError(heldUntil);
+    }
+    // OpenRouter documents HTTP 402 for spending limits. On the exact Crouton
+    // route only, a confirmed structured 402 capacity error from the bounded
+    // structured reason or capped stderr tail parks the route behind the
+    // durable hold — a provider wait, never a review code failure and never
+    // an unbounded retry. Generic 402 wording or incidental prose stays
+    // fail-closed below.
+    if (crouton && receipt.exitCode !== 0 && !receipt.aborted && !receipt.timedOut) {
+      const capacityReason = openRouterCapacityExhaustionReason(outputStream.structuredErrorReason(), receipt.stderr);
+      if (capacityReason !== null) {
+        const heldUntil = metering?.quotaHold?.applyHold(providerRouteFromConfig(context.config.qwen), {
+          resetAt: null,
+          kind: OPENROUTER_CROUTON_CAPACITY_HOLD_KIND,
+        }) ?? null;
+        throw new QuotaHoldActiveError(heldUntil);
+      }
     }
     throw new Error(`Qwen independent review failed (exit=${String(receipt.exitCode)}, aborted=${receipt.aborted}, timedOut=${receipt.timedOut}): ${redactText(receipt.stderr).slice(-1_000)}`);
   }
