@@ -814,7 +814,8 @@ export class PersistentTaskStore {
 
   /**
    * Record an append-only operator feedback event for an unleased ready task
-   * with remaining retry budget and an existing worktree. Patches lastError so
+   * with remaining retry budget and an existing worktree. Bind it to the
+   * candidate commit held at review time. Patches lastError so
    * the next repair prompt carries the finding; never resets or creates
    * attempts and never changes the contract, history, or permissions.
    */
@@ -835,6 +836,7 @@ export class PersistentTaskStore {
       const prior = this.listEvents('task.operator_feedback').find((entry) => entry.idempotencyKey === key);
       const current = this.get(id);
       const contractHash = createHash('sha256').update(JSON.stringify(current.spec)).digest('hex');
+      const candidateCommitSha = current.commitSha;
       const binding = createHash('sha256').update(JSON.stringify({
         id,
         issueNumber: current.issueNumber,
@@ -842,6 +844,7 @@ export class PersistentTaskStore {
         authorizedBy: redactText(feedback.authorizedBy),
         reason,
         contractHash,
+        candidateCommitSha,
       })).digest('hex');
       if (prior) {
         if (prior.payload.binding !== binding) throw new Error('Operator feedback authorization conflicts with its original binding');
@@ -865,6 +868,7 @@ export class PersistentTaskStore {
         attempts: current.attempts,
         maxAttempts: current.maxAttempts,
         contractHash,
+        candidateCommitSha,
         priorVersion: current.version,
       }, key);
       this.insertEvent(event);

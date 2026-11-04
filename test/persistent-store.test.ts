@@ -72,19 +72,35 @@ describe('PersistentTaskStore', () => {
     const worktree = makeTmp('feedback-worktree');
     let store = new PersistentTaskStore('operator-feedback', dir);
     const task = store.upsert({ issueNumber: 7, title: 'feedback', state: 'ready', maxAttempts: 5, spec: taskSpec([]) });
-    store.patch(task.id, { attempts: 2, lineageFailures: 2, lastError: 'prior failure', worktreePath: worktree });
+    const rejectedSha = 'a'.repeat(40);
+    store.patch(task.id, { attempts: 2, lineageFailures: 2, lastError: 'prior failure', worktreePath: worktree, commitSha: rejectedSha });
     const auth = { authorizationId: 'rev-1', authorizedBy: 'Fern', reason: 'Test deletes product database files' };
     const updated = store.recordOperatorFeedback(task.id, auth);
-    expect(updated).toMatchObject({ state: 'ready', attempts: 2, lineageFailures: 2, worktreePath: worktree,
+    expect(updated).toMatchObject({ state: 'ready', attempts: 2, lineageFailures: 2, worktreePath: worktree, commitSha: rejectedSha,
       lastError: 'Operator feedback (rev-1): Test deletes product database files' });
     expect(updated.spec).toEqual(task.spec);
     expect(store.get(task.id).version).toBe(updated.version);
-    expect(store.listEvents('task.operator_feedback')).toHaveLength(1);
+    const feedbackEvent = store.listEvents('task.operator_feedback')[0]!;
+    expect(feedbackEvent.payload.candidateCommitSha).toBe(rejectedSha);
     store.close();
     store = new PersistentTaskStore('operator-feedback', dir);
     expect(store.recordOperatorFeedback(task.id, auth).lastError).toContain('Operator feedback (rev-1)');
+    // The authorization is bound to the candidate commit it rejected: replaying
+    // it after that candidate is replaced by a different commit conflicts.
+    store.patch(task.id, { commitSha: 'b'.repeat(40) });
+    expect(() => store.recordOperatorFeedback(task.id, auth)).toThrow(/conflicts/);
     expect(() => store.recordOperatorFeedback(task.id, { ...auth, reason: 'different finding' })).toThrow(/conflicts/);
     expect(store.listEvents('task.operator_feedback')).toHaveLength(1);
+    store.close();
+  });
+
+  it('allows operator feedback with no candidate commit and binds it to null', () => {
+    const worktree = makeTmp('feedback-null-worktree');
+    const store = new PersistentTaskStore('operator-feedback-null', makeTmp('operator-feedback-null'));
+    const task = store.upsert({ issueNumber: 9, title: 'no candidate', state: 'ready', maxAttempts: 5, spec: taskSpec([]) });
+    store.patch(task.id, { attempts: 1, lineageFailures: 1, worktreePath: worktree, commitSha: null });
+    store.recordOperatorFeedback(task.id, { authorizationId: 'rev-3', authorizedBy: 'Fern', reason: 'finding without candidate' });
+    expect(store.listEvents('task.operator_feedback')[0]!.payload.candidateCommitSha).toBeNull();
     store.close();
   });
 

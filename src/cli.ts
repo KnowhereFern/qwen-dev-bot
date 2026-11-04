@@ -34,7 +34,7 @@ import { readIntakeSource } from './intake/source.js';
 import { intakeConnection } from './intake/connection.js';
 import { draftSpecification, loadSpecification, renderSpecification, specificationDocument } from './intake/specification.js';
 
-const VERSION = '1.0.0-rc.97';
+const VERSION = '1.0.0-rc.98';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? (process.stdin.isTTY && process.stdout.isTTY ? 'interactive' : 'help');
@@ -315,8 +315,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         const task = store.findByIssue(issue);
         if (!task) throw new Error(`No task exists for issue #${issue}`);
         const updated = store.recordOperatorFeedback(task.id, { authorizationId, authorizedBy, reason });
-        if (json) console.log(JSON.stringify({ issue, state: updated.state, attempts: updated.attempts, maxAttempts: updated.maxAttempts, lastError: updated.lastError, authorizationId }, null, 2));
-        else console.log(`Issue #${issue}: operator feedback recorded for ready task; attempts ${updated.attempts}/${updated.maxAttempts} preserved, next repair prompt will carry the finding. Authorization: ${authorizationId}.`);
+        const budget = store.retryBudget(updated.id);
+        if (json) console.log(JSON.stringify({ issue, state: updated.state, attempts: updated.attempts, retryLimit: budget.limit, failures: budget.failures, lastError: updated.lastError, authorizationId }, null, 2));
+        else console.log(`Issue #${issue}: operator feedback recorded for ready task; attempts ${updated.attempts}/${budget.limit} preserved, next repair prompt will carry the finding. Authorization: ${authorizationId}.`);
         return 0;
       } finally { store.close(); }
     }
