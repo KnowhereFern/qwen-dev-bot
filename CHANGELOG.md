@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.101] - 2026-11-04
+
+- Keep reassessment details inside their existing approved coverage requirements, so a missed acceptance item becomes an actionable repair without weakening task failure lineage.
+
 ## [1.0.0-rc.100] - 2026-11-04
 
 - Prioritize source and tests during repository assessment, and include both ends of files tied to unresolved requirements so documentation cannot hide current implementation evidence.

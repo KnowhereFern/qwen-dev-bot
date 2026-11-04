@@ -442,7 +442,7 @@ describe('PortfolioCoordinator', () => {
     store.close();
   });
 
-  it.each(['mapped', 'separate', 'ambiguous', 'missing', 'renamed', 'reinterpreted', 'material', 'completed', 'active'])('maps recovery by requirement identity before any published effects: %s', async (scenario) => {
+  it.each(['mapped', 'separate', 'approved-new', 'subdetail', 'ambiguous', 'missing', 'renamed', 'reinterpreted', 'material', 'completed', 'active'])('maps recovery by requirement identity before any published effects: %s', async (scenario) => {
     const config = defaultProjectConfig(makeTmp('lineage-root'), 'project', 'owner/project');
     config.program.enabled = true;
     config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
@@ -462,8 +462,12 @@ describe('PortfolioCoordinator', () => {
           id: ['A', 'B', 'C'][index], requirement, status: 'missing', requiredAction: 'implement', rationale: 'Missing', evidence: [],
         })),
       };
+      if (scenario === 'subdetail') assessment.coverage[0]!.requirement = 'Foundation. New capability must be delivered';
       store.saveRepositoryAssessment(assessment);
-      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: initial, assessment });
+      const sourceContent = ['approved-new', 'subdetail'].includes(scenario)
+        ? 'objective\n- Acceptance: New capability must be delivered'
+        : 'objective';
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: sourceContent, draft: initial, assessment });
       let approved = await coordinator.approve(created.plan.id);
       const origins = approved.stories.map((story) => story.normalizedIssueNumber as number);
       origins.forEach((issueNumber) => store.upsert({ issueNumber, title: 'failed work', state: 'quarantined' }));
@@ -483,6 +487,7 @@ describe('PortfolioCoordinator', () => {
         replacement.stories[0]!.coverageIds = ['NEW_A'];
         replacement.stories[1]!.coverageIds = ['B'];
       }
+      if (scenario === 'approved-new' || scenario === 'subdetail') next.coverage[next.coverage.length - 1].requirement = 'New capability must be delivered';
       if (scenario === 'missing') replacement.stories[1]!.coverageIds = [];
       if (scenario === 'ambiguous') replacement.stories[1]!.coverageIds = ['NEW_A', 'B'];
       if (scenario === 'renamed' || scenario === 'material') next.coverage[next.coverage.length - 1].requirement = 'A genuinely new or unresolvable requirement';
@@ -493,7 +498,7 @@ describe('PortfolioCoordinator', () => {
       const before = store.getPortfolioPlan(approved.id);
       const issueCount = github.issues.size;
       const revise = () => coordinator.revise({ planId: approved.id, draft: replacement, assessment: next, reason: 'manual', material: scenario === 'material', summary: 'Recovery mapping' });
-      if (['ambiguous', 'missing', 'renamed', 'reinterpreted'].includes(scenario)) {
+      if (['ambiguous', 'missing', 'renamed', 'reinterpreted', 'subdetail'].includes(scenario)) {
         await expect(revise()).rejects.toMatchObject({ name: 'RecoveryLineageError', storyKeys: ['S2'], assessmentId: next.id });
         expect(github.issues.size).toBe(issueCount);
         expect(store.getPortfolioPlan(approved.id)).toEqual(before);
