@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.94] - 2026-11-04
+
+- Send reviewed, bounded recovery guidance to Qwen when an operator grants another attempt on the same task contract.
+
 ## [1.0.0-rc.93] - 2026-11-04
 
 - Include the gate receipt reason in failed candidate re-verification feedback, so source drift after passing checks is actionable.

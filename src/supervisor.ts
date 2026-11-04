@@ -365,10 +365,13 @@ export class HarnessSupervisor {
       const advanced = await this.advanceImplementationBase(task, worktree.path);
       if (advanced) task = advanced;
       await prepareProjectCheckout(worktree.path, executionSignal);
+      const feedback = task.lastError ? [task.lastError] : [];
+      const recoveryGuidance = this.authorizedRecoveryFeedback(task);
+      if (recoveryGuidance !== null) feedback.push(recoveryGuidance);
       const qwenResult = await this.qwen.execute({
         task,
         worktree: worktree.path,
-        feedback: task.lastError ? [task.lastError] : [],
+        feedback,
         onHeartbeat: heartbeat,
         onSession: (sessionId) => {
           if (this.store.get(task.id).qwenSessionId !== sessionId) {
@@ -505,21 +508,29 @@ export class HarnessSupervisor {
   }
 
   /**
-   * Deterministic local gate re-verification of the uncommitted Qwen
-   * candidate, run between the local handoff and commitCandidate. A workflow
-   * reviewer cannot prove timestamp freshness, so the supervisor itself runs
-   * the immutable controller-packaged
-   * template/.qwen-harness/scripts/run-gates.mjs inside the candidate
-   * worktree (never the mutable tracked project script) and requires a fresh
-   * machine receipt: terminal exit 0, status passed, the exact worktree and
-   * HEAD evaluated, no HEAD movement during the run, every configured required
-   * gate passed, and no input drift. Fail closed on a missing runner, an invalid receipt, or any failed
-   * check; the failure blocks commitCandidate, the PR, and independent review
-   * exactly like the existing exact-commit gates — a gate side effect on the
-   * candidate worktree now fails here first, before anything is committed.
-   * Recovered interrupted candidates skip this step: they are already exact commits re-verified by
-   * the exact-commit gates, so restart recovery is preserved. This never
-   * edits product code or weakens any gate.
+   * Bounded, redacted operator guidance from the latest
+   * task.recovery_authorized event for this exact task. The persisted
+   * contractHash must match the current task spec, so guidance recorded
+   * against a stale or edited contract is never delivered. The failure
+   * lastError feedback and every retry/approval bound stay untouched; this
+   * only adds context to the Qwen call.
+   */
+  private authorizedRecoveryFeedback(task: TaskRecord): string | null {
+    const authorization = this.store.listEvents('task.recovery_authorized')
+      .filter((event) => event.taskId === task.id)
+      .at(-1);
+    if (!authorization) return null;
+    if (authorization.payload.contractHash !== sha256(JSON.stringify(task.spec))) return null;
+    if (typeof authorization.payload.reason !== 'string') return null;
+    const reason = redactText(authorization.payload.reason).trim().slice(0, 2_000);
+    if (!reason) return null;
+    return `Operator-authorized recovery guidance: ${reason}`;
+  }
+
+  /**
+   * Re-run the immutable gates against the uncommitted candidate and require
+   * a fresh receipt for the exact HEAD and unchanged inputs before commit.
+   * Recovered committed candidates use the separate exact-commit gates.
    */
   private async runLocalGateReverification(task: TaskRecord, worktreePath: string, signal?: AbortSignal): Promise<void> {
     // The exact HEAD the gates must evaluate: normally the saved base, but on
