@@ -12,7 +12,7 @@ import {
   QWEN_MM_CORE_MCP_SERVER,
   qwenCodeVersionAtLeast,
 } from './qwen/runtime-compat.js';
-import { OPENROUTER_CROUTON_MODEL } from './qwen/openrouter-route.js';
+import { isOpenRouterCroutonRoute, OPENROUTER_CROUTON_MODEL } from './qwen/openrouter-route.js';
 import { runProcess } from './runtime/safe-process.js';
 import { githubSlugFromRemote } from './git/git-workspace.js';
 
@@ -259,7 +259,7 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
         system: 'Return JSON only.',
         user: 'Return {"ok":true}.',
         reasoningEffort: 'low',
-        maxTokens: 32,
+        maxTokens: doctorLiveMaxTokens(config),
       });
       checks.push(check('qwen-live', result.value.ok === true ? 'pass' : 'fail', result.value.ok === true ? `Live ${config.qwen.model} call passed` : `Live ${config.qwen.model} response failed validation`));
     } catch (error) {
@@ -274,6 +274,11 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
 
 export function qwenHarnessExtensionPresent(output: string): boolean {
   return output.includes('qwen-dev-harness') || output.includes('Autonomous Software Delivery Harness');
+}
+
+/** Crouton's reasoning needs more space than the default 32-token probe. */
+export function doctorLiveMaxTokens(config: ProjectConfig): number {
+  return isOpenRouterCroutonRoute(config.qwen) ? 1024 : 32;
 }
 
 export function formatDoctor(report: DoctorReport): string {
