@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
 import type { TaskRecord } from '../src/core/types.js';
+import { ObservedTokenBudget, UsageBudgetActiveError, UsageLedger } from '../src/core/usage-ledger.js';
 import { QwenCodeExecutor } from '../src/qwen/qwen-code-executor.js';
+import { ProviderQuotaHold, providerRouteFromConfig, QuotaHoldActiveError } from '../src/qwen/quota-hold.js';
 import { runProcess } from '../src/runtime/safe-process.js';
 import { qwenWriterGuardEnvironment, WRITER_GUARD_FAILURE } from '../src/qwen/writer-guard.js';
+import { makeTmp } from './helpers.js';
 
 vi.mock('../src/runtime/safe-process.js', () => ({ runProcess: vi.fn(), formatProcessFailure: vi.fn(() => 'Process failed') }));
 vi.mock('../src/qwen/writer-guard.js', async (importOriginal) => ({
@@ -377,6 +380,38 @@ describe('Qwen execution session isolation', () => {
     await expect(execute([])).rejects.toThrow();
   });
 
+  it('never spawns a Qwen Code process while the provider route is held', async () => {
+    const quotaHold = new ProviderQuotaHold(makeTmp('executor-quota'));
+    try {
+      const config = defaultProjectConfig('/tmp/project', 'test', 'owner/repo');
+      const heldUntil = quotaHold.applyHold(providerRouteFromConfig(config.qwen), {
+        resetAt: Date.now() + 2 * 60 * 60_000,
+        kind: 'insufficient_quota',
+      });
+      const executor = new QwenCodeExecutor(config, null, quotaHold);
+      await expect(executor.execute({ task, worktree: '/tmp/project', feedback: [] }))
+        .rejects.toMatchObject({ name: 'QuotaHoldActiveError', heldUntil });
+      expect(runProcess).not.toHaveBeenCalled();
+      // Unrelated routes are unaffected.
+      const other = new ProviderQuotaHold(makeTmp('executor-quota-other'));
+      try {
+        expect(other.heldUntil(providerRouteFromConfig(config.qwen), Date.now())).toBeNull();
+      } finally { other.close(); }
+    } finally { quotaHold.close(); }
+  });
+
+  it('never spawns a Qwen Code process while the observed-token budget blocks calls', async () => {
+    const ledger = new UsageLedger('exec-budget', makeTmp('exec-budget'));
+    try {
+      ledger.recordDirectApiUsage('seed-call', { total_tokens: 500 });
+      const budget = new ObservedTokenBudget(500, ledger);
+      const executor = new QwenCodeExecutor(defaultProjectConfig('/tmp/project', 'test', 'owner/repo'), null, undefined, null, budget);
+      await expect(executor.execute({ task, worktree: '/tmp/project', feedback: [] }))
+        .rejects.toMatchObject({ name: 'UsageBudgetActiveError', status: { reason: 'limit-reached' } });
+      expect(runProcess).not.toHaveBeenCalled();
+    } finally { ledger.close(); }
+  });
+
   it('starts a subsequent fresh local Goal without resume after a context-exhausted stop', async () => {
     const stoppedTask: TaskRecord = { ...task, continuations: 3, qwenAutomaticStop: { sessionId: task.qwenSessionId!, workflowRunId: task.qwenWorkflowRunId, kind: 'context-exhausted' } };
     const before = structuredClone(stoppedTask);
@@ -398,5 +433,133 @@ describe('Qwen execution session isolation', () => {
     expect(result.workflowRunId).toBeNull();
     expect(result.automaticStop).toBeNull();
     expect(stoppedTask).toEqual(before);
+  });
+});
+
+describe('Qwen executor usage ledger integration', () => {
+  const task = {
+    id: 'task', issueNumber: 35, title: 'Verify existing behavior', body: 'Keep the approved contract.',
+    spec: null, qwenSessionId: 'prior-session', qwenWorkflowRunId: 'prior-workflow', attempts: 7,
+  } as TaskRecord;
+
+  beforeEach(() => {
+    vi.mocked(qwenWriterGuardEnvironment).mockReset().mockReturnValue({});
+    vi.mocked(runProcess).mockReset();
+  });
+
+  const execute = (ledger: UsageLedger) => new QwenCodeExecutor(defaultProjectConfig('/tmp/project', 'test', 'owner/repo'), null, undefined, ledger)
+    .execute({ task, worktree: '/tmp/project', feedback: [] });
+
+  /** One mocked run whose stdout carries the given stream events. */
+  function streamRun(lines: Array<Record<string, unknown>>, exitCode = 0) {
+    vi.mocked(runProcess).mockImplementationOnce(async input => {
+      for (const line of lines) input.onStdout?.(`${JSON.stringify(line)}\n`);
+      return { command: input.command, args: input.args ?? [], cwd: input.cwd,
+        exitCode, timedOut: false, aborted: false, durationMs: 1, stdout: '', stderr: '' };
+    });
+  }
+
+  it('records cumulative session usage from result events, counting only the session maximum', async () => {
+    const ledger = new UsageLedger('exec-usage-ok', makeTmp('exec-usage-ok'));
+    try {
+      streamRun([
+        { type: 'system', session_id: 'session-a' },
+        { type: 'result', session_id: 'session-a', usage: { total_tokens: 10 } },
+        { type: 'result', session_id: 'session-a', usage: { total_tokens: 25 } },
+      ]);
+      const result = await execute(ledger);
+      expect(result.sessionId).toBe('session-a');
+      expect(ledger.summary()).toMatchObject({
+        qwenSessionCount: 1, observedTotalTokens: 25, unmeteredCount: 0, directCallCount: 0,
+      });
+    } finally { ledger.close(); }
+  });
+
+  it('records session usage for runs that later fail', async () => {
+    const ledger = new UsageLedger('exec-usage-fail', makeTmp('exec-usage-fail'));
+    try {
+      streamRun([
+        { type: 'system', session_id: 'session-fail' },
+        { type: 'result', session_id: 'session-fail', usage: { total_tokens: 13 } },
+        { event: { type: 'goal_state', goal_state: { goal: { status: 'paused', lastReason: 'manual user stop' } } } },
+      ], 130);
+      await expect(execute(ledger)).rejects.toThrow();
+      expect(ledger.summary()).toMatchObject({ qwenSessionCount: 1, observedTotalTokens: 13, unmeteredCount: 0 });
+    } finally { ledger.close(); }
+  });
+
+  it('records exactly one unmetered event when no result event arrives', async () => {
+    const ledger = new UsageLedger('exec-usage-noresult', makeTmp('exec-usage-noresult'));
+    try {
+      streamRun([{ type: 'system', session_id: 'session-silent' }]);
+      await execute(ledger);
+      const summary = ledger.summary();
+      expect(summary.unmeteredCount).toBe(1);
+      expect(summary.qwenSessionCount).toBe(0);
+      expect(summary.observedTotalTokens).toBe(0);
+    } finally { ledger.close(); }
+  });
+
+  it('records an unmetered event, not a fabricated session, when the result event lacks a session id', async () => {
+    const ledger = new UsageLedger('exec-usage-nosession', makeTmp('exec-usage-nosession'));
+    try {
+      streamRun([{ type: 'result', usage: { total_tokens: 9 } }]);
+      await execute(ledger);
+      const summary = ledger.summary();
+      expect(summary.unmeteredCount).toBe(1);
+      expect(summary.qwenSessionCount).toBe(0);
+      expect(summary.observedTotalTokens).toBe(0);
+    } finally { ledger.close(); }
+  });
+
+  it('meters a result event under the stream-established session id when the event itself omits session_id', async () => {
+    const ledger = new UsageLedger('exec-usage-inherited-session', makeTmp('exec-usage-inherited-session'));
+    try {
+      // An earlier stream event established the session identity; the result
+      // event omits it. The snapshot is metered under that observed session
+      // (max-per-session), not marked unmetered.
+      streamRun([
+        { type: 'system', session_id: 'session-established' },
+        { type: 'result', usage: { total_tokens: 18 } },
+      ]);
+      await execute(ledger);
+      expect(ledger.summary()).toMatchObject({
+        qwenSessionCount: 1,
+        observedTotalTokens: 18,
+        unmeteredCount: 0,
+      });
+    } finally { ledger.close(); }
+  });
+
+  it('marks a result event with a known session but missing usage as unmetered, never zero', async () => {
+    const ledger = new UsageLedger('exec-usage-nousage', makeTmp('exec-usage-nousage'));
+    try {
+      streamRun([{ type: 'result', session_id: 'session-nousage' }]);
+      await execute(ledger);
+      const summary = ledger.summary();
+      expect(summary.unmeteredCount).toBe(1);
+      expect(summary.qwenSessionCount).toBe(0);
+      expect(summary.observedTotalTokens).toBe(0);
+    } finally { ledger.close(); }
+  });
+
+  it('keeps one session maximum across continuation runs and a ledger restart without double counting', async () => {
+    const stateDir = makeTmp('exec-usage-restart');
+    const first = new UsageLedger('exec-usage-restart', stateDir);
+    try {
+      streamRun([{ type: 'result', session_id: 'session-cont', usage: { total_tokens: 30 } }]);
+      await execute(first);
+      expect(first.summary().observedTotalTokens).toBe(30);
+    } finally { first.close(); }
+    // Continuation run in a restarted process on the same state directory: a
+    // lower cumulative snapshot never lowers or re-adds the observed total,
+    // and the regression is flagged as an anomaly rather than ignored.
+    const reopened = new UsageLedger('exec-usage-restart', stateDir);
+    try {
+      streamRun([{ type: 'result', session_id: 'session-cont', usage: { total_tokens: 20 } }]);
+      await execute(reopened);
+      const summary = reopened.summary();
+      expect(summary).toMatchObject({ qwenSessionCount: 1, observedTotalTokens: 30, unmeteredCount: 0, anomalyCount: 1 });
+    } finally { reopened.close(); }
   });
 });

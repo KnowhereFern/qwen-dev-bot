@@ -56,3 +56,43 @@ describe('QwenStructuredResultCollector', () => {
     expect(() => collect(Array.from({ length: 17 }, () => 'x'.repeat(64 * 1_024)))).toThrow();
   });
 });
+
+describe('QwenStructuredResultCollector metering', () => {
+  it('meters a result event under its own session id without exposing the verdict', () => {
+    const events: Array<{ sessionId: string | null; usage: unknown }> = [];
+    const collector = new QwenStructuredResultCollector((event) => events.push({ ...event }));
+    collector.push(`${JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: 'session-1', usage: { total_tokens: 5 }, result: { verdict: true } })}\n`);
+    expect(collector.finish()).toEqual({ verdict: true });
+    expect(events).toEqual([{ sessionId: 'session-1', usage: { total_tokens: 5 } }]);
+  });
+
+  it('meters under the stream-established session id when the result event omits one', () => {
+    const events: Array<{ sessionId: string | null; usage: unknown }> = [];
+    const collector = new QwenStructuredResultCollector((event) => events.push({ ...event }));
+    collector.push(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'stream-session' })}\n`);
+    collector.push(`${JSON.stringify({ type: 'result', subtype: 'success', is_error: false, usage: { input_tokens: 2, output_tokens: 3 }, result: { ok: true } })}\n`);
+    expect(events).toEqual([{ sessionId: 'stream-session', usage: { input_tokens: 2, output_tokens: 3 } }]);
+    expect(collector.hasResultEvent()).toBe(true);
+  });
+
+  it('meters an error result event and exposes only its bounded structured reason', () => {
+    const events: Array<{ sessionId: string | null; usage: unknown }> = [];
+    const collector = new QwenStructuredResultCollector((event) => events.push({ ...event }));
+    collector.push(`${JSON.stringify({ type: 'result', subtype: 'error', is_error: true, session_id: 'session-2', usage: { total_tokens: 7 }, reason: 'provider quota message' })}\n`);
+    expect(events).toEqual([{ sessionId: 'session-2', usage: { total_tokens: 7 } }]);
+    expect(collector.structuredErrorReason()).toBe('provider quota message');
+    expect(() => collector.finish()).toThrow();
+  });
+
+  it('reports no result event for streams without one and flushes a trailing line via endInput', () => {
+    const events: Array<{ sessionId: string | null; usage: unknown }> = [];
+    const collector = new QwenStructuredResultCollector((event) => events.push({ ...event }));
+    collector.push('{"type":"assistant","content":"x"}\n');
+    expect(collector.hasResultEvent()).toBe(false);
+    collector.push(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: 'session-3', usage: { total_tokens: 1 }, result: { ok: true } }));
+    collector.endInput();
+    expect(collector.hasResultEvent()).toBe(true);
+    expect(events).toEqual([{ sessionId: 'session-3', usage: { total_tokens: 1 } }]);
+    expect(collector.finish()).toEqual({ ok: true });
+  });
+});

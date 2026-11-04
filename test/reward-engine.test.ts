@@ -3,6 +3,8 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
 import type { GateResult, TaskRecord } from '../src/core/types.js';
+import { UsageBudgetActiveError } from '../src/core/usage-ledger.js';
+import { QuotaHoldActiveError } from '../src/qwen/quota-hold.js';
 import { UniversalRewardEngine, type EvaluatorResult, type RewardContext, type RewardEvaluator } from '../src/rewards/engine.js';
 import { ExecutionEvaluator } from '../src/rewards/evaluators.js';
 import { GateRunner } from '../src/rewards/gates.js';
@@ -12,6 +14,16 @@ class PassingEvaluator implements RewardEvaluator {
   constructor(readonly modality: 'rubric' | 'agentic') {}
   async evaluate(): Promise<EvaluatorResult> {
     return { score: 1, confidence: 1, reason: 'verified', evidence: [] };
+  }
+}
+
+class ThrowingEvaluator implements RewardEvaluator {
+  constructor(
+    readonly modality: 'rubric' | 'agentic',
+    private readonly error: Error,
+  ) {}
+  async evaluate(): Promise<EvaluatorResult> {
+    throw this.error;
   }
 }
 
@@ -59,6 +71,37 @@ describe('universal runtime rewards', () => {
     await expect(
       engine.evaluate({ ...context(config, root, [gate(true)]), signal: controller.signal }),
     ).rejects.toThrow('worker shutdown');
+  });
+
+  it.each([
+    ['QuotaHoldActiveError', () => new QuotaHoldActiveError(null)],
+    ['UsageBudgetActiveError', () => new UsageBudgetActiveError({ blocked: true, reason: 'limit-reached', observedTotalTokens: 10, maxObservedTokens: 5 })],
+  ])('rethrows %s from an evaluator unchanged instead of failing closed', async (_name, makeError) => {
+    const root = makeTmp('reward-control-signal');
+    const config = defaultProjectConfig(root, 'fixture', 'owner/repo');
+    const error = makeError();
+    const engine = new UniversalRewardEngine([
+      new ExecutionEvaluator(),
+      new ThrowingEvaluator('rubric', error),
+      new PassingEvaluator('agentic'),
+    ]);
+    await expect(engine.evaluate(context(config, root, [gate(true)]))).rejects.toBe(error);
+  });
+
+  it('converts an ordinary evaluator error into a failed scorecard', async () => {
+    const root = makeTmp('reward-evaluator-error');
+    const config = defaultProjectConfig(root, 'fixture', 'owner/repo');
+    const engine = new UniversalRewardEngine([
+      new ExecutionEvaluator(),
+      new ThrowingEvaluator('rubric', new Error('provider exploded')),
+      new PassingEvaluator('agentic'),
+    ]);
+    const scorecard = await engine.evaluate(context(config, root, [gate(true)]));
+    expect(scorecard.passed).toBe(false);
+    expect(scorecard.blockingReasons.some((reason) => reason.includes('evaluator failed'))).toBe(true);
+    const rubric = scorecard.criteria.find((criterion) => criterion.modality === 'rubric');
+    expect(rubric?.score).toBe(0);
+    expect(rubric?.reason).toContain('Evaluator failed closed: provider exploded');
   });
 
   it('fails the built-in security gate on a changed credential', async () => {

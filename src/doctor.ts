@@ -3,6 +3,8 @@ import path from 'node:path';
 import type { ProjectConfig } from './core/types.js';
 import { PROJECT_CONFIG_PATH } from './core/config.js';
 import { redactText } from './core/ledger.js';
+import { projectIdFor, projectStateDir } from './core/state-paths.js';
+import { ObservedTokenBudget, UsageLedger } from './core/usage-ledger.js';
 import { QwenApiClient } from './qwen/qwen-api.js';
 import { qwenCredentialCompatibilityProblem, resolveQwenCredential } from './qwen/credential-resolver.js';
 import {
@@ -236,12 +238,18 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
   }
 
   if (options.live && credential) {
+    // The live check is a real metered Qwen call: gate it on the project
+    // usage budget and count its observed usage in the project ledger,
+    // closing the ledger on success and failure paths.
+    const usageLedger = new UsageLedger(projectIdFor(config), projectStateDir(config));
     try {
       const api = new QwenApiClient({
         model: config.qwen.model,
         apiKey: credential.apiKey,
         credentialEnvKey: config.qwen.credentialEnvKey,
         baseUrl: config.qwen.baseUrl,
+        usageLedger,
+        usageBudget: new ObservedTokenBudget(config.configVersion === 1 ? null : config.usage?.maxObservedTokens ?? null, usageLedger),
       });
       const result = await api.completeJson<{ ok: boolean }>({
         system: 'Return JSON only.',
@@ -252,6 +260,8 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
       checks.push(check('qwen-live', result.value.ok === true ? 'pass' : 'fail', result.value.ok === true ? 'Live Qwen3.8-Max call passed' : 'Live Qwen response failed validation'));
     } catch (error) {
       checks.push(check('qwen-live', 'fail', 'Live Qwen3.8-Max call failed', error instanceof Error ? error.message : String(error)));
+    } finally {
+      usageLedger.close();
     }
   }
 

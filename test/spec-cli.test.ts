@@ -20,7 +20,12 @@ describe('pre-setup specification CLI', () => {
     root = mkdtempSync(path.join(os.tmpdir(), 'fern-spec-cli-project-'));
     state = mkdtempSync(path.join(os.tmpdir(), 'fern-spec-cli-state-'));
     vi.stubEnv('QWEN_HARNESS_STATE_DIR', state);
-    mock.config.mockReturnValue({ qwen: { model: 'qwen3.8-max', baseUrl: 'https://example.com/v1' } });
+    mock.config.mockImplementation(() => ({
+      configVersion: 2,
+      project: { name: 'spec-cli', root, githubRepo: '' },
+      qwen: { model: 'qwen3.8-max', baseUrl: 'https://example.com/v1' },
+      usage: { maxObservedTokens: null },
+    }));
     mock.complete.mockResolvedValue({ value: {
       title: 'Test product', objective: 'Deliver memory', users: ['Developers'], requirements: [{ id: 'R1', description: 'Memory', acceptanceCriteria: ['A stored skill can be retrieved'], basis: 'source', rationale: 'User input', evidence: [{ ref: 'idea', quote: 'Build an agent memory engine' }] }], assumptions: [], decisions: [], nonGoals: [], validation: ['Run retrieval end to end'], unprovenClaims: [],
     } });

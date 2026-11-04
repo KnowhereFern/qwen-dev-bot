@@ -4,6 +4,7 @@ import { CommunityCollector } from './community/collector.js';
 import type { ProjectConfig } from './core/types.js';
 import { projectIdFor, projectStateDir } from './core/state-paths.js';
 import { PersistentTaskStore } from './core/persistent-store.js';
+import { ObservedTokenBudget, UsageLedger } from './core/usage-ledger.js';
 import { GitWorkspace } from './git/git-workspace.js';
 import { OctokitControlPlane, resolveGitHubToken, type GitHubControl } from './github/control-plane.js';
 import { IssueNormalizer } from './intake/normalizer.js';
@@ -11,6 +12,8 @@ import { Logger } from './logger.js';
 import { QwenApiClient } from './qwen/qwen-api.js';
 import { assertQwenCredentialCompatibility, resolveQwenCredential } from './qwen/credential-resolver.js';
 import { QwenCodeExecutor } from './qwen/qwen-code-executor.js';
+import { ProviderQuotaHold } from './qwen/quota-hold.js';
+import { harnessStateRoot } from './core/state-paths.js';
 import { PortfolioPlanner } from './portfolio/planner.js';
 import { RepositoryAssessor } from './program/repository-assessor.js';
 import { ProgramController } from './program/controller.js';
@@ -42,7 +45,34 @@ export async function createProductionHarness(
   const projectId = projectIdFor(config);
   const stateDir = projectStateDir(config);
   const store = new PersistentTaskStore(projectId, stateDir);
+  // One durable cross-project quota circuit breaker per provider route,
+  // stored at the harness state root and shared by the direct API client,
+  // the Qwen Code executor, and the supervisor.
+  let quotaHold: ProviderQuotaHold;
   try {
+    quotaHold = new ProviderQuotaHold(harnessStateRoot());
+  } catch (error) {
+    store.close();
+    throw error;
+  }
+  // One durable project-local usage ledger counting observed Qwen usage;
+  // closed on every construction, success, and failure path below.
+  let usageLedger: UsageLedger;
+  try {
+    usageLedger = new UsageLedger(projectId, stateDir);
+  } catch (error) {
+    quotaHold.close();
+    store.close();
+    throw error;
+  }
+  try {
+    // Opt-in cumulative observed-token budget over the project ledger.
+    // A null limit (the default, and always for v1 configs) keeps it off;
+    // the budget stays distinct from the provider quota hold above.
+    const usageBudget = new ObservedTokenBudget(
+      config.configVersion === 1 ? null : config.usage?.maxObservedTokens ?? null,
+      usageLedger,
+    );
     const github =
       options.github ??
       new OctokitControlPlane({
@@ -58,6 +88,9 @@ export async function createProductionHarness(
         baseUrl: config.qwen.baseUrl,
         credentialEnvKey: config.qwen.credentialEnvKey,
         apiKey: credential?.apiKey,
+        quotaHold,
+        usageLedger,
+        usageBudget,
       });
     const logger = options.logger ?? new Logger();
     const git = new GitWorkspace(config.project.root, stateDir, config);
@@ -65,7 +98,7 @@ export async function createProductionHarness(
     const rewards = new UniversalRewardEngine([
       new ExecutionEvaluator(),
       new QwenRubricEvaluator(qwenApi, credential),
-      new QwenAgenticEvaluator(credential),
+      new QwenAgenticEvaluator(credential, quotaHold, usageLedger, usageBudget),
       new QwenVisualEvaluator(qwenApi),
     ]);
     const supervisor = new HarnessSupervisor(
@@ -73,13 +106,15 @@ export async function createProductionHarness(
       store,
       github,
       git,
-      new QwenCodeExecutor(config, credential),
+      new QwenCodeExecutor(config, credential, quotaHold, usageLedger, usageBudget),
       new IssueNormalizer(config, qwenApi),
       new GateRunner(),
       rewards,
       logger,
       options.workerId ?? `${os.hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`,
       new CommunityCollector(config, store, github, qwenApi),
+      quotaHold,
+      usageBudget,
     );
     const planner = new PortfolioPlanner(config, qwenApi);
     const program = new ProgramController(
@@ -93,8 +128,10 @@ export async function createProductionHarness(
       options.logger,
     );
     const selfHosting = new ControllerReleaseManager(config, store);
-    return { supervisor, program, selfHosting, store, github, close: () => store.close() };
+    return { supervisor, program, selfHosting, store, github, close: () => { usageLedger.close(); quotaHold.close(); store.close(); } };
   } catch (error) {
+    usageLedger.close();
+    quotaHold.close();
     store.close();
     throw error;
   }

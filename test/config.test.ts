@@ -1,7 +1,7 @@
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { defaultProjectConfig, discoverGates, validateProjectConfig } from '../src/core/config.js';
+import { defaultProjectConfig, discoverGates, loadProjectConfig, validateProjectConfig } from '../src/core/config.js';
 import { makeTmp } from './helpers.js';
 
 describe('project configuration invariants', () => {
@@ -40,6 +40,34 @@ describe('project configuration invariants', () => {
     config.configVersion = 1;
     config.program.enabled = false;
     expect(validateProjectConfig(config)).toBe(config);
+  });
+
+  it('keeps the observed-token budget off by default and accepts only a positive safe integer', () => {
+    const config = defaultProjectConfig(makeTmp('config-usage'), 'fixture', 'owner/fixture');
+    expect(config.usage).toEqual({ maxObservedTokens: null });
+    expect(validateProjectConfig(config)).toBe(config);
+    config.usage = { maxObservedTokens: 5_000 };
+    expect(validateProjectConfig(config)).toBe(config);
+    for (const invalid of [0, -1, 1.5, Number.NaN, '1000']) {
+      config.usage = { maxObservedTokens: invalid as number };
+      expect(() => validateProjectConfig(config)).toThrow('usage.maxObservedTokens');
+    }
+  });
+
+  it('keeps the observed-token budget off for v1 configs even when the field is supplied', () => {
+    const root = makeTmp('config-usage-v1');
+    const base = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    const v1File = path.join(root, 'project.yml');
+    writeFileSync(v1File, JSON.stringify({ ...base, configVersion: 1, usage: { maxObservedTokens: 123_456 } }));
+    const v1 = loadProjectConfig(v1File);
+    expect(v1.configVersion).toBe(1);
+    expect(v1.usage).toEqual({ maxObservedTokens: null });
+    // The same supplied field on a v2 config stays active.
+    const v2File = path.join(root, 'project-v2.yml');
+    writeFileSync(v2File, JSON.stringify({ ...base, usage: { maxObservedTokens: 123_456 } }));
+    const v2 = loadProjectConfig(v2File);
+    expect(v2.configVersion).toBe(2);
+    expect(v2.usage).toEqual({ maxObservedTokens: 123_456 });
   });
 
   it('keeps scorecard review-finding ingestion opt-in and off by default', () => {

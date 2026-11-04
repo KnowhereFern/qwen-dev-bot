@@ -8,7 +8,9 @@ import type {
   RewardScorecard,
   TaskRecord,
 } from '../core/types.js';
+import { UsageBudgetActiveError } from '../core/usage-ledger.js';
 import { redactForLedger, redactText } from '../core/ledger.js';
+import { QuotaHoldActiveError } from '../qwen/quota-hold.js';
 
 export interface RewardContext {
   config: ProjectConfig;
@@ -62,6 +64,7 @@ export class UniversalRewardEngine {
         try {
           result = await evaluator.evaluate(criterion, context);
         } catch (error) {
+          if (error instanceof QuotaHoldActiveError || error instanceof UsageBudgetActiveError) throw error;
           throwIfAborted(context.signal);
           result = {
             score: 0,
