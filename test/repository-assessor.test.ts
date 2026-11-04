@@ -279,6 +279,55 @@ describe('RepositoryAssessor', () => {
     expect(snapshot.excerpts.some((entry) => entry.path === 'server/routes/verified.ts')).toBe(true);
   });
 
+  it('puts executable evidence ahead of a large documentation set', async () => {
+    const root = gitRepo();
+    mkdirSync(path.join(root, 'docs'), { recursive: true });
+    mkdirSync(path.join(root, 'src'), { recursive: true });
+    mkdirSync(path.join(root, 'tests'), { recursive: true });
+    for (let index = 0; index < 20; index += 1) {
+      writeFileSync(path.join(root, 'docs', `guide-${index}.md`), 'documentation\n'.repeat(2_000));
+    }
+    writeFileSync(path.join(root, 'src', 'phenotype-store.ts'), 'export const admission = true;\n');
+    writeFileSync(path.join(root, 'tests', 'phenotype-store.test.ts'), 'test("admission", () => {});\n');
+    execFileSync('git', ['add', '.'], { cwd: root });
+    execFileSync('git', ['commit', '-qm', 'add competing evidence'], { cwd: root });
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.maxAssessmentBytes = 80_000;
+
+    const snapshot = await collectRepositorySnapshot(config);
+    const source = snapshot.excerpts.findIndex((entry) => entry.path === 'src/phenotype-store.ts');
+    const test = snapshot.excerpts.findIndex((entry) => entry.path === 'tests/phenotype-store.test.ts');
+    const firstDoc = snapshot.excerpts.findIndex((entry) => entry.path.startsWith('docs/'));
+    expect(source).toBeGreaterThanOrEqual(0);
+    expect(test).toBeGreaterThanOrEqual(0);
+    expect(firstDoc).toBeGreaterThan(source);
+    expect(firstDoc).toBeGreaterThan(test);
+  });
+
+  it('shows the tail of a focused exact-commit source file without leaking tracked secrets', async () => {
+    const root = gitRepo();
+    mkdirSync(path.join(root, 'src'), { recursive: true });
+    writeFileSync(path.join(root, 'src', 'phenotype-store.ts'),
+      `export const beginning = true;\n${'// 🔋 filler\n'.repeat(8_000)}export function setTokenBudget() { return true; }\n`);
+    writeFileSync(path.join(root, '.env'), 'PRIVATE_VALUE=do-not-show\n');
+    execFileSync('git', ['add', '.'], { cwd: root });
+    execFileSync('git', ['commit', '-qm', 'add focused source'], { cwd: root });
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+    writeFileSync(path.join(root, 'src', 'phenotype-store.ts'), 'uncommitted and wrong\n');
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.maxAssessmentBytes = 70_000;
+
+    const snapshot = await collectRepositorySnapshot(config, undefined, sha, ['Phenotype Store token budget']);
+    const excerpt = snapshot.excerpts.find((entry) => entry.path === 'src/phenotype-store.ts')?.content;
+    expect(excerpt).toContain('export const beginning = true');
+    expect(excerpt).toContain('middle of focused file omitted');
+    expect(excerpt).toContain('setTokenBudget()');
+    expect(excerpt).not.toContain('uncommitted and wrong');
+    expect(snapshot.files).not.toContain('.env');
+    expect(snapshot.excerpts.reduce((total, entry) => total + Buffer.byteLength(entry.content), 0))
+      .toBeLessThanOrEqual(config.program.maxAssessmentBytes);
+  });
+
   it('rejects invented deployment evidence and stale git evidence', async () => {
     const root = gitRepo();
     const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
