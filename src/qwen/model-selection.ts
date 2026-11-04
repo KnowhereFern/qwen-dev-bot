@@ -5,6 +5,7 @@ import {
   OPENROUTER_CROUTON_MANDATORY_REASONING_CAPABILITY,
   isOpenRouterCroutonRoute,
 } from './openrouter-route.js';
+import { QWEN_GATE_RUNNER_COMMAND } from './runtime-compat.js';
 
 type Settings = Record<string, unknown>;
 const object = (value: unknown): value is Settings => typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -48,6 +49,8 @@ export function createQwenModelSelection(options: {
   environment?: NodeJS.ProcessEnv;
   home?: string;
   platform?: NodeJS.Platform;
+  /** Opt-in exact gate-command allow for the workflow implementer subagent. */
+  allowGateRunnerCommand?: boolean;
 }): { env: NodeJS.ProcessEnv; cleanup: () => void } {
   if (!options.model.trim() || !/^[A-Z_][A-Z0-9_]*$/.test(options.envKey)) {
     throw new Error('Invalid isolated Qwen model or credential environment key');
@@ -83,8 +86,21 @@ export function createQwenModelSelection(options: {
     model: options.model,
     baseUrl: options.baseUrl,
   });
+  // Qwen merges permissions.allow across settings scopes while deny/ask keep
+  // precedence, so appending the single audited gate runner command only ever
+  // allows that exact command — and only when the implementation execution
+  // opts in; rewards and doctor overlays stay permission-free.
+  const systemPermissions = object(system.permissions) ? system.permissions : {};
+  const gatePermissions = {
+    ...systemPermissions,
+    allow: [
+      ...(Array.isArray(systemPermissions.allow) ? systemPermissions.allow : []),
+      `Shell(${QWEN_GATE_RUNNER_COMMAND})`,
+    ],
+  };
   const overlay = {
     ...system,
+    ...(options.allowGateRunnerCommand ? { permissions: gatePermissions } : {}),
     model: { ...(object(system.model) ? system.model : {}), name: options.model, baseUrl: options.baseUrl },
     security: { ...security, auth: { ...auth, selectedType: 'openai' } },
     modelProviders: { openai: [{ id: options.model, baseUrl: options.baseUrl, envKey: options.envKey,

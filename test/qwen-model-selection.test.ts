@@ -7,6 +7,7 @@ import {
   OPENROUTER_CROUTON_MANDATORY_REASONING_CAPABILITY,
   OPENROUTER_CROUTON_MODEL,
 } from '../src/qwen/openrouter-route.js';
+import { QWEN_GATE_RUNNER_COMMAND } from '../src/qwen/runtime-compat.js';
 import { makeTmp } from './helpers.js';
 
 function fixture() {
@@ -60,6 +61,34 @@ describe('invocation-scoped Qwen model selection', () => {
     const f = fixture();
     writeFileSync(f.systemPath, value);
     expect(() => createQwenModelSelection(f.input)).toThrow('valid JSON object');
+  });
+
+  it('allows only the exact gate runner command when opted in, preserving system permissions', () => {
+    const f = fixture();
+    writeFileSync(f.systemPath, JSON.stringify({
+      permissions: { allow: ['Read(**)'], deny: ['Shell(rm -rf *)'] },
+    }));
+    const selected = createQwenModelSelection({ ...f.input, allowGateRunnerCommand: true });
+    const file = selected.env.QWEN_CODE_SYSTEM_SETTINGS_PATH!;
+    try {
+      const overlay = JSON.parse(readFileSync(file, 'utf8'));
+      expect(overlay.permissions.allow).toEqual(['Read(**)', `Shell(${QWEN_GATE_RUNNER_COMMAND})`]);
+      expect(overlay.permissions.deny).toEqual(['Shell(rm -rf *)']);
+    } finally { selected.cleanup(); }
+  });
+
+  it('does not grant the gate runner command by default', () => {
+    const f = fixture();
+    writeFileSync(f.systemPath, JSON.stringify({
+      permissions: { allow: ['Read(**)'], deny: ['Shell(rm -rf *)'] },
+    }));
+    const selected = createQwenModelSelection(f.input);
+    const file = selected.env.QWEN_CODE_SYSTEM_SETTINGS_PATH!;
+    try {
+      const overlay = JSON.parse(readFileSync(file, 'utf8'));
+      expect(overlay.permissions).toEqual({ allow: ['Read(**)'], deny: ['Shell(rm -rf *)'] });
+      expect(JSON.stringify(overlay)).not.toContain(QWEN_GATE_RUNNER_COMMAND);
+    } finally { selected.cleanup(); }
   });
 
   it.each([

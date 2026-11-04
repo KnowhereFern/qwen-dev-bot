@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.90] - 2026-11-04
+
+- Carry the exact gate runner permission into isolated Qwen subagents without changing persistent user settings or required checks.
+
 ## [1.0.0-rc.89] - 2026-11-04
 
 - Permit the exact audited gate runner command in headless Qwen sessions so implementation can produce its required gate receipt.
