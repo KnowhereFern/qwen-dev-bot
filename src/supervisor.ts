@@ -371,14 +371,17 @@ export class HarnessSupervisor {
       if (recoveryGuidance !== null) feedback.push(recoveryGuidance);
       const removedPaths = await this.applyAuthorizedGitRmPreflight(task, worktree.path);
       if (removedPaths !== null) {
-        // The exact operator-authorized deletion was executed by this
-        // trusted controller before the session: the sandboxed Qwen
-        // implementer receives no git rm shell permission at all (it cannot
-        // write the linked worktree's index under the main repository), only
-        // the knowledge that the files are already gone.
+        // The controller removed only the tracked copies. An ignored untracked
+        // replacement can exist at the same path and must be preserved as data.
         feedback.push(
-          `Operator-authorized tracked-file removal for this exact task only: the controller already removed ${removedPaths.join(', ')} from this worktree before this session. Do not run git rm, and do not restore or recreate those files.`,
+          `Operator-authorized tracked-file removal for this exact task only: the controller removed the tracked copies of ${removedPaths.join(', ')} from Git history. Do not run git rm or restore those tracked files.`,
         );
+        const preserved = (await Promise.all(removedPaths.map(async (file) =>
+          await isIgnoredUntrackedRegularFile(worktree.path, file) ? file : null)))
+          .filter((file): file is string => file !== null);
+        if (preserved.length > 0) {
+          feedback.push(`Ignored untracked files are present at ${preserved.join(', ')}. Preserve them as local data: do not delete, move, or commit them. Repair the test without touching these files.`);
+        }
       }
       const qwenResult = await this.qwen.execute({
         task,
@@ -1792,6 +1795,26 @@ export async function branchHistoryDeletesExactly(worktreePath: string, baseSha:
   return false;
 }
 
+/** A present replacement is data, not part of the authorized tracked deletion. */
+async function isIgnoredUntrackedRegularFile(worktreePath: string, file: string): Promise<boolean> {
+  let parent = worktreePath;
+  for (const segment of file.split('/').slice(0, -1)) {
+    parent = path.join(parent, segment);
+    const ancestor = lstatSync(parent, { throwIfNoEntry: false });
+    if (!ancestor?.isDirectory() || ancestor.isSymbolicLink()) return false;
+  }
+  const metadata = lstatSync(path.join(worktreePath, file), { throwIfNoEntry: false });
+  if (!metadata?.isFile() || metadata.isSymbolicLink()) return false;
+  const indexed = await runProcess({
+    command: 'git', args: ['ls-files', '-z', '--', file], cwd: worktreePath, timeoutMs: 20_000,
+  });
+  if (indexed.exitCode !== 0 || indexed.stdout.length > 0) return false;
+  const ignored = await runProcess({
+    command: 'git', args: ['check-ignore', '--', file], cwd: worktreePath, timeoutMs: 20_000,
+  });
+  return ignored.exitCode === 0 && ignored.stdout.trim() === file;
+}
+
 /**
  * Trusted-controller preflight for the exact operator-approved tracked-file
  * deletion, run before the Qwen implementation session in the task's own
@@ -1840,13 +1863,16 @@ export async function applyAuthorizedGitRmPreflight(
     const statusByPath = new Map(entries.map((entry) => [entry.path, entry.status]));
     const stagedResultIntact = isDeepStrictEqual(applied.payload.paths, grant.paths) &&
       grant.paths.every((file) => statusByPath.get(file) === STAGED_DELETION_STATUS &&
-        !existsSync(path.join(worktreePath, file))) &&
+        lstatSync(path.join(worktreePath, file), { throwIfNoEntry: false }) === undefined) &&
       entries.every((entry) => grant.paths.includes(entry.path) || isOrdinaryTrackedModification(entry.status));
     if (!stagedResultIntact) {
+      const replacementsSafe = await Promise.all(grant.paths.map(async (file) =>
+        lstatSync(path.join(worktreePath, file), { throwIfNoEntry: false }) === undefined ||
+          isIgnoredUntrackedRegularFile(worktreePath, file)));
       const committedSinceBase = isDeepStrictEqual(applied.payload.paths, grant.paths) &&
         await branchHistoryDeletesExactly(worktreePath, task.baseSha, grant.paths) &&
-        grant.paths.every((file) => !existsSync(path.join(worktreePath, file))) &&
-        entries.every((entry) => grant.paths.includes(entry.path) || isOrdinaryTrackedModification(entry.status));
+        replacementsSafe.every(Boolean) &&
+        entries.every((entry) => !grant.paths.includes(entry.path) && isOrdinaryTrackedModification(entry.status));
       if (!committedSinceBase) {
         throw new Error('Operator-authorized tracked-file removal changed after its application event');
       }

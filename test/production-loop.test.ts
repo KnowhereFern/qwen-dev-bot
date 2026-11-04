@@ -797,7 +797,7 @@ describe('production supervisor trace', () => {
     // The sandboxed implementer is never given git rm permission.
     expect('allowGitRmPaths' in input).toBe(false);
     const removal = (input.feedback as string[]).find((item) => item.includes('tracked-file removal')) as string;
-    expect(removal).toContain('controller already removed README.md, check.mjs');
+    expect(removal).toContain('controller removed the tracked copies of README.md, check.mjs');
     expect(removal).toContain('Do not run git rm');
     expect(removal).not.toContain('`git rm -f --');
     // The trusted controller deleted the exact files in the task's worktree.
@@ -886,7 +886,7 @@ describe('production supervisor trace', () => {
     expect(applied[0]?.payload.reconciled).toBe(true);
     expect(applied[0]?.payload.paths).toEqual(['README.md', 'check.mjs']);
     const removal = (execute.mock.calls[0]![0].feedback as string[]).find((item) => item.includes('tracked-file removal')) as string;
-    expect(removal).toContain('controller already removed README.md, check.mjs');
+    expect(removal).toContain('controller removed the tracked copies of README.md, check.mjs');
     expect(store.get(task.id).state).not.toBe('failed');
     store.close();
   }, 30_000);

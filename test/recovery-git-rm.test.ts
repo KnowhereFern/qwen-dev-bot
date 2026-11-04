@@ -1,4 +1,4 @@
-import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -444,6 +444,49 @@ describe('trusted-controller git rm preflight', () => {
     const forked = await runProcess({ command: 'git', args: ['commit-tree', `HEAD^{tree}`, '-m', 'orphan'], cwd: worktree, timeoutMs: 20_000 });
     const untrusted = store.patch(task.id, { baseSha: forked.stdout.trim() });
     await expect(preflight(untrusted)).rejects.toThrow(/changed after its application event/);
+    store.close();
+  }, 60_000);
+
+  it('preserves an ignored untracked file at a path whose tracked copy was already deleted', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-ignored-replacement');
+    authorize(store, task, ['README.md']);
+    await preflight();
+    writeFileSync(path.join(worktree, '.gitignore'), 'README.md\n');
+    await runProcess({ command: 'git', args: ['add', '--', '.gitignore'], cwd: worktree, timeoutMs: 20_000 });
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'apply authorized removal'], cwd: worktree, timeoutMs: 20_000 });
+    const replacement = path.join(worktree, 'README.md');
+    writeFileSync(replacement, 'preserved local data\n');
+    expect((await runProcess({ command: 'git', args: ['ls-files', '-z', '--', 'README.md'], cwd: worktree, timeoutMs: 20_000 })).stdout).toBe('');
+    expect((await runProcess({ command: 'git', args: ['check-ignore', '--', 'README.md'], cwd: worktree, timeoutMs: 20_000 })).exitCode).toBe(0);
+    await expect(preflight()).resolves.toEqual(['README.md']);
+    expect(readFileSync(replacement, 'utf8')).toBe('preserved local data\n');
+    expect(appliedEvents(store)).toHaveLength(1);
+    await runProcess({ command: 'git', args: ['add', '-f', '--', 'README.md'], cwd: worktree, timeoutMs: 20_000 });
+    await expect(preflight()).rejects.toThrow(/changed after its application event/);
+    expect(readFileSync(replacement, 'utf8')).toBe('preserved local data\n');
+    store.close();
+  }, 60_000);
+
+  it('rejects a symlink at a path whose tracked copy was deleted', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-symlink-replacement');
+    authorize(store, task, ['README.md']);
+    await preflight();
+    writeFileSync(path.join(worktree, '.gitignore'), 'README.md\n');
+    await runProcess({ command: 'git', args: ['add', '--', '.gitignore'], cwd: worktree, timeoutMs: 20_000 });
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'apply authorized removal'], cwd: worktree, timeoutMs: 20_000 });
+    symlinkSync('check.mjs', path.join(worktree, 'README.md'));
+    await expect(preflight()).rejects.toThrow(/changed after its application event/);
+    store.close();
+  }, 60_000);
+
+  it('rejects a visible untracked file at a path whose tracked copy was deleted', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-visible-replacement');
+    authorize(store, task, ['README.md']);
+    await preflight();
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'apply authorized removal'], cwd: worktree, timeoutMs: 20_000 });
+    writeFileSync(path.join(worktree, 'README.md'), 'untracked user file\n');
+    await expect(preflight()).rejects.toThrow(/changed after its application event/);
+    expect(readFileSync(path.join(worktree, 'README.md'), 'utf8')).toBe('untracked user file\n');
     store.close();
   }, 60_000);
 
