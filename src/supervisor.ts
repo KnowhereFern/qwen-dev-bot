@@ -188,6 +188,35 @@ export class HarnessSupervisor {
           continue;
         }
         const existing = this.store.findByIssue(issue.number);
+        if (portfolioLink && this.shouldRetireSatisfiedStory(portfolioLink.plan, portfolioLink.story, existing)) {
+          const { plan, story } = portfolioLink;
+          const key = `portfolio:story-satisfied:${plan.id}:${story.key}:${issue.number}`;
+          this.store.recordEvent('portfolio.story_satisfied', existing?.id ?? null, {
+            planId: plan.id, storyKey: story.key, issueNumber: issue.number, coverageIds: story.coverageIds,
+          }, key);
+          if (!story.supersededAt) {
+            const now = Date.now();
+            this.store.savePortfolioPlan({
+              ...plan,
+              stories: plan.stories.map((candidate) => candidate.key === story.key ? { ...candidate, supersededAt: now } : candidate),
+              updatedAt: now,
+            });
+          }
+          if (existing && ['intake', 'normalized', 'ready'].includes(existing.state)) {
+            this.store.transition(existing.id, 'cancelled');
+          }
+          try {
+            await this.github.updateIssue(issue.number, { state: 'closed' });
+            this.store.recordEvent('portfolio.story_satisfied_closed', existing?.id ?? null, {
+              planId: plan.id, storyKey: story.key, issueNumber: issue.number,
+            }, `${key}:closed`);
+          } catch (error) {
+            this.logger.warn('satisfied portfolio issue closure deferred', {
+              issueNumber: issue.number, error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          continue;
+        }
         const lineage = existing ? null : repairLineage(issue.body, this.store);
         const task = this.store.upsert({
           issueNumber: issue.number,
@@ -259,6 +288,24 @@ export class HarnessSupervisor {
       ingested += 1;
     }
     return ingested;
+  }
+
+  private shouldRetireSatisfiedStory(
+    plan: PortfolioPlanRecord,
+    story: PortfolioStoryRecord,
+    task: TaskRecord | null,
+  ): boolean {
+    if (!plan.approvedAt || !['active', 'blocked'].includes(plan.status)) return false;
+    if (!story.coverageIds?.length) return false;
+    const unstarted = !task ||
+      (['intake', 'normalized', 'ready', 'cancelled'].includes(task.state) && task.attempts === 0 &&
+        task.leaseOwner === null && task.leaseExpiresAt === null && task.baseSha === null &&
+        task.branch === null && task.worktreePath === null && task.commitSha === null &&
+        task.qwenSessionId === null && task.qwenWorkflowRunId === null && task.prNumber === null &&
+        task.prUrl === null && task.mergeSha === null && task.rewardRunId === null);
+    if (!unstarted) return false;
+    return Boolean(story.supersededAt) || story.coverageIds.every((id) =>
+      plan.coverage?.find((entry) => entry.id === id)?.status === 'implemented');
   }
 
   private requiresInitialProgramApproval(): boolean {

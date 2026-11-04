@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.102] - 2026-11-04
+
+- Retire stale, unstarted portfolio issues when current approved assessment verifies their requirements are already implemented; retry issue closure after provider failures.
+
 ## [1.0.0-rc.101] - 2026-11-04
 
 - Keep reassessment details inside their existing approved coverage requirements, so a missed acceptance item becomes an actionable repair without weakening task failure lineage.
