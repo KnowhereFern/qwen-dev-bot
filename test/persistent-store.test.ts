@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { PersistentTaskStore, failureFingerprint } from '../src/core/persistent-store.js';
-import type { TaskSpec } from '../src/core/types.js';
+import type { PortfolioPlan, TaskSpec } from '../src/core/types.js';
 import { makeTmp } from './helpers.js';
 
 function taskSpec(dependencies: number[]): TaskSpec {
@@ -356,6 +356,48 @@ describe('PersistentTaskStore', () => {
     expect(store.claimNext('worker', 1_000, 100)?.issueNumber).toBe(102);
     store.close();
   });
+
+  it.each(['verified', 'unapproved', 'unverified', 'stale-evidence', 'file-only', 'started', 'unlinked'] as const)(
+    'accepts a retired dependency only with approved exact-commit coverage: %s', (scenario) => {
+      const directory = makeTmp(`covered-dependency-${scenario}`);
+      let store = new PersistentTaskStore(`covered-dependency-${scenario}`, directory);
+      const priorSpec = taskSpec([]);
+      priorSpec.source.url = 'https://github.test/issues/437';
+      const prior = store.upsert({ issueNumber: 438, title: 'old work', state: 'cancelled', spec: priorSpec });
+      if (scenario === 'started') store.patch(prior.id, { attempts: 1, commitSha: 'previous-attempt' });
+      store.upsert({ issueNumber: 442, title: 'current work', state: 'ready', spec: taskSpec([437]) });
+      const story = {
+        title: 'Work', goal: 'Work', acceptanceCriteria: ['Verified'], constraints: [], requiredGateIds: [],
+        rewardCriterionIds: [], risk: 'low' as const, dependsOn: [], rollback: 'Revert',
+        technologyDecisionIds: [], deploymentDecisionIds: [], sourceIssueUrl: 'https://github.test/issues/437',
+        normalizedIssueUrl: 'https://github.test/issues/438',
+      };
+      const plan: PortfolioPlan = {
+        id: 'approved-plan', projectId: store.projectId, sourcePath: 'OBJECTIVE.md', contentHash: 'objective',
+        title: 'Objective', objective: 'Deliver product', constraints: [], definitionOfDone: ['Verified'],
+        technologyDecisions: [], deploymentDecisions: [], status: scenario === 'unapproved' ? 'draft' : 'active',
+        epicIssueNumber: null, epicIssueUrl: null, createdAt: 1, updatedAt: 1,
+        approvedAt: scenario === 'unapproved' ? null : 1, repositorySha: 'a'.repeat(40),
+        stories: [
+          { ...story, key: 'R30_S1', sourceIssueNumber: 437, normalizedIssueNumber: 438,
+            coverageIds: ['CULL'], supersededAt: 2 },
+          { ...story, key: 'R31_S1', sourceIssueNumber: 439, normalizedIssueNumber: 442,
+            dependsOn: scenario === 'unlinked' ? [] : ['R30_S1'], coverageIds: ['NEXT'], supersededAt: null },
+        ],
+        coverage: [{ id: 'CULL', requirement: 'Cull safely',
+          status: scenario === 'unverified' ? 'unverified' : 'implemented',
+          requiredAction: scenario === 'unverified' ? 'verify' : 'none', rationale: 'Verified',
+          evidence: [{ kind: scenario === 'file-only' ? 'file' : 'test', locator: 'tests/cull.test.ts', summary: 'Passed',
+            commitSha: scenario === 'stale-evidence' ? 'b'.repeat(40) : 'a'.repeat(40) }],
+        }],
+      };
+      store.savePortfolioPlan(plan);
+      store.close();
+      store = new PersistentTaskStore(`covered-dependency-${scenario}`, directory);
+      expect(store.claimNext('worker', 1_000, 100)?.issueNumber ?? null).toBe(scenario === 'verified' ? 442 : null);
+      store.close();
+    },
+  );
 
   it('allows post-merge reconciliation after a PR is merged before CI polling completes', () => {
     for (const state of ['pr_open', 'waiting_ci'] as const) {

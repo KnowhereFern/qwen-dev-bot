@@ -581,8 +581,32 @@ export class PersistentTaskStore {
         (candidate) =>
           candidate.state === 'done' &&
           (candidate.issueNumber === issueNumber || sourceIssueNumber(candidate.spec?.source.url) === issueNumber),
-      ),
+      ) || this.dependencySatisfiedByApprovedCoverage(task, issueNumber, candidates),
     );
+  }
+
+  private dependencySatisfiedByApprovedCoverage(task: TaskRecord, issueNumber: number, candidates: TaskRecord[]): boolean {
+    return this.listPortfolioPlans().some((plan) => {
+      if (!plan.approvedAt || !['active', 'blocked'].includes(plan.status) || !plan.repositorySha) return false;
+      const dependent = plan.stories.find((story) => story.normalizedIssueNumber === task.issueNumber && !story.supersededAt);
+      const dependency = plan.stories.find((story) =>
+        story.sourceIssueNumber === issueNumber || story.normalizedIssueNumber === issueNumber);
+      if (!dependent || !dependency?.supersededAt || !dependent.dependsOn.includes(dependency.key) ||
+          !dependency.coverageIds?.length) return false;
+      const covered = dependency.coverageIds.every((id) => {
+        const entry = plan.coverage?.find((item) => item.id === id);
+        return entry?.status === 'implemented' && entry.requiredAction === 'none' &&
+          entry.evidence.some((evidence) =>
+            ['test', 'deployment'].includes(evidence.kind) && evidence.commitSha === plan.repositorySha);
+      });
+      if (!covered) return false;
+      const prior = candidates.find((candidate) => candidate.issueNumber === dependency.normalizedIssueNumber);
+      return !prior || (prior.state === 'cancelled' && prior.attempts === 0 &&
+        prior.leaseOwner === null && prior.leaseExpiresAt === null && prior.baseSha === null &&
+        prior.branch === null && prior.worktreePath === null && prior.commitSha === null &&
+        prior.qwenSessionId === null && prior.qwenWorkflowRunId === null && prior.prNumber === null &&
+        prior.prUrl === null && prior.mergeSha === null && prior.rewardRunId === null);
+    });
   }
 
   heartbeat(id: string, workerId: string, leaseMs: number, now = Date.now()): TaskRecord {
