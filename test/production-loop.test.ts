@@ -749,6 +749,74 @@ describe('production supervisor trace', () => {
     store.close();
   }, 30_000);
 
+  it('passes the exact authorized git rm permission and command for the same task and frozen contract', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('recovery-git-rm-state');
+    const store = new PersistentTaskStore('recovery-git-rm-project', state);
+    const executor = new MockQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-recovery-git-rm',
+    );
+
+    await supervisor.syncIntake();
+    const task = store.findByIssue(2) as NonNullable<ReturnType<typeof store.findByIssue>>;
+    const unrelated = store.upsert({ issueNumber: 3, title: 'Unrelated finished task', state: 'done' });
+    const contractHash = createHash('sha256').update(JSON.stringify(task.spec)).digest('hex');
+    // A removal authorization for another task must never leak into this one.
+    store.recordEvent('task.recovery_authorized', unrelated.id, {
+      reason: 'Unrelated removal', contractHash, allowGitRm: ['README.md'],
+    });
+    store.recordEvent('task.recovery_authorized', task.id, {
+      reason: 'Remove stale tracked artifacts', contractHash, allowGitRm: ['README.md', 'check.mjs'],
+    });
+
+    await supervisor.tick();
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    const input = execute.mock.calls[0]![0];
+    expect(input.allowGitRmPaths).toEqual(['README.md', 'check.mjs']);
+    const removal = (input.feedback as string[]).find((item) => item.includes('git rm -f --')) as string;
+    expect(removal).toContain('`git rm -f -- README.md check.mjs`');
+    expect(removal).toContain('this exact task only');
+    store.close();
+  }, 30_000);
+
+  it('grants no git rm permission for a stale contract or paths no longer valid in the worktree', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('recovery-git-rm-stale-state');
+    const store = new PersistentTaskStore('recovery-git-rm-stale-project', state);
+    const executor = new MockQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-recovery-git-rm-stale',
+    );
+
+    await supervisor.syncIntake();
+    const task = store.findByIssue(2) as NonNullable<ReturnType<typeof store.findByIssue>>;
+    const contractHash = createHash('sha256').update(JSON.stringify(task.spec)).digest('hex');
+    // Stale contract: no permission even though the paths are valid.
+    store.recordEvent('task.recovery_authorized', task.id, {
+      reason: 'Stale removal', contractHash: 'deadbeef', allowGitRm: ['README.md'],
+    });
+
+    await supervisor.tick();
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls[0]![0].allowGitRmPaths).toBeUndefined();
+    expect((execute.mock.calls[0]![0].feedback as string[]).join('\n')).not.toContain('git rm -f --');
+    store.close();
+  }, 30_000);
+
   it('applies a durable cross-project quota hold from a confirmed Qwen Code quota result', async () => {
     const { repo } = await createGitFixture();
     const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');

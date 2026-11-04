@@ -6,7 +6,7 @@ import { projectIdFor, projectStateDir } from './core/state-paths.js';
 import type { ControllerRelease, DeploymentRecord, EvolutionSignal, PortfolioPlan, ProjectConfig, QwenBillingPlan } from './core/types.js';
 import { budgetStatus, ObservedTokenBudget, UsageLedger } from './core/usage-ledger.js';
 import { redactText } from './core/ledger.js';
-import { PersistentTaskStore } from './core/persistent-store.js';
+import { PersistentTaskStore, validateAuthorizedGitRmPaths } from './core/persistent-store.js';
 import { runDaemon } from './daemon.js';
 import { formatDoctor, runDoctor } from './doctor.js';
 import { createProductionHarness } from './factory.js';
@@ -34,7 +34,7 @@ import { readIntakeSource } from './intake/source.js';
 import { intakeConnection } from './intake/connection.js';
 import { draftSpecification, loadSpecification, renderSpecification, specificationDocument } from './intake/specification.js';
 
-const VERSION = '1.0.0-rc.94';
+const VERSION = '1.0.0-rc.95';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? (process.stdin.isTTY && process.stdout.isTTY ? 'interactive' : 'help');
@@ -250,19 +250,53 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const authorizationId = valueOf(args, '--authorization');
       const authorizedBy = valueOf(args, '--authorized-by');
       const reason = valueOf(args, '--reason');
+      const allowGitRm = valuesOf(args, '--allow-git-rm');
       if (!hasFlag(args, '--yes') || !issue || !additionalAttempts || !authorizationId || !authorizedBy || !reason ||
           [authorizationId, authorizedBy, reason].some((value) => !value.trim() || value.startsWith('--'))) {
-        throw new Error('recovery-authorize requires --yes --issue N --additional-attempts N --authorization ID --authorized-by OPERATOR --reason TEXT');
+        throw new Error('recovery-authorize requires --yes --issue N --additional-attempts N --authorization ID --authorized-by OPERATOR --reason TEXT [--allow-git-rm PATH]...');
       }
       const config = loadProjectConfig(root);
       const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
       try {
         const task = store.findByIssue(issue);
         if (!task) throw new Error(`No task exists for issue #${issue}`);
-        const recovered = store.authorizeRecovery(task.id, { authorizationId, additionalAttempts, authorizedBy, reason });
+        // Worktree validation happens before any state change: each authorized
+        // path must be a tracked regular file in the failed task worktree.
+        const validatedGitRm = allowGitRm.length > 0
+          ? await validateAuthorizedGitRmPaths(task.worktreePath ?? '', allowGitRm, config.protectedPaths)
+          : [];
+        const recovered = store.authorizeRecovery(task.id, { authorizationId, additionalAttempts, authorizedBy, reason,
+          ...(validatedGitRm.length > 0 ? { allowGitRm: validatedGitRm } : {}) });
         const budget = store.retryBudget(task.id);
-        if (json) console.log(JSON.stringify({ issue, state: recovered.state, authorizationId, ...budget }, null, 2));
+        if (json) console.log(JSON.stringify({ issue, state: recovered.state, authorizationId,
+          ...(validatedGitRm.length > 0 ? { allowGitRm: validatedGitRm } : {}), ...budget }, null, 2));
         else console.log(`Issue #${issue}: ${recovered.state}; ${budget.failures} historical failures retained, total ceiling ${budget.limit}. Authorization: ${authorizationId}.`);
+        return 0;
+      } finally { store.close(); }
+    }
+    case 'recovery-grant-git-rm': {
+      const issue = integerValue(args, '--issue');
+      const authorizationId = valueOf(args, '--authorization');
+      const authorizedBy = valueOf(args, '--authorized-by');
+      const reason = valueOf(args, '--reason');
+      const allowGitRm = valuesOf(args, '--allow-git-rm');
+      if (!hasFlag(args, '--yes') || !issue || !authorizationId || !authorizedBy || !reason || allowGitRm.length === 0 ||
+          [authorizationId, authorizedBy, reason].some((value) => !value.trim() || value.startsWith('--'))) {
+        throw new Error('recovery-grant-git-rm requires --yes --issue N --authorization ID --authorized-by OPERATOR --reason TEXT --allow-git-rm PATH...');
+      }
+      const config = loadProjectConfig(root);
+      const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      try {
+        const task = store.findByIssue(issue);
+        if (!task) throw new Error(`No task exists for issue #${issue}`);
+        // Worktree validation happens before any state change: each authorized
+        // path must be a tracked regular file in the ready task worktree.
+        const validatedGitRm = await validateAuthorizedGitRmPaths(task.worktreePath ?? '', allowGitRm, config.protectedPaths);
+        const grant = store.grantGitRmPermission(task.id, { authorizationId, authorizedBy, reason, allowGitRm: validatedGitRm });
+        const budget = store.retryBudget(task.id);
+        if (json) console.log(JSON.stringify({ issue, state: task.state, authorizationId, allowGitRm: validatedGitRm,
+          recoveryAuthorizationId: grant.recoveryAuthorizationId, additionalAttempts: 0, ...budget }, null, 2));
+        else console.log(`Issue #${issue}: tracked-file removal granted on the existing ready retry (no attempt added; ${budget.failures}/${budget.limit} failures used) under recovery ${grant.recoveryAuthorizationId}. Authorization: ${authorizationId}. Paths: ${validatedGitRm.join(', ')}.`);
         return 0;
       } finally { store.close(); }
     }
@@ -707,7 +741,7 @@ function openUsageGuard(config: ProjectConfig): { ledger: UsageLedger; budget: O
 }
 
 function firstPositional(args: string[]): string | undefined {
-  const valueOptions = new Set(['--input', '--idea', '--pages', '--spec', '--name', '--repo', '--trusted-author', '--model', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment', '--additional-attempts', '--authorization', '--authorized-by', '--reason']);
+  const valueOptions = new Set(['--input', '--idea', '--pages', '--spec', '--name', '--repo', '--trusted-author', '--model', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment', '--additional-attempts', '--authorization', '--authorized-by', '--reason', '--allow-git-rm']);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] as string;
     if (valueOptions.has(arg)) {
@@ -733,6 +767,20 @@ function toggleFlagValue(args: string[], enabledFlag: string, disabledFlag: stri
 function valueOf(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
+}
+
+/** Every value for a repeatable flag, in order, skipping the flag's own slot. */
+function valuesOf(args: string[], flag: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if ((args[index] as string) === flag) {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+      values.push(value);
+      index += 1;
+    }
+  }
+  return values;
 }
 
 function strictValueOf(args: string[], flag: string): string | undefined {
@@ -821,9 +869,17 @@ Commands:
   uninstall --yes      Remove unchanged installer-owned files
 
 Recovery authorization options (operator-only):
-  --yes --issue N --additional-attempts N --authorization ID --authorized-by OPERATOR --reason TEXT [--json]
+  --yes --issue N --additional-attempts N --authorization ID --authorized-by OPERATOR --reason TEXT [--allow-git-rm PATH]... [--json]
   Adds at most three attempts. Reusing an authorization ID cannot add attempts again.
+  --allow-git-rm may repeat with 1-5 worktree-relative tracked file paths; the
+  recovered attempt may then run exactly \`git rm -f -- <those paths>\`.
   An already-running worker may claim the released task immediately.
+
+  recovery-grant-git-rm --yes --issue N --authorization ID --authorized-by OPERATOR --reason TEXT --allow-git-rm PATH... [--json]
+  Attaches tracked-file removal permission to an existing ready recovered
+  retry without adding an attempt. Requires an unleased ready task with an
+  active recovery authorization, remaining retry budget, and a real worktree;
+  each path is validated against that worktree before anything is stored.
 
 Init options:
   --dry-run --yes --name NAME --repo OWNER/NAME --trusted-author LOGIN --billing-plan PLAN

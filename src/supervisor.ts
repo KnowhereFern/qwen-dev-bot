@@ -6,7 +6,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { CommunityCollector, CommunityScanResult } from './community/collector.js';
 import type { GateResult, HarnessEvent, ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
 import { redactText } from './core/ledger.js';
-import { PersistentTaskStore } from './core/persistent-store.js';
+import { PersistentTaskStore, validateAuthorizedGitRmPaths } from './core/persistent-store.js';
 import { REQUIRED_GITHUB_CHECKS, REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
 import { runLocalGateReverification } from './gates/local-reverify.js';
 import { GitWorkspace, branchFor, isOrdinaryTrackedModification, type TrackedCandidateDigest } from './git/git-workspace.js';
@@ -368,10 +368,19 @@ export class HarnessSupervisor {
       const feedback = task.lastError ? [task.lastError] : [];
       const recoveryGuidance = this.authorizedRecoveryFeedback(task);
       if (recoveryGuidance !== null) feedback.push(recoveryGuidance);
+      const allowGitRmPaths = await this.authorizedRecoveryGitRmPaths(task, worktree.path);
+      if (allowGitRmPaths !== null) {
+        // The exact authorized command is part of the Qwen feedback so the
+        // sole implementer knows the one permitted removal verbatim.
+        feedback.push(
+          `Operator-authorized tracked-file removal for this exact task only: the saved workflow implementer may run exactly \`git rm -f -- ${allowGitRmPaths.join(' ')}\` and nothing else; no wildcard, no other file, and no other git rm form is authorized.`,
+        );
+      }
       const qwenResult = await this.qwen.execute({
         task,
         worktree: worktree.path,
         feedback,
+        ...(allowGitRmPaths !== null ? { allowGitRmPaths } : {}),
         onHeartbeat: heartbeat,
         onSession: (sessionId) => {
           if (this.store.get(task.id).qwenSessionId !== sessionId) {
@@ -525,6 +534,41 @@ export class HarnessSupervisor {
     const reason = redactText(authorization.payload.reason).trim().slice(0, 2_000);
     if (!reason) return null;
     return `Operator-authorized recovery guidance: ${reason}`;
+  }
+
+  /**
+   * Task-scoped tracked-file removal permission from the latest recovery
+   * authorization for this exact task. The persisted contractHash must match
+   * the current frozen task spec, and every persisted path is re-validated
+   * against the current worktree (tracked regular file, no traversal,
+   * metacharacters, symlinks, credential names, or configured protected
+   * paths). Any failure — stale contract, edited worktree, unrelated task —
+   * yields no permission at all, never a narrowed one.
+   */
+  private async authorizedRecoveryGitRmPaths(task: TaskRecord, worktreePath: string): Promise<string[] | null> {
+    const contractHash = sha256(JSON.stringify(task.spec));
+    const recovery = this.store.listEvents('task.recovery_authorized')
+      .filter((event) => event.taskId === task.id)
+      .at(-1) ?? null;
+    // Both permission sources are chronological: standalone
+    // task.git_rm_granted events (valid only while bound to the current
+    // contract and the current active recovery authorization) and the
+    // recovery_authorize inline allowGitRm paths for the current contract.
+    const grant = this.store.listEvents('task.git_rm_granted')
+      .filter((event) => event.taskId === task.id && event.payload.contractHash === contractHash && recovery !== null &&
+        recovery.payload.contractHash === contractHash &&
+        event.payload.recoveryAuthorizationId === recovery.payload.authorizationId)
+      .at(-1);
+    const requested = grant?.payload.allowGitRm ??
+      (recovery !== null && recovery.payload.contractHash === contractHash ? recovery.payload.allowGitRm : undefined);
+    if (!Array.isArray(requested) || requested.length === 0 ||
+        !requested.every((entry): entry is string => typeof entry === 'string')) return null;
+    try {
+      return await validateAuthorizedGitRmPaths(worktreePath, requested, this.config.protectedPaths);
+    } catch {
+      // Stale, unsafe, or no-longer-tracked paths: no extra permission.
+      return null;
+    }
   }
 
   /**
