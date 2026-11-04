@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstatSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
@@ -368,19 +368,21 @@ export class HarnessSupervisor {
       const feedback = task.lastError ? [task.lastError] : [];
       const recoveryGuidance = this.authorizedRecoveryFeedback(task);
       if (recoveryGuidance !== null) feedback.push(recoveryGuidance);
-      const allowGitRmPaths = await this.authorizedRecoveryGitRmPaths(task, worktree.path);
-      if (allowGitRmPaths !== null) {
-        // The exact authorized command is part of the Qwen feedback so the
-        // sole implementer knows the one permitted removal verbatim.
+      const removedPaths = await this.applyAuthorizedGitRmPreflight(task, worktree.path);
+      if (removedPaths !== null) {
+        // The exact operator-authorized deletion was executed by this
+        // trusted controller before the session: the sandboxed Qwen
+        // implementer receives no git rm shell permission at all (it cannot
+        // write the linked worktree's index under the main repository), only
+        // the knowledge that the files are already gone.
         feedback.push(
-          `Operator-authorized tracked-file removal for this exact task only: the saved workflow implementer may run exactly \`git rm -f -- ${allowGitRmPaths.join(' ')}\` and nothing else; no wildcard, no other file, and no other git rm form is authorized.`,
+          `Operator-authorized tracked-file removal for this exact task only: the controller already removed ${removedPaths.join(', ')} from this worktree before this session. Do not run git rm, and do not restore or recreate those files.`,
         );
       }
       const qwenResult = await this.qwen.execute({
         task,
         worktree: worktree.path,
         feedback,
-        ...(allowGitRmPaths !== null ? { allowGitRmPaths } : {}),
         onHeartbeat: heartbeat,
         onSession: (sessionId) => {
           if (this.store.get(task.id).qwenSessionId !== sessionId) {
@@ -537,38 +539,18 @@ export class HarnessSupervisor {
   }
 
   /**
-   * Task-scoped tracked-file removal permission from the latest recovery
-   * authorization for this exact task. The persisted contractHash must match
-   * the current frozen task spec, and every persisted path is re-validated
-   * against the current worktree (tracked regular file, no traversal,
-   * metacharacters, symlinks, credential names, or configured protected
-   * paths). Any failure — stale contract, edited worktree, unrelated task —
-   * yields no permission at all, never a narrowed one.
+   * Deterministic trusted-controller preflight for the operator-authorized
+   * tracked-file deletion, run before the Qwen implementation session. The
+   * sandboxed implementer never receives git rm shell permission (it cannot
+   * write the linked worktree's index under the main repository); the
+   * controller performs the exact audited deletion itself.
    */
-  private async authorizedRecoveryGitRmPaths(task: TaskRecord, worktreePath: string): Promise<string[] | null> {
-    const contractHash = sha256(JSON.stringify(task.spec));
-    const recovery = this.store.listEvents('task.recovery_authorized')
-      .filter((event) => event.taskId === task.id)
-      .at(-1) ?? null;
-    // Both permission sources are chronological: standalone
-    // task.git_rm_granted events (valid only while bound to the current
-    // contract and the current active recovery authorization) and the
-    // recovery_authorize inline allowGitRm paths for the current contract.
-    const grant = this.store.listEvents('task.git_rm_granted')
-      .filter((event) => event.taskId === task.id && event.payload.contractHash === contractHash && recovery !== null &&
-        recovery.payload.contractHash === contractHash &&
-        event.payload.recoveryAuthorizationId === recovery.payload.authorizationId)
-      .at(-1);
-    const requested = grant?.payload.allowGitRm ??
-      (recovery !== null && recovery.payload.contractHash === contractHash ? recovery.payload.allowGitRm : undefined);
-    if (!Array.isArray(requested) || requested.length === 0 ||
-        !requested.every((entry): entry is string => typeof entry === 'string')) return null;
-    try {
-      return await validateAuthorizedGitRmPaths(worktreePath, requested, this.config.protectedPaths);
-    } catch {
-      // Stale, unsafe, or no-longer-tracked paths: no extra permission.
-      return null;
-    }
+  private applyAuthorizedGitRmPreflight(task: TaskRecord, worktreePath: string): Promise<string[] | null> {
+    return applyAuthorizedGitRmPreflight(
+      { store: this.store, git: this.git, protectedPaths: this.config.protectedPaths },
+      task,
+      worktreePath,
+    );
   }
 
   /**
@@ -989,10 +971,23 @@ export class HarnessSupervisor {
     const unsupportedTracked = trackedCandidates.filter((entry) => !isOrdinaryTrackedModification(entry.status));
     if (unsupportedTracked.length > 0) {
       if (reconciling) {
+        // The controller's own git rm preflight only runs after a completed
+        // advance (including the baseSha patch), so audited staged deletions
+        // can never legitimately appear in the reconciling branch; staged
+        // entries here are real drift and fail closed.
         throw new Error(
           `Durable implementation base advance for task ${task.id} found unsupported tracked changes: ${unsupportedTracked.map((entry) => `${entry.path} (${entry.status.trim() || 'index'})`).join(', ')}`,
         );
       }
+      // This path includes the exact audited staged-deletion state a
+      // controller-executed operator-authorized git rm leaves behind on
+      // restart (porcelain 'D ' of the approved paths, recorded in a
+      // task.git_rm_applied event): it must be declined, never rejected, so
+      // the attempt proceeds and the deletions ride into the next candidate
+      // commit (git refuses to fast-forward over a staged index, so the base
+      // advance resumes only after that commit). Acceptance is not broadened:
+      // every unsupported status still declines here, and only the preflight
+      // itself reconciles its own exact staged deletions.
       return null;
     }
     const trackedOverlap = tracked.filter((file) => changed.includes(file));
@@ -1610,6 +1605,149 @@ function renderPullRequestBody(task: TaskRecord, summary: string, scorecard: Rew
     '',
     'Generated by the Qwen autonomous harness. Exact-head GitHub checks remain authoritative.',
   ].join('\n');
+}
+
+/** The exact staged-deletion porcelain v1 status a controller `git rm`
+ * produces: deleted from the index and the worktree ('D '). */
+const STAGED_DELETION_STATUS = 'D ';
+
+/** Idempotency key for the durable controller application event of an
+ * operator-authorized tracked-file removal. */
+export function gitRmAppliedIdempotencyKey(
+  taskId: string,
+  recoveryAuthorizationId: string,
+  paths: string[],
+): string {
+  return `task:git-rm-applied:${taskId}:${recoveryAuthorizationId}:${[...paths].sort().join(' ')}`;
+}
+
+export interface GitRmPreflightDeps {
+  store: Pick<PersistentTaskStore, 'listEvents' | 'recordEvent'>;
+  git: Pick<GitWorkspace, 'trackedCandidates' | 'removeTrackedFiles'>;
+  protectedPaths: string[];
+}
+
+/**
+ * Resolve the operator-authorized tracked-file removal grant for one exact
+ * task: either a standalone task.git_rm_granted event (valid only while
+ * bound to the current frozen contract and the current active recovery
+ * authorization) or the recovery_authorize inline allowGitRm paths for the
+ * current contract. Any mismatch — stale contract, superseded recovery
+ * authorization, unrelated task — yields no grant at all, never a narrowed
+ * one. Performs no worktree validation so an already-applied removal (files
+ * gone) can still be recognized on reentry.
+ */
+export function resolveAuthorizedGitRmGrant(
+  store: Pick<PersistentTaskStore, 'listEvents'>,
+  task: TaskRecord,
+): { recoveryAuthorizationId: string; paths: string[]; grantAuthorizationId: string | null } | null {
+  const contractHash = sha256(JSON.stringify(task.spec));
+  const recovery = store.listEvents('task.recovery_authorized')
+    .filter((event) => event.taskId === task.id)
+    .at(-1) ?? null;
+  if (recovery === null || recovery.payload.contractHash !== contractHash) return null;
+  const grant = store.listEvents('task.git_rm_granted')
+    .filter((event) => event.taskId === task.id && event.payload.contractHash === contractHash &&
+      event.payload.recoveryAuthorizationId === recovery.payload.authorizationId)
+    .at(-1);
+  const requested = grant?.payload.allowGitRm ?? recovery.payload.allowGitRm;
+  if (!Array.isArray(requested) || requested.length === 0 ||
+      !requested.every((entry): entry is string => typeof entry === 'string')) return null;
+  return {
+    recoveryAuthorizationId: String(recovery.payload.authorizationId),
+    paths: [...requested],
+    grantAuthorizationId: typeof grant?.payload.authorizationId === 'string' ? grant.payload.authorizationId : null,
+  };
+}
+
+/**
+ * Trusted-controller preflight for the exact operator-approved tracked-file
+ * deletion, run before the Qwen implementation session in the task's own
+ * worktree. The controller validates the grant (task, frozen contract,
+ * current recovery authorization) and the paths (safe tracked regular files,
+ * no protected paths), then invokes exactly `git rm -f -- <paths>` with argv
+ * (no shell) and persists an idempotent application event.
+ *
+ * Crash between the git rm and the event is reconciled: exactly staged
+ * deletions of the approved paths — with no other staged drift — are
+ * recognized as the controller's own completed work and the event is
+ * recorded. Any other drift fails closed. Reentry with a recorded
+ * application neither requires the deleted files to exist nor reruns the
+ * deletion. Returns the removed paths, or null when no valid grant exists.
+ */
+export async function applyAuthorizedGitRmPreflight(
+  deps: GitRmPreflightDeps,
+  task: TaskRecord,
+  worktreePath: string,
+): Promise<string[] | null> {
+  const grant = resolveAuthorizedGitRmGrant(deps.store, task);
+  if (grant === null) return null;
+  if (typeof task.worktreePath !== 'string' || path.resolve(task.worktreePath) !== path.resolve(worktreePath)) {
+    throw new Error('Operator-authorized tracked-file removal worktree does not match the task');
+  }
+  const contractHash = sha256(JSON.stringify(task.spec));
+  const key = gitRmAppliedIdempotencyKey(task.id, grant.recoveryAuthorizationId, grant.paths);
+  const applied = deps.store.listEvents('task.git_rm_applied')
+    .find((event) => event.taskId === task.id && event.idempotencyKey === key &&
+      event.payload.contractHash === contractHash);
+  if (applied && Array.isArray(applied.payload.paths)) {
+    // Reentry: the audited removal already ran. Verify its exact staged
+    // result still exists, then continue without rerunning the deletion.
+    const entries = await deps.git.trackedCandidates(worktreePath);
+    const statusByPath = new Map(entries.map((entry) => [entry.path, entry.status]));
+    if (!isDeepStrictEqual(applied.payload.paths, grant.paths) ||
+        grant.paths.some((file) => statusByPath.get(file) !== STAGED_DELETION_STATUS ||
+          existsSync(path.join(worktreePath, file))) ||
+        entries.some((entry) => !grant.paths.includes(entry.path) && !isOrdinaryTrackedModification(entry.status))) {
+      throw new Error('Operator-authorized tracked-file removal changed after its application event');
+    }
+    return [...(applied.payload.paths as string[])];
+  }
+  const entries = await deps.git.trackedCandidates(worktreePath);
+  const statusByPath = new Map(entries.map((entry) => [entry.path, entry.status]));
+  const stagedDeletions = grant.paths.filter((file) =>
+    statusByPath.get(file) === STAGED_DELETION_STATUS && !existsSync(path.join(worktreePath, file)));
+  // Unrelated tracked drift (any staged or otherwise unsupported change to a
+  // path outside the approved removal) is never reconciled and never ridden
+  // over: the attempt fails closed instead.
+  const drift = entries.filter((entry) =>
+    !grant.paths.includes(entry.path) && !isOrdinaryTrackedModification(entry.status));
+  if (drift.length > 0) {
+    throw new Error(
+      `Operator-authorized tracked-file removal for task ${task.id} found unrelated tracked drift: ${drift.map((entry) => `${entry.path} (${entry.status.trim() || 'index'})`).join(', ')}`,
+    );
+  }
+  if (stagedDeletions.length === grant.paths.length) {
+    // Crash between the controller git rm and the durable event: the exact
+    // staged deletions of the approved paths are this controller's own
+    // completed work (and nothing else is staged, per the drift check).
+    // Reconcile by recording the application event.
+    deps.store.recordEvent('task.git_rm_applied', task.id, {
+      contractHash,
+      recoveryAuthorizationId: grant.recoveryAuthorizationId,
+      grantAuthorizationId: grant.grantAuthorizationId,
+      paths: grant.paths,
+      reconciled: true,
+    }, key);
+    return [...grant.paths];
+  }
+  if (stagedDeletions.length > 0) {
+    throw new Error(
+      `Operator-authorized tracked-file removal for task ${task.id} found a partial staged deletion; expected exactly ${grant.paths.join(', ')}`,
+    );
+  }
+  // No staged deletion yet: every approved path must still be a safe tracked
+  // regular file (full re-validation including protected paths).
+  const validated = await validateAuthorizedGitRmPaths(worktreePath, grant.paths, deps.protectedPaths);
+  await deps.git.removeTrackedFiles(worktreePath, validated);
+  deps.store.recordEvent('task.git_rm_applied', task.id, {
+    contractHash,
+    recoveryAuthorizationId: grant.recoveryAuthorizationId,
+    grantAuthorizationId: grant.grantAuthorizationId,
+    paths: validated,
+    reconciled: false,
+  }, key);
+  return [...validated];
 }
 
 function sha256(value: string): string {

@@ -19,8 +19,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-latest
+            runner: ubuntu-latest
+          # Keep the protected check context while using GitHub's standard
+          # macOS 26 Intel pool when the macos-latest ARM pool is unassigned.
+          - os: macos-latest
+            runner: macos-26-intel
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,5 +39,11 @@ jobs:
       - run: npm ci
       - run: npm run release:check
       - run: npm run typecheck
+      # Hosted macOS runners starve process-based tests when all 52 test
+      # files run in parallel (Vitest default 5s testTimeout). Bound the
+      # worker pool and per-test timeout there only; Ubuntu keeps defaults.
       - run: npm test
+        if: matrix.os != 'macos-latest'
+      - run: npm test -- --maxWorkers=2 --testTimeout=15000
+        if: matrix.os == 'macos-latest'
       - run: npm run package:smoke

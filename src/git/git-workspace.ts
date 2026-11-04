@@ -177,6 +177,22 @@ export class GitWorkspace {
       .map((entry) => ({ path: entry.path, status: entry.status }));
   }
 
+  /**
+   * Controller-executed operator-authorized tracked-file removal: exactly
+   * `git rm -f -- <paths>` as a direct argv invocation (never a shell) inside
+   * a harness-owned worktree only. The caller owns grant validation; this
+   * method performs no permission logic of its own. The trusted controller
+   * runs it because a sandboxed implementer cannot write the linked
+   * worktree's index under the main repository.
+   */
+  async removeTrackedFiles(worktree: string, paths: string[]): Promise<void> {
+    if (!Array.isArray(paths) || paths.length === 0) {
+      throw new Error('Tracked-file removal requires at least one path');
+    }
+    this.assertOwnedPath(worktree);
+    await this.git(['rm', '-f', '--', ...paths], worktree);
+  }
+
   async untrackedFiles(worktree: string): Promise<string[]> {
     const entries = await this.statusEntries(worktree);
     return entries.filter((entry) => entry.untracked).map((entry) => entry.path);

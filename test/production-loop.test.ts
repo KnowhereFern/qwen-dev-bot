@@ -749,7 +749,7 @@ describe('production supervisor trace', () => {
     store.close();
   }, 30_000);
 
-  it('passes the exact authorized git rm permission and command for the same task and frozen contract', async () => {
+  it('applies the authorized tracked-file removal in the controller preflight and grants Qwen no git rm permission', async () => {
     const { repo } = await createGitFixture();
     const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
     config.intake.trustedAuthors.push('bot');
@@ -780,14 +780,24 @@ describe('production supervisor trace', () => {
 
     expect(execute).toHaveBeenCalledTimes(1);
     const input = execute.mock.calls[0]![0];
-    expect(input.allowGitRmPaths).toEqual(['README.md', 'check.mjs']);
-    const removal = (input.feedback as string[]).find((item) => item.includes('git rm -f --')) as string;
-    expect(removal).toContain('`git rm -f -- README.md check.mjs`');
-    expect(removal).toContain('this exact task only');
+    // The sandboxed implementer is never given git rm permission.
+    expect('allowGitRmPaths' in input).toBe(false);
+    const removal = (input.feedback as string[]).find((item) => item.includes('tracked-file removal')) as string;
+    expect(removal).toContain('controller already removed README.md, check.mjs');
+    expect(removal).toContain('Do not run git rm');
+    expect(removal).not.toContain('`git rm -f --');
+    // The trusted controller deleted the exact files in the task's worktree.
+    const worktree = store.get(task.id).worktreePath as string;
+    expect(existsSync(path.join(worktree, 'README.md'))).toBe(false);
+    expect(existsSync(path.join(worktree, 'check.mjs'))).toBe(false);
+    const applied = store.listEvents('task.git_rm_applied');
+    expect(applied).toHaveLength(1);
+    expect(applied[0]?.taskId).toBe(task.id);
+    expect(applied[0]?.payload.paths).toEqual(['README.md', 'check.mjs']);
     store.close();
   }, 30_000);
 
-  it('grants no git rm permission for a stale contract or paths no longer valid in the worktree', async () => {
+  it('applies no removal for a stale contract and leaves the worktree untouched', async () => {
     const { repo } = await createGitFixture();
     const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
     config.intake.trustedAuthors.push('bot');
@@ -805,15 +815,65 @@ describe('production supervisor trace', () => {
     await supervisor.syncIntake();
     const task = store.findByIssue(2) as NonNullable<ReturnType<typeof store.findByIssue>>;
     const contractHash = createHash('sha256').update(JSON.stringify(task.spec)).digest('hex');
-    // Stale contract: no permission even though the paths are valid.
+    // Stale contract: no removal even though the paths are valid.
     store.recordEvent('task.recovery_authorized', task.id, {
       reason: 'Stale removal', contractHash: 'deadbeef', allowGitRm: ['README.md'],
     });
 
     await supervisor.tick();
     expect(execute).toHaveBeenCalledTimes(1);
-    expect(execute.mock.calls[0]![0].allowGitRmPaths).toBeUndefined();
-    expect((execute.mock.calls[0]![0].feedback as string[]).join('\n')).not.toContain('git rm -f --');
+    const input = execute.mock.calls[0]![0];
+    expect('allowGitRmPaths' in input).toBe(false);
+    expect((input.feedback as string[]).join('\n')).not.toContain('git rm');
+    // No controller removal ran: no application event, and if the task's
+    // worktree still exists after the delivery cycle, the file is untouched.
+    expect(store.listEvents('task.git_rm_applied')).toHaveLength(0);
+    const worktree = store.get(task.id).worktreePath as string;
+    if (existsSync(worktree)) {
+      expect(existsSync(path.join(worktree, 'README.md'))).toBe(true);
+    }
+    store.close();
+  }, 30_000);
+
+  it('reconciles the exact audited staged deletion on restart without rejecting the attempt', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('recovery-git-rm-crash-state');
+    const store = new PersistentTaskStore('recovery-git-rm-crash-project', state);
+    const executor = new MockQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-recovery-git-rm-crash',
+    );
+
+    await supervisor.syncIntake();
+    const task = store.findByIssue(2) as NonNullable<ReturnType<typeof store.findByIssue>>;
+    const contractHash = createHash('sha256').update(JSON.stringify(task.spec)).digest('hex');
+    store.recordEvent('task.recovery_authorized', task.id, {
+      reason: 'Remove stale tracked artifacts', contractHash, allowGitRm: ['README.md', 'check.mjs'],
+    });
+    // Simulate the crash: the controller's git rm landed in the task
+    // worktree, the durable application event did not.
+    const git = new GitWorkspace(repo, state, config);
+    const receipt = await git.createOrResume(task);
+    await runProcess({ command: 'git', args: ['rm', '-f', '--', 'README.md', 'check.mjs'], cwd: receipt.path, timeoutMs: 20_000 });
+
+    await supervisor.tick();
+
+    // The restart neither rejected the attempt nor reran the deletion: the
+    // exact staged deletions were reconciled and the session still ran.
+    expect(execute).toHaveBeenCalledTimes(1);
+    const applied = store.listEvents('task.git_rm_applied');
+    expect(applied).toHaveLength(1);
+    expect(applied[0]?.payload.reconciled).toBe(true);
+    expect(applied[0]?.payload.paths).toEqual(['README.md', 'check.mjs']);
+    const removal = (execute.mock.calls[0]![0].feedback as string[]).find((item) => item.includes('tracked-file removal')) as string;
+    expect(removal).toContain('controller already removed README.md, check.mjs');
+    expect(store.get(task.id).state).not.toBe('failed');
     store.close();
   }, 30_000);
 
