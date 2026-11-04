@@ -101,12 +101,23 @@ export function qwenImplementationToolArgs(): string[] {
   ];
 }
 
-/** Auto-approve only the audited saved workflow required by the headless Goal. */
+/**
+ * Exact, audited gate runner command the workflow implementer must run to
+ * produce the machine-written gate receipt. Auto mode strips overbroad shell
+ * allows but retains this narrow exact-command rule, so it must match the
+ * workflow prompt verbatim: no prefix, suffix, or chained commands.
+ */
+export const QWEN_GATE_RUNNER_COMMAND = 'node .qwen-harness/scripts/run-gates.mjs';
+
+/** Auto-approve only the audited saved workflow and gate runner required by the headless Goal. */
 export function qwenSavedWorkflowPermissionArgs(scriptPath: string): string[] {
   if (!path.isAbsolute(scriptPath) || /[,()\r\n]/.test(scriptPath)) {
     throw new Error(`Saved workflow path cannot be represented safely in a Qwen permission rule: ${scriptPath}`);
   }
-  return ['--allowed-tools', `workflow(scriptPath:${scriptPath})`];
+  return [
+    '--allowed-tools',
+    `workflow(scriptPath:${scriptPath}),Shell(${QWEN_GATE_RUNNER_COMMAND})`,
+  ];
 }
 
 export interface QwenWorkflowLimits {

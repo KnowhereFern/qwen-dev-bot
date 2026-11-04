@@ -101,11 +101,19 @@ describe('Qwen runtime boundary', () => {
     });
   });
 
-  it('approves only the exact audited saved workflow path', () => {
-    expect(qwenSavedWorkflowPermissionArgs('/project/.qwen/workflows/harness-implement.js')).toEqual([
+  it('approves only the exact audited saved workflow path and gate runner command', () => {
+    const args = qwenSavedWorkflowPermissionArgs('/project/.qwen/workflows/harness-implement.js');
+    expect(args).toEqual([
       '--allowed-tools',
-      'workflow(scriptPath:/project/.qwen/workflows/harness-implement.js)',
+      'workflow(scriptPath:/project/.qwen/workflows/harness-implement.js),Shell(node .qwen-harness/scripts/run-gates.mjs)',
     ]);
+    const allowed = args[1];
+    // Narrow exact-command Shell allow only: no broad shell allow survives.
+    expect(allowed).toContain('Shell(node .qwen-harness/scripts/run-gates.mjs)');
+    expect(allowed).not.toContain('Shell(*)');
+    expect(allowed).not.toContain('Shell(node)');
+    expect(allowed).not.toMatch(/Shell\(\*/);
+    expect(allowed).not.toContain('run_shell_command');
     expect(() => qwenSavedWorkflowPermissionArgs('/project,unsafe/workflow.js')).toThrow(/cannot be represented safely/);
   });
 

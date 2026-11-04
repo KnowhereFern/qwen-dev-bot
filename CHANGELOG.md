@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.89] - 2026-11-04
+
+- Permit the exact audited gate runner command in headless Qwen sessions so implementation can produce its required gate receipt.
+
 ## [1.0.0-rc.88] - 2026-11-04
 
 - Apply mandatory Crouton reasoning to Qwen Code's child credential route, so Goal verification works in saved task worktrees.
