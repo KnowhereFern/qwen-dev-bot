@@ -95,28 +95,7 @@ describe('invocation-scoped Qwen model selection', () => {
     } finally { selected.cleanup(); }
   });
 
-  it('allows exactly the authorized git rm command when opted in, alongside gate runner rules', () => {
-    const f = fixture();
-    writeFileSync(f.systemPath, JSON.stringify({
-      permissions: { allow: ['Read(**)'], deny: ['Shell(git rm *)'] },
-    }));
-    const command = 'git rm -f -- src/old.ts src/deep/stale.ts';
-    const selected = createQwenModelSelection({ ...f.input, allowGateRunnerCommand: true, allowGitRmCommand: command });
-    const file = selected.env.QWEN_CODE_SYSTEM_SETTINGS_PATH!;
-    try {
-      const overlay = JSON.parse(readFileSync(file, 'utf8'));
-      expect(overlay.permissions.allow).toEqual([
-        'Read(**)',
-        `Shell(${QWEN_GATE_RUNNER_COMMAND})`,
-        `Shell(${process.platform === 'win32' ? gateRunnerCommand(resolveInstalledGateRunner()) : `${process.execPath} ${resolveInstalledGateRunner()}`})`,
-        `Shell(${command})`,
-      ]);
-      expect(overlay.permissions.allow).toHaveLength(4);
-      expect(overlay.permissions.deny).toEqual(['Shell(git rm *)']);
-    } finally { selected.cleanup(); }
-  });
-
-  it('does not grant any git rm permission by default or with none authorized', () => {
+  it('never grants any git rm shell permission in the overlay', () => {
     const f = fixture();
     writeFileSync(f.systemPath, JSON.stringify({ permissions: { allow: ['Read(**)'] } }));
     for (const options of [f.input, { ...f.input, allowGateRunnerCommand: true }]) {
@@ -124,24 +103,9 @@ describe('invocation-scoped Qwen model selection', () => {
       const file = selected.env.QWEN_CODE_SYSTEM_SETTINGS_PATH!;
       try {
         const overlay = JSON.parse(readFileSync(file, 'utf8'));
-        expect(JSON.stringify(overlay.permissions.allow)).not.toContain('git rm');
+        expect(JSON.stringify(overlay.permissions?.allow)).not.toContain('git rm');
       } finally { selected.cleanup(); }
     }
-  });
-
-  it.each([
-    'git rm -f -- src/old.ts ../escape.ts',
-    'git rm -f -- src/old.ts;rm -rf /',
-    'git rm -rf -- src/old.ts',
-    'git rm -f -- src/old.ts *.tmp',
-    'git rm -f --',
-    'rm -f -- src/old.ts',
-    'git rm -f -- src/old.ts && git commit',
-  ])('refuses a non-exact removal permission command: %s', (command) => {
-    const f = fixture();
-    writeFileSync(f.systemPath, JSON.stringify({ permissions: { allow: [] } }));
-    expect(() => createQwenModelSelection({ ...f.input, allowGitRmCommand: command }))
-      .toThrow('exact validated git rm');
   });
 
   it.each([

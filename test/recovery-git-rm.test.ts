@@ -1,12 +1,16 @@
 import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { GIT_RM_MAX_PATHS, PersistentTaskStore, validateAuthorizedGitRmPaths } from '../src/core/persistent-store.js';
-import { gitRmCommandFor } from '../src/qwen/qwen-code-executor.js';
-import type { TaskSpec } from '../src/core/types.js';
+import { defaultProjectConfig } from '../src/core/config.js';
+import { GitWorkspace } from '../src/git/git-workspace.js';
+import { applyAuthorizedGitRmPreflight, gitRmAppliedIdempotencyKey, resolveAuthorizedGitRmGrant } from '../src/supervisor.js';
+import type { TaskRecord, TaskSpec } from '../src/core/types.js';
 import { createGitFixture } from './fixtures/git.js';
 import { makeTmp } from './helpers.js';
+import { runProcess } from '../src/runtime/safe-process.js';
 
 const PROTECTED = ['AUTONOMY.md', '.qwen-harness/', '.github/workflows/harness-'];
 
@@ -79,9 +83,11 @@ describe('authorized tracked-file removal validation', () => {
   });
 
   it('builds the exact single permission command for validated paths', () => {
-    expect(gitRmCommandFor(['src/old.ts'])).toBe('git rm -f -- src/old.ts');
-    expect(gitRmCommandFor(['src/old.ts', 'src/deep/stale.ts'])).toBe('git rm -f -- src/old.ts src/deep/stale.ts');
-    expect(() => gitRmCommandFor([])).toThrow(/at least one/);
+    expect(gitRmAppliedIdempotencyKey('task-1', 'recovery-1', ['src/old.ts', 'src/stale.ts']))
+      .toBe(`task:git-rm-applied:task-1:recovery-1:${['src/old.ts', 'src/stale.ts'].sort().join(' ')}`);
+    // Path order never changes the identity of the application event.
+    expect(gitRmAppliedIdempotencyKey('task-1', 'recovery-1', ['src/stale.ts', 'src/old.ts']))
+      .toBe(gitRmAppliedIdempotencyKey('task-1', 'recovery-1', ['src/old.ts', 'src/stale.ts']));
   });
 });
 
@@ -208,4 +214,216 @@ describe('standalone tracked-file removal grant on a ready retry', () => {
     expect(() => store.grantGitRmPermission(taskId, grant)).toThrow(/unleased ready/);
     store.close();
   });
+});
+
+describe('trusted-controller git rm preflight', () => {
+  const PROTECTED_PREFLIGHT = ['AUTONOMY.md', '.qwen-harness/'];
+
+  function contractHashOf(task: TaskRecord): string {
+    return createHash('sha256').update(JSON.stringify(task.spec)).digest('hex');
+  }
+
+  async function setup(label: string, issueNumber = 42): Promise<{
+    store: PersistentTaskStore;
+    git: GitWorkspace;
+    task: TaskRecord;
+    worktree: string;
+    preflight: (taskOverride?: TaskRecord) => Promise<string[] | null>;
+  }> {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    const state = makeTmp(label);
+    const store = new PersistentTaskStore(label, state);
+    const git = new GitWorkspace(repo, state, config);
+    const created = store.upsert({
+      issueNumber, title: `preflight ${issueNumber}`, state: 'ready', maxAttempts: 5, spec: spec(),
+    });
+    const receipt = await git.createOrResume(created);
+    store.patch(created.id, { worktreePath: receipt.path, branch: receipt.branch, baseSha: receipt.baseSha });
+    const task = store.get(created.id);
+    return {
+      store,
+      git,
+      task,
+      worktree: receipt.path,
+      preflight: (taskOverride?: TaskRecord) => applyAuthorizedGitRmPreflight(
+        { store, git, protectedPaths: PROTECTED_PREFLIGHT }, taskOverride ?? task, receipt.path,
+      ),
+    };
+  }
+
+  function authorize(store: PersistentTaskStore, task: TaskRecord, paths: string[], authorizationId = 'recovery-1'): void {
+    store.recordEvent('task.recovery_authorized', task.id, {
+      authorizationId, contractHash: contractHashOf(task), allowGitRm: paths,
+    });
+  }
+
+  function appliedEvents(store: PersistentTaskStore) {
+    return store.listEvents('task.git_rm_applied');
+  }
+
+  it('applies the exact authorized deletion once in the owned worktree and records an idempotent event', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-apply');
+    authorize(store, task, ['README.md', 'check.mjs']);
+
+    await expect(preflight()).resolves.toEqual(['README.md', 'check.mjs']);
+
+    expect(existsSync(path.join(worktree, 'README.md'))).toBe(false);
+    expect(existsSync(path.join(worktree, 'check.mjs'))).toBe(false);
+    const events = appliedEvents(store);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.taskId).toBe(task.id);
+    expect(events[0]?.payload.paths).toEqual(['README.md', 'check.mjs']);
+    expect(events[0]?.payload.contractHash).toBe(contractHashOf(task));
+    // Authorization identifiers are redacted in the durable ledger when
+    // events are written through recordEvent; the binding identity is the
+    // stable task + sorted-paths suffix of the idempotency key.
+    expect(events[0]?.payload.reconciled).toBe(false);
+    expect(events[0]?.idempotencyKey?.startsWith(`task:git-rm-applied:${task.id}:`)).toBe(true);
+    expect(events[0]?.idempotencyKey?.endsWith(':README.md check.mjs')).toBe(true);
+    // The deletion is staged in the task worktree's index.
+    const status = await runProcess({ command: 'git', args: ['status', '--porcelain=v1'], cwd: worktree, timeoutMs: 20_000 });
+    expect(status.stdout).toContain('D  README.md');
+    expect(status.stdout).toContain('D  check.mjs');
+
+    // Reentry with the recorded application: no rerun, no second event.
+    await expect(preflight()).resolves.toEqual(['README.md', 'check.mjs']);
+    expect(appliedEvents(store)).toHaveLength(1);
+    store.close();
+  }, 60_000);
+
+  it('rejects a recreated file on reentry without rerunning the deletion', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-reentry');
+    authorize(store, task, ['check.mjs']);
+    await preflight();
+    // The implementer recreated the file against instructions. The controller
+    // must not mistake the old application receipt for the current state.
+    writeFileSync(path.join(worktree, 'check.mjs'), 'recreated\n');
+    await expect(preflight()).rejects.toThrow(/changed after its application event/);
+    expect(existsSync(path.join(worktree, 'check.mjs'))).toBe(true);
+    expect(appliedEvents(store)).toHaveLength(1);
+    store.close();
+  }, 60_000);
+
+  it('reconciles a crash between the controller git rm and the durable event', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-crash');
+    authorize(store, task, ['README.md', 'check.mjs']);
+    // Simulate the crash: the controller's git rm landed, the event did not.
+    await runProcess({ command: 'git', args: ['rm', '-f', '--', 'README.md', 'check.mjs'], cwd: worktree, timeoutMs: 20_000 });
+
+    await expect(preflight()).resolves.toEqual(['README.md', 'check.mjs']);
+
+    const events = appliedEvents(store);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.payload.reconciled).toBe(true);
+    expect(existsSync(path.join(worktree, 'README.md'))).toBe(false);
+    // And the reconciled event is itself idempotent on reentry.
+    await expect(preflight()).resolves.toEqual(['README.md', 'check.mjs']);
+    expect(appliedEvents(store)).toHaveLength(1);
+    store.close();
+  }, 60_000);
+
+  it('rejects other drift: unrelated staged changes, partial deletions, and unstaged deletions', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-drift');
+    authorize(store, task, ['README.md', 'check.mjs']);
+
+    // Unrelated staged modification outside the approved paths.
+    writeFileSync(path.join(worktree, 'AUTONOMY.md'), '# changed\n');
+    await runProcess({ command: 'git', args: ['add', '--', 'AUTONOMY.md'], cwd: worktree, timeoutMs: 20_000 });
+    await expect(preflight()).rejects.toThrow(/unrelated tracked drift/);
+    expect(appliedEvents(store)).toHaveLength(0);
+    await runProcess({ command: 'git', args: ['checkout', 'HEAD', '--', 'AUTONOMY.md'], cwd: worktree, timeoutMs: 20_000 });
+
+    // Partial staged deletion of the approved paths.
+    await runProcess({ command: 'git', args: ['rm', '-f', '--', 'README.md'], cwd: worktree, timeoutMs: 20_000 });
+    await expect(preflight()).rejects.toThrow(/partial staged deletion/);
+    expect(appliedEvents(store)).toHaveLength(0);
+    await runProcess({ command: 'git', args: ['checkout', 'HEAD', '--', 'README.md'], cwd: worktree, timeoutMs: 20_000 });
+
+    // Unstaged deletion drift (file removed without git rm).
+    await runProcess({ command: 'git', args: ['rm', '-f', '--', 'check.mjs'], cwd: worktree, timeoutMs: 20_000 });
+    writeFileSync(path.join(worktree, 'check.mjs'), 'restored bytes\n');
+    // check.mjs is now staged-deleted but still present: not the exact state.
+    await expect(preflight()).rejects.toThrow();
+    expect(appliedEvents(store)).toHaveLength(0);
+    store.close();
+  }, 60_000);
+
+  it('yields no grant for a stale contract, a superseded recovery authorization, or an unrelated task', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-stale');
+    authorize(store, task, ['README.md']);
+    // Files must remain untouched in every case below.
+
+    // Stale contract: the task spec changed after the authorization.
+    const changed = store.patch(task.id, { spec: { ...spec(), goal: 'A different contract' } });
+    await expect(preflight(changed)).resolves.toBeNull();
+    expect(existsSync(path.join(worktree, 'README.md'))).toBe(true);
+    expect(appliedEvents(store)).toHaveLength(0);
+
+    // Superseded recovery authorization without its own allowGitRm paths.
+    const restored = store.patch(task.id, { spec: task.spec });
+    store.recordEvent('task.recovery_authorized', restored.id, {
+      authorizationId: 'recovery-2', contractHash: contractHashOf(restored),
+    });
+    await expect(preflight(restored)).resolves.toBeNull();
+    expect(existsSync(path.join(worktree, 'README.md'))).toBe(true);
+    expect(appliedEvents(store)).toHaveLength(0);
+    expect(resolveAuthorizedGitRmGrant(store, restored)).toBeNull();
+    store.close();
+  }, 60_000);
+
+  it('applies a standalone task.git_rm_granted event bound to the current recovery authorization', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-grant-event');
+    store.recordEvent('task.recovery_authorized', task.id, {
+      authorizationId: 'recovery-1', contractHash: contractHashOf(task),
+    });
+    store.recordEvent('task.git_rm_granted', task.id, {
+      authorizationId: 'grant-1', recoveryAuthorizationId: 'recovery-1',
+      contractHash: contractHashOf(task), allowGitRm: ['check.mjs'],
+    });
+
+    await expect(preflight()).resolves.toEqual(['check.mjs']);
+    expect(existsSync(path.join(worktree, 'check.mjs'))).toBe(false);
+    expect(appliedEvents(store)).toHaveLength(1);
+
+    // A grant bound to an older recovery authorization is never applied.
+    store.recordEvent('task.recovery_authorized', task.id, {
+      authorizationId: 'recovery-2', contractHash: contractHashOf(task),
+    });
+    store.recordEvent('task.git_rm_granted', task.id, {
+      authorizationId: 'grant-2', recoveryAuthorizationId: 'recovery-1',
+      contractHash: contractHashOf(task), allowGitRm: ['README.md'],
+    });
+    expect(existsSync(path.join(worktree, 'README.md'))).toBe(true);
+    expect(appliedEvents(store)).toHaveLength(1);
+    store.close();
+  }, 60_000);
+
+  it('applies nothing for another task\'s authorization and rejects protected removal paths', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-unrelated');
+    const other = store.upsert({ issueNumber: 43, title: 'other task', state: 'ready', maxAttempts: 5, spec: spec() });
+    store.recordEvent('task.recovery_authorized', other.id, {
+      authorizationId: 'recovery-other', contractHash: contractHashOf(other), allowGitRm: ['README.md'],
+    });
+    await expect(preflight()).resolves.toBeNull();
+    expect(existsSync(path.join(worktree, 'README.md'))).toBe(true);
+    expect(appliedEvents(store)).toHaveLength(0);
+
+    // Protected paths fail closed even when authorized inline.
+    authorize(store, task, ['AUTONOMY.md']);
+    await expect(preflight()).rejects.toThrow(/protected/);
+    expect(existsSync(path.join(worktree, 'AUTONOMY.md'))).toBe(true);
+    expect(appliedEvents(store)).toHaveLength(0);
+    store.close();
+  }, 60_000);
+
+  it('rejects a grant if the supplied worktree is not the task worktree', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-wrong-worktree');
+    authorize(store, task, ['README.md']);
+    await expect(preflight({ ...task, worktreePath: `${worktree}-other` }))
+      .rejects.toThrow(/worktree does not match/);
+    expect(existsSync(path.join(worktree, 'README.md'))).toBe(true);
+    expect(appliedEvents(store)).toHaveLength(0);
+    store.close();
+  }, 60_000);
 });

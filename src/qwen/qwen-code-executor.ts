@@ -76,13 +76,6 @@ export interface QwenCodeRunInput {
   task: TaskRecord;
   worktree: string;
   feedback?: string[];
-  /**
-   * Operator-authorized tracked-file removal paths (already validated against
-   * this exact task's authorization and worktree). Grants the invocation-only
-   * overlay permission for exactly `git rm -f -- <these paths>`; absent or
-   * empty means no extra permission.
-   */
-  allowGitRmPaths?: string[];
   onHeartbeat?: () => void;
   onSession?: (sessionId: string) => void;
   signal?: AbortSignal;
@@ -245,14 +238,10 @@ export class QwenCodeExecutor implements QwenExecutor {
       envKey: crouton ? CROUTON_CHILD_CREDENTIAL_ENV_KEY : this.config.qwen.credentialEnvKey,
       // The parent's --allowed-tools does not reach the workflow
       // implementer subagent, but the invocation-only system overlay does;
-      // allow exactly the gate runner command there.
+      // allow exactly the gate runner command there. Tracked-file removal is
+      // never permitted here: the trusted controller performs the exact
+      // operator-authorized deletion before this session starts.
       allowGateRunnerCommand: true,
-      // Exact task-scoped tracked-file removal allow from a recovery
-      // authorization: only the one exact command is permitted, never a
-      // wildcard or blanket Shell allow.
-      ...(input.allowGitRmPaths && input.allowGitRmPaths.length > 0
-        ? { allowGitRmCommand: gitRmCommandFor(input.allowGitRmPaths) }
-        : {}),
     });
     // Durable provider-wide quota hold: never spawn a Qwen Code process
     // against a held route. The supervisor parks the task on this signal
@@ -422,13 +411,6 @@ export class QwenCodeExecutor implements QwenExecutor {
       durationMs: receipt.durationMs,
     };
   }
-}
-
-/** The exact single command a recovery authorization permits for the given
- * validated paths. No wildcards: the command string is the permission. */
-export function gitRmCommandFor(paths: string[]): string {
-  if (paths.length === 0) throw new Error('Tracked-file removal permission requires at least one authorized path');
-  return `git rm -f -- ${paths.join(' ')}`;
 }
 
 export function classifyGoalDisposition(input: {

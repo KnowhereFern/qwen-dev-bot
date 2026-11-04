@@ -52,12 +52,6 @@ export function createQwenModelSelection(options: {
   platform?: NodeJS.Platform;
   /** Opt-in exact gate-command allow for the workflow implementer subagent. */
   allowGateRunnerCommand?: boolean;
-  /**
-   * Opt-in exact `git rm -f -- <paths>` allow for a recovery-authorized
-   * tracked-file removal. Must be a fully validated exact command; never a
-   * wildcard or blanket Shell allow.
-   */
-  allowGitRmCommand?: string;
 }): { env: NodeJS.ProcessEnv; cleanup: () => void } {
   if (!options.model.trim() || !/^[A-Z_][A-Z0-9_]*$/.test(options.envKey)) {
     throw new Error('Invalid isolated Qwen model or credential environment key');
@@ -115,21 +109,9 @@ export function createQwenModelSelection(options: {
     }
     extraAllow.push(`Shell(${QWEN_GATE_RUNNER_COMMAND})`, `Shell(${installedPermissionCommand})`);
   }
-  if (options.allowGitRmCommand !== undefined) {
-    // Same exact-token matching: only the one authorized command string is
-    // ever allowed, and it must already be the fully validated operator
-    // authorization (`git rm -f --` plus 1-5 safe relative paths).
-    const command = options.allowGitRmCommand;
-    const segments = command.split(' ');
-    const syntax = /^git$/.test(segments[0] ?? '') && segments[1] === 'rm' && segments[2] === '-f' && segments[3] === '--' &&
-      segments.length >= 5 && segments.slice(4).every((token) =>
-        token.split('/').every((part) => part !== '' && part !== '.' && part !== '..' &&
-          (/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(part) || /^\.[A-Za-z0-9_][A-Za-z0-9._+-]*$/.test(part))));
-    if (!syntax) {
-      throw new Error('Tracked-file removal permission must be the exact validated git rm -f -- <paths> command');
-    }
-    extraAllow.push(`Shell(${command})`);
-  }
+  // Tracked-file removal is never granted in this overlay: the trusted
+  // controller performs the exact operator-authorized deletion before the
+  // Qwen session, so the implementer needs no git rm shell permission.
   const overlayPermissions = extraAllow.length > 0
     ? { ...systemPermissions, allow: [
         ...(Array.isArray(systemPermissions.allow) ? systemPermissions.allow : []),

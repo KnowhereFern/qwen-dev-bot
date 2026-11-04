@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.96] - 2026-11-04
+
+- Let the controller apply one audited, operator-approved tracked-file cleanup before a sandboxed recovery session and reconcile it safely after interruption.
+
 ## [1.0.0-rc.95] - 2026-11-04
 
 - Permit one operator-approved tracked-file removal command during an existing recovery retry, without broadening headless shell access or resetting the retry history.
