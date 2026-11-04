@@ -527,6 +527,35 @@ describe('local gate re-verification fail-closed hardening (RC76)', () => {
     expect(existsSync(path.join(repo, '.qwen-harness', 'project.yml'))).toBe(false);
   }, 30_000);
 
+  it('names the machine receipt errorCode when a gate edits sources yet exits zero', async () => {
+    const { repo } = await createGitFixture();
+    writeFileSync(path.join(repo, 'feature.txt'), 'implemented by Qwen\n');
+    const head = await git(['rev-parse', 'HEAD'], repo);
+
+    // The gate prints PASS and exits 0, but edits a tracked source file on
+    // the way out: the immutable runner then exits 1 with INPUTS_CHANGED,
+    // and the machine receipt — not the trailing console output — is the
+    // only place that verdict is recorded.
+    const rejection = await runLocalGateReverification({
+      worktreePath: repo,
+      expectedHead: head,
+      gates: [unitGate({ args: ['-e', "require('fs').appendFileSync('README.md', 'late edit\\n')"] })],
+    }).then(
+      () => {
+        throw new Error('expected runLocalGateReverification to reject');
+      },
+      (error: unknown) => error,
+    );
+    expect(rejection).toBeInstanceOf(Error);
+    const message = (rejection as Error).message;
+    expect(message).toContain('immutable gate runner exited 1');
+    expect(message).toContain('receipt status failed');
+    expect(message).toContain('errorCode INPUTS_CHANGED');
+    // Cleanup still ran to completion on the failure path.
+    expect(existsSync(path.join(repo, '.qwen-harness', 'project.yml'))).toBe(false);
+    expect(existsSync(path.join(repo, '.qwen-harness', 'state', 'gate-receipt.json'))).toBe(false);
+  }, 30_000);
+
   it('preserves the primary gate failure when cleanup also fails', async () => {
     const { repo } = await createGitFixture();
     writeFileSync(path.join(repo, 'feature.txt'), 'implemented by Qwen\n');

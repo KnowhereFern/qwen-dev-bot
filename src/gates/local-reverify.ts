@@ -130,10 +130,18 @@ export async function runLocalGateReverification(options: LocalGateReverificatio
       env: gateEnvironment({ ...process.env, CI: 'true', NODE_ENV: 'test' }),
     });
     if (result.exitCode !== 0 || result.timedOut || result.aborted) {
+      // Bounded safe diagnostic: the trailing console output alone loses the
+      // machine receipt's structured verdict (for example INPUTS_CHANGED
+      // after every individual gate printed PASS). Read the fresh receipt
+      // and surface only strictly validated controlled fields — never
+      // arbitrary receipt text, which could carry paths or secrets. Any
+      // problem with the diagnostic simply falls back to console output;
+      // it can never weaken or mask the fail-closed verdict below.
+      const diagnostic = failedRunReceiptSummary(receiptPath, startedMs);
       throw new Error(
         `Local gate re-verification failed: immutable gate runner ${
           result.timedOut ? 'timed out' : result.aborted ? 'was aborted' : `exited ${String(result.exitCode)}`
-        }: ${redactText((result.stderr.trim() || result.stdout.trim()).slice(-1_200))}`,
+        }${diagnostic === null ? '' : ` (${redactText(diagnostic)})`}: ${redactText((result.stderr.trim() || result.stdout.trim()).slice(-1_200))}`,
       );
     }
     const postContentHash = controllerContentHash(worktree);
@@ -318,6 +326,60 @@ function writeAll(fd: number, data: Buffer): void {
   let written = 0;
   while (written < data.length) {
     written += writeSync(fd, data, written, data.length - written);
+  }
+}
+
+/**
+ * Best-effort, fail-open-only-for-itself diagnostic for a nonzero runner
+ * exit: reads the receipt this very invocation should have written and
+ * returns a short summary of strictly validated controlled fields — receipt
+ * status, errorCode, and the ids of gates the receipt records as failed.
+ * Returns null whenever anything is off (missing/symlink/oversized/stale
+ * receipt, invalid JSON, unexpected shapes) so the diagnostic can never
+ * surface arbitrary receipt text, paths, or secrets, and can never turn a
+ * failure into a success or mask the primary error.
+ */
+function failedRunReceiptSummary(receiptPath: string, startedMs: number): string | null {
+  // Upper bound on bytes read so a runaway receipt cannot exhaust memory.
+  const maxReceiptBytes = 1_000_000;
+  try {
+    const stat = safeLstat(receiptPath);
+    if (stat === null || stat.isSymbolicLink() || !stat.isFile() || stat.size > maxReceiptBytes) return null;
+    // Only a receipt freshly written by this very invocation is summarized;
+    // a stale or future-dated one is ignored rather than trusted.
+    const nowMs = Date.now();
+    if (stat.mtimeMs < startedMs - RECEIPT_CLOCK_SKEW_MS || stat.mtimeMs > nowMs + RECEIPT_CLOCK_SKEW_MS) return null;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(receiptPath, 'utf8'));
+    } catch {
+      return null;
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    const parts: string[] = [];
+    // Controlled vocabulary only: free-form strings are never echoed.
+    if (record.status === 'failed' || record.status === 'pending') parts.push(`receipt status ${record.status}`);
+    if (record.errorCode === 'INPUTS_CHANGED' || record.errorCode === 'RECEIPT_OR_RUNNER_ERROR') {
+      parts.push(`errorCode ${record.errorCode}`);
+    }
+    if (Array.isArray(record.gates)) {
+      const failedGateIds: string[] = [];
+      for (const gate of record.gates.slice(0, 20)) {
+        if (typeof gate !== 'object' || gate === null || Array.isArray(gate)) continue;
+        const entry = gate as Record<string, unknown>;
+        const failed = entry.status !== 'passed' && entry.status !== 'not_applicable' && entry.status !== 'pending';
+        // Gate ids originate from the controller-written config, but are
+        // still pattern-validated before being echoed.
+        if (failed && typeof entry.id === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(entry.id)) {
+          failedGateIds.push(entry.id);
+        }
+      }
+      if (failedGateIds.length > 0) parts.push(`failed gates: ${failedGateIds.join(', ')}`);
+    }
+    return parts.length > 0 ? parts.join(', ') : null;
+  } catch {
+    return null;
   }
 }
 
