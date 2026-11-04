@@ -82,7 +82,6 @@ export function createQwenModelSelection(options: {
   const crouton = isOpenRouterCroutonRoute({
     model: options.model,
     baseUrl: options.baseUrl,
-    credentialEnvKey: options.envKey,
   });
   const overlay = {
     ...system,

@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.88] - 2026-11-04
+
+- Apply mandatory Crouton reasoning to Qwen Code's child credential route, so Goal verification works in saved task worktrees.
+
 ## [1.0.0-rc.87] - 2026-11-04
 
 - Carry Crouton's mandatory reasoning setting into isolated Qwen Code sessions, including resumed worktrees created before the route change.
