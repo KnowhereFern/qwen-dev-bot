@@ -236,6 +236,10 @@ export class QwenCodeExecutor implements QwenExecutor {
       // The Crouton child reads its key only from OPENAI_API_KEY, so the
       // isolated selection must pin that exact env key, never a Qwen one.
       envKey: crouton ? CROUTON_CHILD_CREDENTIAL_ENV_KEY : this.config.qwen.credentialEnvKey,
+      // The parent's --allowed-tools does not reach the workflow
+      // implementer subagent, but the invocation-only system overlay does;
+      // allow exactly the gate runner command there.
+      allowGateRunnerCommand: true,
     });
     // Durable provider-wide quota hold: never spawn a Qwen Code process
     // against a held route. The supervisor parks the task on this signal
