@@ -2,6 +2,12 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'no
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createQwenModelSelection } from '../src/qwen/model-selection.js';
+import {
+  OPENROUTER_CROUTON_BASE_URL,
+  OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
+  OPENROUTER_CROUTON_MANDATORY_REASONING_CAPABILITY,
+  OPENROUTER_CROUTON_MODEL,
+} from '../src/qwen/openrouter-route.js';
 import { makeTmp } from './helpers.js';
 
 function fixture() {
@@ -70,5 +76,40 @@ describe('invocation-scoped Qwen model selection', () => {
   it('rejects credential-bearing endpoints', () => {
     const f = fixture();
     expect(() => createQwenModelSelection({ ...f.input, baseUrl: 'https://user:pass@example.test/v1' })).toThrow(/credentials/);
+  });
+
+  it('carries the mandatory reasoning capability into the exact Crouton overlay even with stale settings', () => {
+    const home = makeTmp('model-selection-crouton');
+    const systemPath = path.join(home, 'system.json');
+    // Stale pre-Crouton system settings: no reasoning capability anywhere.
+    writeFileSync(systemPath, JSON.stringify({ tools: { sandbox: true } }));
+    const selected = createQwenModelSelection({ model: OPENROUTER_CROUTON_MODEL, baseUrl: OPENROUTER_CROUTON_BASE_URL,
+      envKey: OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY, home, environment: { QWEN_CODE_SYSTEM_SETTINGS_PATH: systemPath } });
+    const file = selected.env.QWEN_CODE_SYSTEM_SETTINGS_PATH!;
+    try {
+      const overlay = JSON.parse(readFileSync(file, 'utf8'));
+      expect(overlay.modelProviders.openai).toEqual([{ id: OPENROUTER_CROUTON_MODEL,
+        baseUrl: OPENROUTER_CROUTON_BASE_URL, envKey: OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
+        capabilities: { reasoning: { profile: 'openai-reasoning', efforts: ['low', 'medium', 'high', 'xhigh'],
+          defaultEffort: 'xhigh', canDisable: false } } }]);
+      expect(overlay.modelProviders.openai[0].capabilities).toEqual(OPENROUTER_CROUTON_MANDATORY_REASONING_CAPABILITY);
+    } finally { selected.cleanup(); }
+  });
+
+  it.each([
+    { label: 'other model on the Crouton endpoint', model: 'qwen3.8-max', baseUrl: OPENROUTER_CROUTON_BASE_URL },
+    { label: 'Crouton model on a different endpoint', model: OPENROUTER_CROUTON_MODEL, baseUrl: 'https://coding.example/v1' },
+    { label: 'Crouton model with another credential key', model: OPENROUTER_CROUTON_MODEL, baseUrl: OPENROUTER_CROUTON_BASE_URL },
+  ])('does not add the Crouton reasoning capability for non-Crouton route ($label)', ({ model, baseUrl }) => {
+    const home = makeTmp('model-selection-non-crouton');
+    const systemPath = path.join(home, 'system.json');
+    writeFileSync(systemPath, JSON.stringify({ tools: { sandbox: true } }));
+    const selected = createQwenModelSelection({ model, baseUrl, envKey: 'TOKEN_KEY',
+      home, environment: { QWEN_CODE_SYSTEM_SETTINGS_PATH: systemPath } });
+    const file = selected.env.QWEN_CODE_SYSTEM_SETTINGS_PATH!;
+    try {
+      const overlay = JSON.parse(readFileSync(file, 'utf8'));
+      expect(overlay.modelProviders.openai).toEqual([{ id: model, baseUrl, envKey: 'TOKEN_KEY' }]);
+    } finally { selected.cleanup(); }
   });
 });
