@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.86] - 2026-11-04
+
+- Keep reasoning enabled for OpenRouter Crouton side queries so Qwen Code Goal verification can run.
+
 ## [1.0.0-rc.85] - 2026-11-03
 
 - Give the opt-in Crouton route enough output budget for the live readiness probe while keeping the Qwen probe unchanged.
