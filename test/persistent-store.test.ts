@@ -67,6 +67,49 @@ describe('PersistentTaskStore', () => {
     store.close();
   });
 
+  it('records append-only operator feedback for an unleased ready task without resetting history', () => {
+    const dir = makeTmp('operator-feedback');
+    const worktree = makeTmp('feedback-worktree');
+    let store = new PersistentTaskStore('operator-feedback', dir);
+    const task = store.upsert({ issueNumber: 7, title: 'feedback', state: 'ready', maxAttempts: 5, spec: taskSpec([]) });
+    store.patch(task.id, { attempts: 2, lineageFailures: 2, lastError: 'prior failure', worktreePath: worktree });
+    const auth = { authorizationId: 'rev-1', authorizedBy: 'Fern', reason: 'Test deletes product database files' };
+    const updated = store.recordOperatorFeedback(task.id, auth);
+    expect(updated).toMatchObject({ state: 'ready', attempts: 2, lineageFailures: 2, worktreePath: worktree,
+      lastError: 'Operator feedback (rev-1): Test deletes product database files' });
+    expect(updated.spec).toEqual(task.spec);
+    expect(store.get(task.id).version).toBe(updated.version);
+    expect(store.listEvents('task.operator_feedback')).toHaveLength(1);
+    store.close();
+    store = new PersistentTaskStore('operator-feedback', dir);
+    expect(store.recordOperatorFeedback(task.id, auth).lastError).toContain('Operator feedback (rev-1)');
+    expect(() => store.recordOperatorFeedback(task.id, { ...auth, reason: 'different finding' })).toThrow(/conflicts/);
+    expect(store.listEvents('task.operator_feedback')).toHaveLength(1);
+    store.close();
+  });
+
+  it('rejects operator feedback for leased, merged, exhausted, and worktree-less tasks', () => {
+    const worktree = makeTmp('feedback-reject-worktree');
+    const store = new PersistentTaskStore('operator-feedback-reject', makeTmp('operator-feedback-reject'));
+    const task = store.upsert({ issueNumber: 8, title: 'reject', state: 'ready', maxAttempts: 5, spec: taskSpec([]) });
+    const auth = { authorizationId: 'rev-2', authorizedBy: 'Fern', reason: 'finding' };
+    const expectReject = (pattern: RegExp) => expect(() => store.recordOperatorFeedback(task.id, auth)).toThrow(pattern);
+    expectReject(/worktree/);
+    store.patch(task.id, { worktreePath: worktree, mergeSha: 'abc123' });
+    expectReject(/merged/i);
+    store.patch(task.id, { mergeSha: null });
+    store.transition(task.id, 'leased', { leaseOwner: 'worker', leaseExpiresAt: Date.now() + 1_000 });
+    expectReject(/unleased ready task/);
+    store.transition(task.id, 'ready', { leaseOwner: null, leaseExpiresAt: null });
+    store.patch(task.id, { leaseOwner: 'stale-worker' });
+    expectReject(/unleased ready task/);
+    store.patch(task.id, { leaseOwner: null });
+    store.patch(task.id, { attempts: 5, lineageFailures: 5 });
+    expectReject(/retry budget/);
+    expect(store.listEvents('task.operator_feedback')).toHaveLength(0);
+    store.close();
+  });
+
   it('retains identical-failure quarantine despite an explicit recovery allowance', () => {
     const store = new PersistentTaskStore('recovery-identical', makeTmp('recovery-identical'));
     const task = store.upsert({ issueNumber: 1, title: 'quarantine', state: 'quarantined', maxAttempts: 5 });

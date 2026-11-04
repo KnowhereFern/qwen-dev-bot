@@ -34,7 +34,7 @@ import { readIntakeSource } from './intake/source.js';
 import { intakeConnection } from './intake/connection.js';
 import { draftSpecification, loadSpecification, renderSpecification, specificationDocument } from './intake/specification.js';
 
-const VERSION = '1.0.0-rc.96';
+const VERSION = '1.0.0-rc.97';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? (process.stdin.isTTY && process.stdout.isTTY ? 'interactive' : 'help');
@@ -297,6 +297,26 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         if (json) console.log(JSON.stringify({ issue, state: task.state, authorizationId, allowGitRm: validatedGitRm,
           recoveryAuthorizationId: grant.recoveryAuthorizationId, additionalAttempts: 0, ...budget }, null, 2));
         else console.log(`Issue #${issue}: tracked-file removal granted on the existing ready retry (no attempt added; ${budget.failures}/${budget.limit} failures used) under recovery ${grant.recoveryAuthorizationId}. Authorization: ${authorizationId}. Paths: ${validatedGitRm.join(', ')}.`);
+        return 0;
+      } finally { store.close(); }
+    }
+    case 'task-feedback': {
+      const issue = integerValue(args, '--issue');
+      const authorizationId = valueOf(args, '--authorization');
+      const authorizedBy = valueOf(args, '--authorized-by');
+      const reason = valueOf(args, '--reason');
+      if (!hasFlag(args, '--yes') || !issue || !authorizationId || !authorizedBy || !reason ||
+          [authorizationId, authorizedBy, reason].some((value) => !value.trim() || value.startsWith('--'))) {
+        throw new Error('task-feedback requires --yes --issue N --reason TEXT --authorization ID --authorized-by OPERATOR');
+      }
+      const config = loadProjectConfig(root);
+      const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      try {
+        const task = store.findByIssue(issue);
+        if (!task) throw new Error(`No task exists for issue #${issue}`);
+        const updated = store.recordOperatorFeedback(task.id, { authorizationId, authorizedBy, reason });
+        if (json) console.log(JSON.stringify({ issue, state: updated.state, attempts: updated.attempts, maxAttempts: updated.maxAttempts, lastError: updated.lastError, authorizationId }, null, 2));
+        else console.log(`Issue #${issue}: operator feedback recorded for ready task; attempts ${updated.attempts}/${updated.maxAttempts} preserved, next repair prompt will carry the finding. Authorization: ${authorizationId}.`);
         return 0;
       } finally { store.close(); }
     }
@@ -848,6 +868,7 @@ Commands:
   status [--json]      Show tasks, leases, sessions, PRs, and rewards
   usage-status [--json] Read-only project usage ledger summary and budget state
   recovery-authorize   Record an explicit bounded recovery authorization; never reset history
+  task-feedback        Record operator feedback for an unleased ready task; next repair prompt carries it
   logs [--lines N]     Tail the redacted append-only event ledger
   reward               Show the latest stored universal reward scorecard
   community [--force]  Scan allowlisted sources and create review-only issues
@@ -880,6 +901,11 @@ Recovery authorization options (operator-only):
   retry without adding an attempt. Requires an unleased ready task with an
   active recovery authorization, remaining retry budget, and a real worktree;
   each path is validated against that worktree before anything is stored.
+
+Task feedback options (operator-only):
+  --yes --issue N --reason TEXT --authorization ID --authorized-by OPERATOR [--json]
+  Appends one feedback event per authorization to an unleased ready task with retry budget
+  and an existing worktree. Reusing an authorization ID with different bindings is rejected.
 
 Init options:
   --dry-run --yes --name NAME --repo OWNER/NAME --trusted-author LOGIN --billing-plan PLAN

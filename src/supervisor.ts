@@ -21,6 +21,7 @@ import { UniversalRewardEngine } from './rewards/engine.js';
 import { resolveVisualArtifacts } from './rewards/evaluators.js';
 import { GateRunner } from './rewards/gates.js';
 import { prepareProjectCheckout } from './runtime/checkout-preflight.js';
+import { runProcess } from './runtime/safe-process.js';
 
 // Parser compatibility: the strict reset parser now lives in
 // src/qwen/provider-reset.ts; existing imports from supervisor keep working.
@@ -1660,6 +1661,113 @@ export function resolveAuthorizedGitRmGrant(
   };
 }
 
+/** Upper bound on how many commits after baseSha the reentry history scan
+ * will enumerate before failing closed. Tasks produce a handful of candidate
+ * and repair commits; anything larger is not a shape we promised to verify. */
+const GIT_RM_HISTORY_COMMIT_LIMIT = 512;
+
+/**
+ * Direct argv Git reads over the branch history between the task's recorded
+ * baseSha and the current worktree HEAD, used only by the trusted controller
+ * for git-rm reentry. A net `git diff baseSha..HEAD` is not enough: the
+ * granted paths may have been ADDED after baseSha by an earlier task attempt
+ * and DELETED by the controller's committed removal later, so the net diff
+ * shows no 'D' for them at all. Instead, after confirming ancestry and a
+ * bounded commit count, the scan enumerates commits after baseSha (newest
+ * first) and looks for a single commit whose `git diff-tree -r -z
+ * --name-status --no-renames` output deletes all and only the given paths,
+ * while permitting ordinary 'M'/'A' changes to other paths in that same
+ * commit (the staged deletion is committed together with unrelated work).
+ * Two read-only guards wrap that search: a net baseSha..HEAD diff must not
+ * delete any path outside the grant (a later commit removing more than
+ * authorized fails closed) and must not re-add a granted path (restoration),
+ * and the caller separately confirms the working tree still lacks the paths.
+ * Subsequent repair commits carrying only ordinary M/A changes never
+ * disqualify the earlier qualifying commit. All operations are read-only
+ * argv Git (never a shell, never a mutation). Returns false for a missing or
+ * malformed baseSha, a baseSha that is not an ancestor of HEAD, an
+ * unbounded or empty commit range, any git failure, an extra deleted path
+ * (in the qualifying commit or net at HEAD), and any granted path restored
+ * at HEAD.
+ */
+export async function branchHistoryDeletesExactly(worktreePath: string, baseSha: unknown, paths: string[]): Promise<boolean> {
+  if (!Array.isArray(paths) || paths.length === 0) return false;
+  if (typeof baseSha !== 'string' || !/^[0-9a-f]{40}$/i.test(baseSha)) return false;
+  const ancestry = await runProcess({
+    command: 'git',
+    args: ['merge-base', '--is-ancestor', baseSha, 'HEAD'],
+    cwd: worktreePath,
+    timeoutMs: 20_000,
+  });
+  if (ancestry.exitCode !== 0) return false;
+  const counted = await runProcess({
+    command: 'git',
+    args: ['rev-list', '--count', `${baseSha}..HEAD`],
+    cwd: worktreePath,
+    timeoutMs: 20_000,
+  });
+  if (counted.exitCode !== 0) return false;
+  const commitCount = Number.parseInt(counted.stdout.trim(), 10);
+  if (!Number.isInteger(commitCount) || commitCount < 1 || commitCount > GIT_RM_HISTORY_COMMIT_LIMIT) return false;
+  // Net guard: no path outside the grant may be deleted between baseSha and
+  // HEAD, and a granted path may not be re-added (restored) at HEAD. A
+  // granted path that was added after baseSha and then removed nets out to
+  // no entry at all, which is accepted — the per-commit scan below carries
+  // the deletion evidence. Unmerged/combined statuses are multi-letter and
+  // simply never match the ordinary 'M'/'A' comparison.
+  const netReceipt = await runProcess({
+    command: 'git',
+    args: ['diff', '--no-renames', '-z', '--name-status', baseSha, 'HEAD'],
+    cwd: worktreePath,
+    timeoutMs: 20_000,
+  });
+  if (netReceipt.exitCode !== 0) return false;
+  const netTokens = netReceipt.stdout.split('\0');
+  for (let index = 0; index + 1 < netTokens.length; index += 2) {
+    const status = netTokens[index]!.trim();
+    const file = netTokens[index + 1]!;
+    if (paths.includes(file) ? status === 'A' : status !== 'M' && status !== 'A') return false;
+  }
+  // Enumerate commits after baseSha, newest first, and accept the history
+  // when one commit deletes all and only the granted paths.
+  const listed = await runProcess({
+    command: 'git',
+    args: ['rev-list', `${baseSha}..HEAD`],
+    cwd: worktreePath,
+    timeoutMs: 20_000,
+  });
+  if (listed.exitCode !== 0) return false;
+  const commits = listed.stdout.trim().split('\n').filter((line) => line.length > 0);
+  if (commits.length !== commitCount) return false;
+  for (const commit of commits) {
+    const treeReceipt = await runProcess({
+      command: 'git',
+      args: ['diff-tree', '-r', '-z', '--name-status', '--no-renames', commit],
+      cwd: worktreePath,
+      timeoutMs: 20_000,
+    });
+    if (treeReceipt.exitCode !== 0) return false;
+    const tokens = treeReceipt.stdout.split('\0');
+    // `diff-tree -z` echoes the commit id as the first NUL-terminated token,
+    // followed by <status NUL path NUL> pairs.
+    let index = 0;
+    if (/^[0-9a-f]{40}$/i.test(tokens[0] ?? '')) index = 1;
+    let qualifies = true;
+    const deleted: string[] = [];
+    for (; index + 1 < tokens.length; index += 2) {
+      const status = tokens[index]!.trim();
+      const file = tokens[index + 1]!;
+      if (status === 'D') deleted.push(file);
+      else if (status !== 'M' && status !== 'A') {
+        qualifies = false;
+        break;
+      }
+    }
+    if (qualifies && deleted.length === paths.length && deleted.every((file) => paths.includes(file))) return true;
+  }
+  return false;
+}
+
 /**
  * Trusted-controller preflight for the exact operator-approved tracked-file
  * deletion, run before the Qwen implementation session in the task's own
@@ -1673,7 +1781,14 @@ export function resolveAuthorizedGitRmGrant(
  * recognized as the controller's own completed work and the event is
  * recorded. Any other drift fails closed. Reentry with a recorded
  * application neither requires the deleted files to exist nor reruns the
- * deletion. Returns the removed paths, or null when no valid grant exists.
+ * deletion: it accepts either the exact staged deletions still standing or
+ * the exact authorized deletion committed into the branch history between
+ * the task's immutable baseSha and HEAD (validated by read-only per-commit
+ * verification; the deletions may sit in an ancestor commit, and the granted
+ * paths may even have been added after baseSha by an earlier attempt and
+ * removed by the committed deletion, so a net diff alone cannot see them;
+ * unrelated tracked drift still fails closed). Returns
+ * the removed paths, or null when no valid grant exists.
  */
 export async function applyAuthorizedGitRmPreflight(
   deps: GitRmPreflightDeps,
@@ -1691,15 +1806,26 @@ export async function applyAuthorizedGitRmPreflight(
     .find((event) => event.taskId === task.id && event.idempotencyKey === key &&
       event.payload.contractHash === contractHash);
   if (applied && Array.isArray(applied.payload.paths)) {
-    // Reentry: the audited removal already ran. Verify its exact staged
-    // result still exists, then continue without rerunning the deletion.
+    // Reentry: the audited removal already ran. Either its exact staged
+    // result still exists, or the exact authorized deletion is committed in
+    // the baseSha..HEAD branch history (possibly in an ancestor commit; the
+    // granted paths may have been added after baseSha by an earlier attempt,
+    // so the deletion is verified per-commit rather than by a net diff);
+    // anything else fails closed.
     const entries = await deps.git.trackedCandidates(worktreePath);
     const statusByPath = new Map(entries.map((entry) => [entry.path, entry.status]));
-    if (!isDeepStrictEqual(applied.payload.paths, grant.paths) ||
-        grant.paths.some((file) => statusByPath.get(file) !== STAGED_DELETION_STATUS ||
-          existsSync(path.join(worktreePath, file))) ||
-        entries.some((entry) => !grant.paths.includes(entry.path) && !isOrdinaryTrackedModification(entry.status))) {
-      throw new Error('Operator-authorized tracked-file removal changed after its application event');
+    const stagedResultIntact = isDeepStrictEqual(applied.payload.paths, grant.paths) &&
+      grant.paths.every((file) => statusByPath.get(file) === STAGED_DELETION_STATUS &&
+        !existsSync(path.join(worktreePath, file))) &&
+      entries.every((entry) => grant.paths.includes(entry.path) || isOrdinaryTrackedModification(entry.status));
+    if (!stagedResultIntact) {
+      const committedSinceBase = isDeepStrictEqual(applied.payload.paths, grant.paths) &&
+        await branchHistoryDeletesExactly(worktreePath, task.baseSha, grant.paths) &&
+        grant.paths.every((file) => !existsSync(path.join(worktreePath, file))) &&
+        entries.every((entry) => grant.paths.includes(entry.path) || isOrdinaryTrackedModification(entry.status));
+      if (!committedSinceBase) {
+        throw new Error('Operator-authorized tracked-file removal changed after its application event');
+      }
     }
     return [...(applied.payload.paths as string[])];
   }
