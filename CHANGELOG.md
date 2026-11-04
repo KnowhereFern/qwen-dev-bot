@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.93] - 2026-11-04
+
+- Include the gate receipt reason in failed candidate re-verification feedback, so source drift after passing checks is actionable.
+
 ## [1.0.0-rc.92] - 2026-11-04
 
 - Tell independent reviewers to submit verdicts through Qwen's required structured output tool.
