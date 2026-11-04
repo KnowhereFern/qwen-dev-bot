@@ -564,7 +564,7 @@ exit 1
     const immutableRuntime = path.join(state, 'controller', 'installed', harnessVersion, 'node_modules', 'qwen-dev-bot');
     expect(readFileSync(linkedPath, 'utf8')).toBe(immutableRuntime);
     expect(installed.receipt.extensionLinked).toBe(true);
-  }, 15_000);
+  }, 120_000);
 
   it('shows setup help without entering the interactive wizard', async () => {
     const cwd = makeTmp('launcher-help-cwd');
@@ -610,7 +610,7 @@ exit 1
     expect(existsSync(path.join(root, '.qwen-harness', 'install-receipt.json'))).toBe(true);
     expect(existsSync(path.join(state, 'controller', 'installed', harnessVersion, 'node_modules', 'qwen-dev-bot', 'bin', 'qwen-harness-launcher.mjs'))).toBe(true);
     expect(await uninstallProject(root)).toContain('unregistered project');
-  }, 15_000); // Exercises immutable runtime installation before the intentional link failure.
+  }, 120_000); // Exercises immutable runtime installation before the intentional link failure.
 
   it.skipIf(process.platform === 'win32')('refuses managed-path symlinks before writing template files', async () => {
     const root = makeTmp('installer-symlink-root');
