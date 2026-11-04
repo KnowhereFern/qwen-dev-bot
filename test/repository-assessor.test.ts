@@ -65,6 +65,29 @@ class UnsupportedEvidenceModel implements PortfolioPlanningModel {
   }
 }
 
+class DuplicateDetailModel implements PortfolioPlanningModel {
+  coverageAttempts = 0;
+  constructor(private readonly prior: ObjectiveCoverage, private readonly alwaysDuplicate = false, private readonly distinctAction = false, private readonly exactDuplicate = false) {}
+
+  async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]): Promise<{ value: T }> {
+    if (input.jsonSchema?.name === 'repository_analysis') {
+      return { value: { summary: 'Reviewed', findings: [], risks: [] } as T };
+    }
+    this.coverageAttempts += 1;
+    const old = { ...this.prior, status: 'partial', requiredAction: 'implement', rationale: 'XML import remains missing', evidence: [] };
+    const duplicate = {
+      id: this.distinctAction ? 'BLOCK-EXPORT' : 'XML-BLOCK-IMPORT',
+      requirement: this.distinctAction
+        ? 'An administrator can export a Skill Block file (JSON/XML) from the Registry without agent restart.'
+        : this.exactDuplicate
+          ? 'An administrator can import a Skill Block file (JSON/XML) into the Registry without agent restart.'
+        : 'Administrator can import a Skill Block file in XML format into the Registry without agent restart, with the same four-component schema validation as JSON import.',
+      status: 'missing', requiredAction: 'implement', rationale: 'XML import missing', evidence: [],
+    };
+    return { value: { coverage: this.alwaysDuplicate || this.coverageAttempts === 1 ? [old, duplicate] : [old] } as T };
+  }
+}
+
 class ImplementedCoverageModel implements PortfolioPlanningModel {
   calls = 0;
   constructor(private readonly evidence: Array<{ kind: 'file' | 'test'; locator: string; summary: string }>) {}
@@ -129,8 +152,8 @@ describe('RepositoryAssessor', () => {
     expect(model.prompts[4]).toContain('preserve every existing id and requirement text verbatim');
     expect(model.inputs[4]).toContain('<prior-coverage>[{"id":"HEALTH","requirement":"Expose health"}]</prior-coverage>');
     expect(assessment.coverage[0]).toMatchObject({ id: 'HEALTH', requirement: 'Expose health', status: 'unverified' });
-    const extended = await new RepositoryAssessor(config, coverageIdsModel(['HEALTH', 'NEW-HEALTH-CHECK'])).assess(
-      { sourcePath: 'PROJECT.md', content: 'Expose health.' }, undefined, [], undefined, undefined, priorCoverage,
+    const extended = await new RepositoryAssessor(config, coverageIdsModel(['HEALTH', 'NEW-HEALTH-CHECK'], 'Expose health', { 'NEW-HEALTH-CHECK': 'Expose a separate readiness check' })).assess(
+      { sourcePath: 'PROJECT.md', content: 'Expose health.\n- Acceptance: Expose a separate readiness check' }, undefined, [], undefined, undefined, priorCoverage,
     );
     expect(extended.coverage.map((entry) => entry.id)).toEqual(['HEALTH', 'NEW-HEALTH-CHECK']);
   });
@@ -345,6 +368,46 @@ describe('RepositoryAssessor', () => {
     expect(snapshot.files).not.toContain('.env');
     expect(snapshot.excerpts.reduce((total, entry) => total + Buffer.byteLength(entry.content), 0))
       .toBeLessThanOrEqual(config.program.maxAssessmentBytes);
+  });
+
+  it('keeps newly found XML import work inside the existing static-import coverage identity', async () => {
+    const root = gitRepo();
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.enabled = true;
+    const prior: ObjectiveCoverage = {
+      id: 'STATIC-BLOCK-IMPORT',
+      requirement: 'Prebuilt (static) Skill Blocks loaded into the Registry at initialization from manual curation or external datasets. An administrator can import a Skill Block file (JSON/XML) into the Registry without agent restart. Imported blocks pass schema validation requiring Schema, Procedural Steps, Key Variables, and Minimal Context fields.',
+      status: 'implemented', requiredAction: 'none', rationale: 'Earlier assessment', evidence: [],
+    };
+    const model = new DuplicateDetailModel(prior);
+    const assessment = await new RepositoryAssessor(config, model).assess(
+      { sourcePath: 'PROJECT.md', content: 'An administrator can import a Skill Block file (JSON/XML) into the Registry without agent restart.' },
+      undefined, [], undefined, undefined, [prior],
+    );
+    expect(model.coverageAttempts).toBe(2);
+    expect(assessment.coverage).toHaveLength(1);
+    expect(assessment.coverage[0]).toMatchObject({ id: prior.id, status: 'partial', requiredAction: 'implement' });
+
+    const stubborn = new DuplicateDetailModel(prior, true);
+    await expect(new RepositoryAssessor(config, stubborn).assess(
+      { sourcePath: 'PROJECT.md', content: 'An administrator can import a Skill Block file (JSON/XML) into the Registry without agent restart.' },
+      undefined, [], undefined, undefined, [prior],
+    )).rejects.toThrow(/repeats a detail of STATIC-BLOCK-IMPORT/);
+    expect(stubborn.coverageAttempts).toBe(2);
+
+    const exact = new DuplicateDetailModel(prior, true, false, true);
+    await expect(new RepositoryAssessor(config, exact).assess(
+      { sourcePath: 'PROJECT.md', content: '- Acceptance: An administrator can import a Skill Block file (JSON/XML) into the Registry without agent restart.' },
+      undefined, [], undefined, undefined, [prior],
+    )).rejects.toThrow(/repeats a detail of STATIC-BLOCK-IMPORT/);
+
+    const distinct = new DuplicateDetailModel(prior, true, true);
+    const sibling = await new RepositoryAssessor(config, distinct).assess(
+      { sourcePath: 'PROJECT.md', content: '- Acceptance: An administrator can import a Skill Block file (JSON/XML) into the Registry without agent restart.\n- Acceptance: An administrator can export a Skill Block file (JSON/XML) from the Registry without agent restart.' },
+      undefined, [], undefined, undefined, [prior],
+    );
+    expect(distinct.coverageAttempts).toBe(1);
+    expect(sibling.coverage.map((entry) => entry.id)).toEqual([prior.id, 'BLOCK-EXPORT']);
   });
 
   it('rejects invented deployment evidence and stale git evidence', async () => {
@@ -584,11 +647,11 @@ function coverageResponse<T>(input: Parameters<PortfolioPlanningModel['completeJ
   return { value: value as T };
 }
 
-function coverageIdsModel(ids: string[], requirement = 'Expose health'): PortfolioPlanningModel {
+function coverageIdsModel(ids: string[], requirement = 'Expose health', newRequirements: Record<string, string> = {}): PortfolioPlanningModel {
   return { async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]) {
     return { value: (input.jsonSchema?.name === 'objective_coverage'
       ? { coverage: ids.map((id) => ({
-          id, requirement, status: 'missing', requiredAction: 'implement', rationale: 'Not implemented', evidence: [],
+          id, requirement: newRequirements[id] ?? requirement, status: 'missing', requiredAction: 'implement', rationale: 'Not implemented', evidence: [],
         })) }
       : { summary: 'Reviewed', findings: [], risks: [] }) as T };
   } };

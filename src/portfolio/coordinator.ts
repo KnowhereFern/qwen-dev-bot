@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { PersistentTaskStore } from '../core/persistent-store.js';
+import { isDetailOfPriorRequirement, isExactApprovedRequirement } from '../core/objective-identity.js';
 import type {
   ApprovedProgramContract,
   PortfolioPlan,
@@ -488,7 +489,11 @@ export class PortfolioCoordinator {
         const requirement = identity(entries[0]!.requirement);
         const meanings = historicalIds.get(id);
         if (meanings && (meanings.size !== 1 || !meanings.has(requirement))) reject([story.key], `Coverage ${id} changes an existing requirement identity; preserve it before revising ${story.key}.`);
-        if (failedIssues.length && !established.has(requirement) && !material) reject([story.key], `Story ${story.key} has an unrecognized requirement identity; preserve established wording or request a material revision.`);
+        if (failedIssues.length && !established.has(requirement) && !material &&
+            (!isExactApprovedRequirement(entries[0]!.requirement, current.sourceContent ?? '') ||
+             isDetailOfPriorRequirement(entries[0]!.requirement, [...established]))) {
+          reject([story.key], `Story ${story.key} has an unrecognized requirement identity; preserve established wording or request a material revision.`);
+        }
         matches.push(...(latest.get(requirement) ?? []).filter(({ task }) => failed(task)).map(({ task }) => task));
       }
       const lineages = new Set(matches.map((task) => task.failureLineageId ?? task.id));

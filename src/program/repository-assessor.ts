@@ -12,6 +12,7 @@ import type {
   StructuredOutputSchema,
 } from '../core/types.js';
 import { redactText } from '../core/ledger.js';
+import { isDetailOfPriorRequirement, isExactApprovedRequirement } from '../core/objective-identity.js';
 import { projectIdFor } from '../core/state-paths.js';
 import { runProcess } from '../runtime/safe-process.js';
 import type { PortfolioPlanningModel, RequirementsDocument } from '../portfolio/planner.js';
@@ -185,8 +186,9 @@ export class RepositoryAssessor {
       system: [
         'Map every distinct target-product acceptance requirement in the supplied objective to repository evidence.',
         'Harness specification approval is a planning-stage prerequisite, not a missing target-product feature. Do not create product coverage for approving this plan or specification. A harness-spec: identifier is not a repository file and cannot serve as file or test evidence.',
-        ...(priorCoverage.length ? ['The supplied prior-coverage entries are frozen requirement identities: preserve every existing id and requirement text verbatim while updating status, requiredAction, rationale and evidence. Never omit, rename, merge or reinterpret an existing requirement. You may add newly identified requirements with new unique IDs within the objective.'] : []),
-        'Split compound requirements into independently testable behaviors, especially when some parts exist and others are missing. Do not let an implemented sub-capability hide an incomplete pickup, exception, settlement, recovery, or operational outcome.',
+        ...(priorCoverage.length
+          ? ['The supplied prior-coverage entries are frozen requirement identities: preserve every existing id and requirement text verbatim while updating status, requiredAction, rationale and evidence. Never omit, rename, merge or reinterpret an existing requirement. If a newly discovered missing behavior is already named within an existing requirement, mark that existing entry partial or missing; do not mint a duplicate ID for its subbehavior. A genuinely new ID must copy one complete acceptance line verbatim from the frozen objective.']
+          : ['Split compound requirements into independently testable behaviors, especially when some parts exist and others are missing. Do not let an implemented sub-capability hide an incomplete pickup, exception, settlement, recovery, or operational outcome.']),
         'Separate target-product behavior from harness-owned proof obligations. Issue/PR/deployment recovery, program revisions, evidence export, controller history, and maintenance observation are operational proof obligations, not missing target-product modules. Include them as unverified/operate coverage only when the objective makes them part of target acceptance; assess product charges, messages, and state-transition idempotency separately.',
         'If the objective explicitly places harness validation on a separate track outside product acceptance, do not add that track as target-product coverage or work. Track separation does not waive the separate proof. Maintenance observation belongs to that track when the objective says so.',
         'Missing credentials or missing runtime evidence alone do not make existing product code partial or missing. Split missing product behavior (implement) from missing provider access (external) and missing live verification (operate/verify). Do not require rebuilding working adapters, templates or lazy widgets solely because they are unconfigured.',
@@ -212,15 +214,11 @@ export class RepositoryAssessor {
         `<review-feedback>${JSON.stringify(reviewFeedback ?? '')}</review-feedback>`,
         ...(priorCoverage.length ? [`<prior-coverage>${JSON.stringify(priorCoverage.map(({ id, requirement }) => ({ id, requirement })))}</prior-coverage>`] : []),
       ].join('\n'),
-    }, (value) => validateCoverage(value, evidenceContext));
-    for (const prior of priorCoverage) {
-      const current = coverage.find((entry) => entry.id === prior.id);
-      if (!current) throw new AssessmentContractError(`Reassessment omitted existing coverage id ${prior.id}`);
-      const normalize = (text: string) => text.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
-      if (normalize(current.requirement) !== normalize(prior.requirement)) {
-        throw new AssessmentContractError(`Reassessment changed existing requirement for coverage id ${prior.id}`);
-      }
-    }
+    }, (value) => {
+      const proposed = validateCoverage(value, evidenceContext);
+      validatePriorCoverage(proposed, priorCoverage, document.content);
+      return proposed;
+    });
     const createdAt = Date.now();
     const id = `assessment_${sha256(`${projectIdFor(this.config)}:${snapshot.commitSha}:${sha256(document.content)}:${createdAt}`).slice(0, 20)}`;
     return {
@@ -522,6 +520,27 @@ function validateCoverage(value: unknown, context: EvidenceValidationContext): O
       evidence,
     };
   });
+}
+
+function validatePriorCoverage(coverage: ObjectiveCoverage[], priorCoverage: ObjectiveCoverage[], sourceContent: string): void {
+  if (!priorCoverage.length) return;
+  const normalizeStable = (value: string): string => value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+  const priorIds = new Set(priorCoverage.map((entry) => entry.id));
+  for (const prior of priorCoverage) {
+    const current = coverage.find((entry) => entry.id === prior.id);
+    if (!current) throw new AssessmentContractError(`Reassessment omitted existing coverage id ${prior.id}`);
+    if (normalizeStable(current.requirement) !== normalizeStable(prior.requirement)) {
+      throw new AssessmentContractError(`Reassessment changed existing requirement for coverage id ${prior.id}`);
+    }
+  }
+  for (const entry of coverage) {
+    if (priorIds.has(entry.id)) continue;
+    const duplicate = priorCoverage.find((prior) => isDetailOfPriorRequirement(entry.requirement, [prior.requirement]));
+    if (duplicate) throw new AssessmentContractError(`New coverage ${entry.id} repeats a detail of ${duplicate.id}; update ${duplicate.id} status and evidence instead of creating a duplicate requirement`);
+    if (!isExactApprovedRequirement(entry.requirement, sourceContent)) {
+      throw new AssessmentContractError(`New coverage ${entry.id} must copy one complete acceptance line from the frozen objective, or update an existing coverage identity for a subbehavior`);
+    }
+  }
 }
 
 function validateCoverageAction(value: unknown, status: CapabilityStatus, id: string): CoverageAction {
