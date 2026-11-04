@@ -417,6 +417,84 @@ describe('trusted-controller git rm preflight', () => {
     store.close();
   }, 60_000);
 
+  it('allows reentry when the grant deletions are committed in an ancestor and HEAD only carries ordinary M', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-head-commit');
+    authorize(store, task, ['README.md', 'check.mjs']);
+    await preflight();
+    // The staged deletion was committed (crash or retry after a candidate
+    // commit), and a later repair created a further commit that only
+    // modifies a test: the deletion sits in an ancestor while HEAD is an
+    // ordinary M. Reentry must verify the baseSha..HEAD branch history
+    // commit by commit, not the HEAD commit alone, and must not rerun
+    // git rm.
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'apply authorized removal'], cwd: worktree, timeoutMs: 20_000 });
+    writeFileSync(path.join(worktree, 'AUTONOMY.md'), '# repair note\n');
+    await runProcess({ command: 'git', args: ['add', '--', 'AUTONOMY.md'], cwd: worktree, timeoutMs: 20_000 });
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'repair: touch doc'], cwd: worktree, timeoutMs: 20_000 });
+    expect(existsSync(path.join(worktree, 'README.md'))).toBe(false);
+    await expect(preflight()).resolves.toEqual(['README.md', 'check.mjs']);
+    expect(appliedEvents(store)).toHaveLength(1);
+    // Still idempotent on a further reentry against the same HEAD.
+    await expect(preflight()).resolves.toEqual(['README.md', 'check.mjs']);
+    expect(appliedEvents(store)).toHaveLength(1);
+    // A missing baseSha removes the immutable lower bound: fail closed.
+    const unbound = store.patch(task.id, { baseSha: null });
+    await expect(preflight(unbound)).rejects.toThrow(/changed after its application event/);
+    // An untrusted baseSha that is not an ancestor of HEAD fails closed too.
+    const forked = await runProcess({ command: 'git', args: ['commit-tree', `HEAD^{tree}`, '-m', 'orphan'], cwd: worktree, timeoutMs: 20_000 });
+    const untrusted = store.patch(task.id, { baseSha: forked.stdout.trim() });
+    await expect(preflight(untrusted)).rejects.toThrow(/changed after its application event/);
+    store.close();
+  }, 60_000);
+
+  it('rejects reentry when a later commit restores an authorized path or deletes an extra path', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-head-drift');
+    authorize(store, task, ['check.mjs']);
+    await preflight();
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'apply authorized removal'], cwd: worktree, timeoutMs: 20_000 });
+
+    // An implementer restored an authorized path in a later commit: the
+    // restored file is back in the working tree and the branch history no
+    // longer ends without the granted path.
+    writeFileSync(path.join(worktree, 'check.mjs'), 'restored\n');
+    await runProcess({ command: 'git', args: ['add', '--', 'check.mjs'], cwd: worktree, timeoutMs: 20_000 });
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'restore file'], cwd: worktree, timeoutMs: 20_000 });
+    await expect(preflight()).rejects.toThrow(/changed after its application event/);
+    store.close();
+  }, 60_000);
+
+  it('allows reentry when HEAD commits the authorized deletions together with ordinary M/A changes', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-head-coexist');
+    authorize(store, task, ['check.mjs']);
+    await preflight();
+    // The controller's staged deletion was committed in the same HEAD commit
+    // as an ordinary modification of another tracked file and a new tracked
+    // file (real candidate commits pair the removal with unrelated work).
+    // Reentry must accept the committed removal without rerunning git rm.
+    writeFileSync(path.join(worktree, 'README.md'), '# fixture changed\n');
+    writeFileSync(path.join(worktree, 'notes.txt'), 'ordinary addition\n');
+    await runProcess({ command: 'git', args: ['add', '--', 'README.md', 'notes.txt'], cwd: worktree, timeoutMs: 20_000 });
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'controller: apply authorized removal with ordinary changes'], cwd: worktree, timeoutMs: 20_000 });
+    expect(existsSync(path.join(worktree, 'check.mjs'))).toBe(false);
+    await expect(preflight()).resolves.toEqual(['check.mjs']);
+    expect(appliedEvents(store)).toHaveLength(1);
+    store.close();
+  }, 60_000);
+
+  it('rejects reentry when a later commit deletes an extra path beyond the grant', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-head-mixed');
+    authorize(store, task, ['check.mjs']);
+    await preflight();
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'apply authorized removal'], cwd: worktree, timeoutMs: 20_000 });
+    // A later commit deletes a path outside the grant: the net baseSha..HEAD
+    // history now deletes more than authorized and must fail closed.
+    await runProcess({ command: 'git', args: ['rm', '-f', '--', 'README.md'], cwd: worktree, timeoutMs: 20_000 });
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'extra removal'], cwd: worktree, timeoutMs: 20_000 });
+    await expect(preflight()).rejects.toThrow(/changed after its application event/);
+    expect(appliedEvents(store)).toHaveLength(1);
+    store.close();
+  }, 60_000);
+
   it('rejects a grant if the supplied worktree is not the task worktree', async () => {
     const { store, task, worktree, preflight } = await setup('preflight-wrong-worktree');
     authorize(store, task, ['README.md']);
@@ -424,6 +502,47 @@ describe('trusted-controller git rm preflight', () => {
       .rejects.toThrow(/worktree does not match/);
     expect(existsSync(path.join(worktree, 'README.md'))).toBe(true);
     expect(appliedEvents(store)).toHaveLength(0);
+    store.close();
+  }, 60_000);
+
+  it('allows reentry when the granted path was added after baseSha, removed by a committed controller deletion, and followed by an ordinary repair commit', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-added-after-base');
+    // An earlier task attempt introduced the path after baseSha; a saved
+    // real task had exactly this shape, where the net baseSha..HEAD diff
+    // shows no deletion at all (the addition and removal cancel out).
+    writeFileSync(path.join(worktree, 'generated-report.md'), 'attempt output\n');
+    await runProcess({ command: 'git', args: ['add', '--', 'generated-report.md'], cwd: worktree, timeoutMs: 20_000 });
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'attempt adds generated report'], cwd: worktree, timeoutMs: 20_000 });
+
+    authorize(store, task, ['generated-report.md']);
+    await preflight();
+    // The controller's staged removal is committed together with an ordinary
+    // modification, then a further ordinary repair commit lands on top.
+    writeFileSync(path.join(worktree, 'AUTONOMY.md'), '# paired change\n');
+    await runProcess({ command: 'git', args: ['add', '--', 'AUTONOMY.md'], cwd: worktree, timeoutMs: 20_000 });
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'apply authorized removal with paired change'], cwd: worktree, timeoutMs: 20_000 });
+    writeFileSync(path.join(worktree, 'README.md'), '# repaired\n');
+    await runProcess({ command: 'git', args: ['add', '--', 'README.md'], cwd: worktree, timeoutMs: 20_000 });
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'repair: touch readme'], cwd: worktree, timeoutMs: 20_000 });
+
+    expect(existsSync(path.join(worktree, 'generated-report.md'))).toBe(false);
+    await expect(preflight()).resolves.toEqual(['generated-report.md']);
+    expect(appliedEvents(store)).toHaveLength(1);
+    store.close();
+  }, 60_000);
+
+  it('rejects reentry when the removal commit itself also deletes an extra path beyond the grant', async () => {
+    const { store, task, worktree, preflight } = await setup('preflight-extra-in-commit');
+    authorize(store, task, ['check.mjs']);
+    await preflight();
+    // The commit carrying the authorized deletion also removes a path
+    // outside the grant: no single commit deletes all and only the granted
+    // paths, and the net diff still deletes the extra path. Fail closed.
+    await runProcess({ command: 'git', args: ['rm', '-f', '--', 'README.md'], cwd: worktree, timeoutMs: 20_000 });
+    await runProcess({ command: 'git', args: ['commit', '--no-gpg-sign', '-m', 'removal with extra deletion'], cwd: worktree, timeoutMs: 20_000 });
+    expect(existsSync(path.join(worktree, 'README.md'))).toBe(false);
+    await expect(preflight()).rejects.toThrow(/changed after its application event/);
+    expect(appliedEvents(store)).toHaveLength(1);
     store.close();
   }, 60_000);
 });

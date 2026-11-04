@@ -1,4 +1,4 @@
-import { lstatSync, mkdirSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
@@ -803,6 +803,71 @@ export class PersistentTaskStore {
         this.insertEvent(event);
         result = { recoveryAuthorizationId: String(event.payload.recoveryAuthorizationId), contractHash };
       }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    if (event) this.ledger.append(event);
+    return result;
+  }
+
+  /**
+   * Record an append-only operator feedback event for an unleased ready task
+   * with remaining retry budget and an existing worktree. Patches lastError so
+   * the next repair prompt carries the finding; never resets or creates
+   * attempts and never changes the contract, history, or permissions.
+   */
+  recordOperatorFeedback(
+    id: string,
+    feedback: { authorizationId: string; authorizedBy: string; reason: string },
+    now = Date.now(),
+  ): TaskRecord {
+    if ([feedback.authorizationId, feedback.authorizedBy, feedback.reason].some((value) => typeof value !== 'string' || !value.trim())) {
+      throw new Error('Operator feedback requires a named authorization, author, and reason');
+    }
+    const reason = redactText(feedback.reason).trim();
+    const key = `task:feedback:${feedback.authorizationId}`;
+    let event: HarnessEvent | undefined;
+    let result: TaskRecord;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const prior = this.listEvents('task.operator_feedback').find((entry) => entry.idempotencyKey === key);
+      const current = this.get(id);
+      const contractHash = createHash('sha256').update(JSON.stringify(current.spec)).digest('hex');
+      const binding = createHash('sha256').update(JSON.stringify({
+        id,
+        issueNumber: current.issueNumber,
+        authorizationId: feedback.authorizationId,
+        authorizedBy: redactText(feedback.authorizedBy),
+        reason,
+        contractHash,
+      })).digest('hex');
+      if (prior) {
+        if (prior.payload.binding !== binding) throw new Error('Operator feedback authorization conflicts with its original binding');
+        this.db.exec('COMMIT');
+        return current;
+      }
+      if (current.state !== 'ready' || current.leaseOwner !== null || current.leaseExpiresAt !== null) {
+        throw new Error(`Operator feedback requires an unleased ready task, not ${current.state}`);
+      }
+      if (current.mergeSha) throw new Error('Merged tasks are not eligible for operator feedback');
+      const budget = this.failureBudget(current);
+      if (budget.failures >= budget.limit) throw new Error('Operator feedback requires remaining retry budget');
+      if (!current.worktreePath || !existsSync(current.worktreePath)) throw new Error('Operator feedback requires an existing task worktree');
+      result = this.patch(id, { lastError: `Operator feedback (${feedback.authorizationId}): ${reason}` }, now);
+      event = this.makeEvent('task.operator_feedback', id, {
+        binding,
+        authorizationId: feedback.authorizationId,
+        authorizedBy: redactText(feedback.authorizedBy),
+        reason,
+        issueNumber: current.issueNumber,
+        attempts: current.attempts,
+        maxAttempts: current.maxAttempts,
+        contractHash,
+        priorVersion: current.version,
+      }, key);
+      this.insertEvent(event);
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
