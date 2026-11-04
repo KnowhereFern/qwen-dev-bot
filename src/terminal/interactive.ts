@@ -11,7 +11,12 @@ import { createTerminalIO } from './presentation.js';
 import { formatLiveStatus, readWorkerStatus } from './status.js';
 import type { WorkerStatus } from './status.js';
 import { resolveQwenCredential, qwenCredentialCompatibilityProblem } from '../qwen/credential-resolver.js';
-import { DEFAULT_QWEN_BASE_URL, TOKEN_PLAN_QWEN_BASE_URL } from '../qwen/runtime-compat.js';
+import { DEFAULT_QWEN_BASE_URL, QWEN_HARNESS_MODEL, TOKEN_PLAN_QWEN_BASE_URL } from '../qwen/runtime-compat.js';
+import {
+  OPENROUTER_CROUTON_BASE_URL,
+  OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
+  OPENROUTER_CROUTON_MODEL,
+} from '../qwen/openrouter-route.js';
 import { saveUserModelCredential } from './model-connection.js';
 import { format } from 'node:util';
 import { spawn } from 'node:child_process';
@@ -408,21 +413,36 @@ export async function runInteractiveTerminal(options: {
     io.print(`\nMODEL CONNECTION\n${context}`);
     const action = await choose('Model connection', ['Configure provider / endpoint', 'Add or replace credential (hidden input)', 'Verify live model connection'], 'Connection: ', context);
     if (action === '1') {
-      const route = await choose('Provider route', ['Standard API', 'Token Plan Personal', 'Token Plan Team', 'Custom compatible endpoint'], 'Provider route (Enter cancels): ');
-      const billing = ({ '1': 'standard', '2': 'token-plan-personal', '3': 'token-plan-team', '4': 'custom' } as Record<string, QwenBillingPlan>)[route ?? ''];
+      const route = await choose('Provider route', ['Standard API', 'Token Plan Personal', 'Token Plan Team', 'Custom compatible endpoint', 'Crouton — OpenRouter stealth/crouton-alpha (opt-in)'], 'Provider route (Enter cancels): ');
+      const billing = ({ '1': 'standard', '2': 'token-plan-personal', '3': 'token-plan-team', '4': 'custom', '5': 'custom' } as Record<string, QwenBillingPlan>)[route ?? ''];
       if (!billing) return;
+      if (route === '5') {
+        // The Crouton route is exact: model, endpoint, credential key, and
+        // billing are pinned and shown explicitly before anything is saved.
+        io.print(`Crouton route (opt-in)\nModel: ${OPENROUTER_CROUTON_MODEL}\nEndpoint: ${OPENROUTER_CROUTON_BASE_URL}\nCredential: ${OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY} (OpenRouter API key)\nBilling: custom`);
+        io.print('Requests and the configured credential go to OpenRouter. This changes only the execution connection, not the product stack, approved objective, or deployment authority. No subscription is purchased.');
+        if (!await confirm('Switch to the Crouton route', `Model requests will use ${OPENROUTER_CROUTON_MODEL} at ${OPENROUTER_CROUTON_BASE_URL} with ${OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY}. No worker is started.`)) return;
+        await execute(['update', root!, '--model', OPENROUTER_CROUTON_MODEL, '--billing-plan', 'custom', '--base-url', OPENROUTER_CROUTON_BASE_URL, '--api-key-env', OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY, '--no-service', '--skip-dependencies']);
+        verifiedConnection = undefined;
+        return;
+      }
       const suggested = billing.startsWith('token-plan-') ? TOKEN_PLAN_QWEN_BASE_URL : billing === 'standard' ? DEFAULT_QWEN_BASE_URL : config.qwen.baseUrl;
       const endpoint = (await io.question(`Endpoint [${suggested}]: `))?.trim();
       if (endpoint === undefined) return;
       const url = new URL(endpoint || suggested);
       if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) throw new Error('Use an HTTPS endpoint without embedded credentials, query parameters, or fragments.');
-      const env = (await io.question(`Credential environment name [${billing.startsWith('token-plan-') ? 'BAILIAN_TOKEN_PLAN_API_KEY' : config.qwen.credentialEnvKey}]: `))?.trim();
+      // Leaving the Crouton route for a Qwen billing plan restores the default
+      // Qwen credential suggestion alongside the default Qwen model.
+      const qwenCredential = config.qwen.model === QWEN_HARNESS_MODEL ? config.qwen.credentialEnvKey : 'DASHSCOPE_API_KEY';
+      const env = (await io.question(`Credential environment name [${billing.startsWith('token-plan-') ? 'BAILIAN_TOKEN_PLAN_API_KEY' : qwenCredential}]: `))?.trim();
       if (env === undefined) return;
-      const envKey = env || (billing.startsWith('token-plan-') ? 'BAILIAN_TOKEN_PLAN_API_KEY' : config.qwen.credentialEnvKey);
+      const envKey = env || (billing.startsWith('token-plan-') ? 'BAILIAN_TOKEN_PLAN_API_KEY' : qwenCredential);
       if (!/^[A-Z_][A-Z0-9_]*$/.test(envKey)) throw new Error('Use an uppercase environment variable name, not a key.');
       io.print(`Model requests and the configured credential will be sent to ${url.origin}. This changes only the execution connection, not the model, product stack, approved objective, or deployment authority. An existing worker reads it on a later cycle. No subscription is purchased.`);
       if (!await confirm('Save model connection', `Model requests and credentials will be sent to ${url.origin}. No worker is started.`)) return;
-      await execute(['update', root!, '--billing-plan', billing, '--base-url', url.toString().replace(/\/$/, ''), '--api-key-env', envKey, '--no-service', '--skip-dependencies']);
+      // Selecting a Qwen billing route restores the default Qwen model whenever
+      // the project currently runs the opt-in Crouton route.
+      await execute(['update', root!, ...(config.qwen.model !== QWEN_HARNESS_MODEL ? ['--model', QWEN_HARNESS_MODEL] : []), '--billing-plan', billing, '--base-url', url.toString().replace(/\/$/, ''), '--api-key-env', envKey, '--no-service', '--skip-dependencies']);
       verifiedConnection = undefined;
     } else if (action === '2') {
       if (!io.secret) throw new Error('Hidden credential input is unavailable. Configure the named environment variable through your credential manager.');
@@ -438,7 +458,7 @@ export async function runInteractiveTerminal(options: {
       const effective = credential(config);
       io.print(effective && effective.apiKey !== secret ? `Key saved, but ${effective.source} currently takes precedence. Resolve that source before verification; no active worker credential was replaced.` : 'Key saved. Verify the connection explicitly next.');
     } else if (action === '3') {
-      if (await confirm('Test model connection', 'Make a small live Qwen request using your provider plan.')) {
+      if (await confirm('Test model connection', `Make a small live ${config.qwen.model} request using your provider plan.`)) {
         await execute(['verify', root!]);
         const key = credential(config);
         if (key) verifiedConnection = { root: root!, model: config.qwen.model, endpoint: config.qwen.baseUrl, envKey: config.qwen.credentialEnvKey, apiKey: key.apiKey };

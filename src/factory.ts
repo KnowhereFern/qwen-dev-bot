@@ -87,6 +87,7 @@ export async function createProductionHarness(
         model: config.qwen.model,
         baseUrl: config.qwen.baseUrl,
         credentialEnvKey: config.qwen.credentialEnvKey,
+        billingPlan: config.qwen.billingPlan,
         apiKey: credential?.apiKey,
         quotaHold,
         usageLedger,

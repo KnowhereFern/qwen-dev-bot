@@ -32,6 +32,7 @@ import { runProcess } from '../runtime/safe-process.js';
 import {
   DEFAULT_QWEN_BASE_URL,
   MIN_QWEN_CODE_VERSION,
+  QWEN_HARNESS_MODEL,
   QWEN_MM_CORE_MCP_SERVER,
   TOKEN_PLAN_QWEN_BASE_URL,
   detectedQwenCodeVersion,
@@ -39,6 +40,12 @@ import {
   qwenMmCoreCheckArgs,
   qwenMmCoreInstallArgs,
 } from '../qwen/runtime-compat.js';
+import {
+  OPENROUTER_CROUTON_BASE_URL,
+  OPENROUTER_CROUTON_BILLING_PLAN,
+  OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
+  OPENROUTER_CROUTON_MODEL,
+} from '../qwen/openrouter-route.js';
 import { resolveQwenCredential } from '../qwen/credential-resolver.js';
 import { installWorkerService, uninstallWorkerService, type ServiceReceipt } from './service.js';
 
@@ -46,6 +53,7 @@ export interface InstallAnswers {
   projectName: string;
   githubRepo: string;
   trustedAuthor: string;
+  qwenModel: string;
   qwenBaseUrl: string;
   qwenCredentialEnvKey: string;
   qwenBillingPlan: QwenBillingPlan;
@@ -118,6 +126,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
     projectName: existingConfig?.project.name ?? path.basename(root),
     githubRepo: detectedRepo,
     trustedAuthor: detectedAuthor,
+    qwenModel: existingConfig?.qwen.model ?? QWEN_HARNESS_MODEL,
     qwenBaseUrl:
       existingConfig?.qwen.baseUrl ??
       process.env.DASHSCOPE_BASE_URL ??
@@ -147,6 +156,41 @@ export async function installProject(options: InstallOptions): Promise<{ config:
     if (!supplied.qwenBaseUrl && options.yes) answers.qwenBaseUrl = TOKEN_PLAN_QWEN_BASE_URL;
     if (!supplied.qwenCredentialEnvKey && options.yes) answers.qwenCredentialEnvKey = 'BAILIAN_TOKEN_PLAN_API_KEY';
   }
+  // The OpenRouter Crouton route is exact: model, endpoint, credential key,
+  // and billing plan must all match. Omitted route fields default to the
+  // pinned OpenRouter constants, but an explicit conflicting value is rejected
+  // before any mutation — the installer never silently overrides it.
+  const croutonRoute = answers.qwenModel === OPENROUTER_CROUTON_MODEL;
+  if (croutonRoute) {
+    const explicitRouteAnswers = options.yes ? supplied : answers;
+    const conflicts: string[] = [];
+    if (
+      explicitRouteAnswers.qwenBaseUrl !== undefined &&
+      explicitRouteAnswers.qwenBaseUrl.replace(/\/+$/, '') !== OPENROUTER_CROUTON_BASE_URL
+    ) {
+      conflicts.push(`qwenBaseUrl=${explicitRouteAnswers.qwenBaseUrl}`);
+    }
+    if (
+      explicitRouteAnswers.qwenCredentialEnvKey !== undefined &&
+      explicitRouteAnswers.qwenCredentialEnvKey !== OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY
+    ) {
+      conflicts.push(`qwenCredentialEnvKey=${explicitRouteAnswers.qwenCredentialEnvKey}`);
+    }
+    if (
+      explicitRouteAnswers.qwenBillingPlan !== undefined &&
+      explicitRouteAnswers.qwenBillingPlan !== OPENROUTER_CROUTON_BILLING_PLAN
+    ) {
+      conflicts.push(`qwenBillingPlan=${explicitRouteAnswers.qwenBillingPlan}`);
+    }
+    if (conflicts.length > 0) {
+      throw new Error(
+        `The stealth/crouton-alpha model requires endpoint ${OPENROUTER_CROUTON_BASE_URL}, credential key ${OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY}, and billingPlan ${OPENROUTER_CROUTON_BILLING_PLAN}. Conflicting values: ${conflicts.join(', ')}. Omit them to accept the pinned OpenRouter route, or choose a different model.`,
+      );
+    }
+    answers.qwenBaseUrl = OPENROUTER_CROUTON_BASE_URL;
+    answers.qwenCredentialEnvKey = OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY;
+    answers.qwenBillingPlan = OPENROUTER_CROUTON_BILLING_PLAN;
+  }
   if (answers.installQwen && !options.dryRun) {
     const installed = await runProcess({
       command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
@@ -169,6 +213,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
   config.project.root = root;
   config.project.name = answers.projectName;
   config.project.githubRepo = answers.githubRepo;
+  config.qwen.model = answers.qwenModel;
   config.qwen.baseUrl = answers.qwenBaseUrl;
   config.qwen.credentialEnvKey = answers.qwenCredentialEnvKey;
   config.qwen.billingPlan = answers.qwenBillingPlan;
@@ -176,7 +221,7 @@ export async function installProject(options: InstallOptions): Promise<{ config:
   config.worker.autoMerge = answers.autoMerge;
   config.intake.communityEnabled = answers.enableCommunity;
   config.program.enabled = answers.enableProgram;
-  if (answers.enableProgram && config.configVersion === 1) config.configVersion = 2;
+  if ((answers.enableProgram || croutonRoute) && config.configVersion === 1) config.configVersion = 2;
   for (const protectedPath of defaultProjectConfig(root).protectedPaths) {
     if (!config.protectedPaths.includes(protectedPath)) config.protectedPaths.push(protectedPath);
   }
@@ -479,17 +524,22 @@ async function guidedAnswers(defaults: InstallAnswers): Promise<InstallAnswers> 
     const projectName = await ask('Project name', defaults.projectName);
     const githubRepo = await ask('GitHub repository (owner/name)', defaults.githubRepo);
     const trustedAuthor = await ask('Trusted GitHub automation/operator login', defaults.trustedAuthor);
-    const qwenBillingPlan = await chooseQwenBillingPlan(terminal, defaults.qwenBillingPlan);
-    const suggestedBaseUrl = qwenBillingPlan.startsWith('token-plan-')
+    const croutonDefault = defaults.qwenModel === OPENROUTER_CROUTON_MODEL;
+    const qwenBillingPlan = croutonDefault ? OPENROUTER_CROUTON_BILLING_PLAN : await chooseQwenBillingPlan(terminal, defaults.qwenBillingPlan);
+    const suggestedBaseUrl = croutonDefault
+      ? OPENROUTER_CROUTON_BASE_URL
+      : qwenBillingPlan.startsWith('token-plan-')
       ? TOKEN_PLAN_QWEN_BASE_URL
       : qwenBillingPlan === 'standard'
         ? DEFAULT_QWEN_BASE_URL
         : defaults.qwenBaseUrl;
-    const suggestedCredential = qwenBillingPlan.startsWith('token-plan-')
-      ? 'BAILIAN_TOKEN_PLAN_API_KEY'
-      : defaults.qwenCredentialEnvKey;
-    const qwenBaseUrl = await ask('Qwen API base URL', suggestedBaseUrl);
-    const qwenCredentialEnvKey = await ask('Qwen credential name (press Enter to accept)', suggestedCredential);
+    const suggestedCredential = croutonDefault
+      ? OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY
+      : qwenBillingPlan.startsWith('token-plan-')
+        ? 'BAILIAN_TOKEN_PLAN_API_KEY'
+        : defaults.qwenCredentialEnvKey;
+    const qwenBaseUrl = await ask('Model API base URL', suggestedBaseUrl);
+    const qwenCredentialEnvKey = await ask('Model credential name (press Enter to accept)', suggestedCredential);
     const autoMerge = await yesNo('Enable automatic merge after every gate passes?', defaults.autoMerge);
     const enableCommunity = await yesNo('Scan allowlisted community sources for reviewable improvement ideas?', defaults.enableCommunity);
     const enableProgram = await yesNo('Enable repository-aware objective programs and dependency waves?', defaults.enableProgram);
@@ -514,6 +564,10 @@ async function guidedAnswers(defaults: InstallAnswers): Promise<InstallAnswers> 
       projectName,
       githubRepo,
       trustedAuthor,
+      // The guided installer keeps the configured/default model; the Crouton
+      // route stays opt-in through the CLI --model flag or the terminal
+      // Model connection menu.
+      qwenModel: defaults.qwenModel,
       qwenBaseUrl,
       qwenCredentialEnvKey,
       qwenBillingPlan,
@@ -676,16 +730,21 @@ function mergeQwenSettings(file: string, config: ProjectConfig): Record<string, 
     : [];
   const currentQwenProvider =
     existingOpenAi.find((provider) => provider.id === config.qwen.model) ?? {};
+  // The Qwen-only enable_thinking/preserve_thinking flags apply only to the
+  // default QwenCloud route; the OpenRouter Crouton provider must never
+  // receive them, and any stale copy is removed when switching routes.
+  const croutonRoute = config.qwen.model === OPENROUTER_CROUTON_MODEL;
   const qwenProvider = deepMerge(currentQwenProvider, {
     id: config.qwen.model,
-    name: `${config.qwen.model} (QwenCloud)`,
-    description: 'Qwen3.8-Max for the autonomous engineering harness',
+    name: `${config.qwen.model} (${croutonRoute ? 'OpenRouter' : 'QwenCloud'})`,
+    description: croutonRoute
+      ? 'OpenRouter stealth/crouton-alpha for the autonomous engineering harness'
+      : 'Qwen3.8-Max for the autonomous engineering harness',
     baseUrl: config.qwen.baseUrl,
     envKey: config.qwen.credentialEnvKey,
-    generationConfig: {
-      extra_body: { enable_thinking: true, preserve_thinking: true },
-    },
+    ...(croutonRoute ? {} : { generationConfig: { extra_body: { enable_thinking: true, preserve_thinking: true } } }),
   });
+  if (croutonRoute) delete qwenProvider.generationConfig;
   const merged = deepMerge(existing, {
     model: {
       name: config.qwen.model,
@@ -762,8 +821,8 @@ function removeHarnessQwenSettings(file: string, originalFile?: string): void {
   const originalProviders = isRecord(original.modelProviders) ? original.modelProviders : {};
   const originalOpenAi = Array.isArray(originalProviders.openai) ? originalProviders.openai.filter(isRecord) : [];
   const restoredOpenAi = [
-    ...currentOpenAi.filter((provider) => provider.id !== 'qwen3.8-max'),
-    ...originalOpenAi.filter((provider) => provider.id === 'qwen3.8-max'),
+    ...currentOpenAi.filter((provider) => provider.id !== 'qwen3.8-max' && provider.id !== OPENROUTER_CROUTON_MODEL),
+    ...originalOpenAi.filter((provider) => provider.id === 'qwen3.8-max' || provider.id === OPENROUTER_CROUTON_MODEL),
   ];
   if (restoredOpenAi.length > 0) providers.openai = restoredOpenAi;
   else delete providers.openai;

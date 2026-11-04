@@ -1,5 +1,5 @@
 import path from 'node:path';
-import type { ProjectConfig, TaskRecord, TaskSpec } from '../core/types.js';
+import type { ProjectConfig, QwenBillingPlan, TaskRecord, TaskSpec } from '../core/types.js';
 import { UsageBudgetActiveError, type UsageBudgetController, type UsageLedger } from '../core/usage-ledger.js';
 import { redactText } from '../core/ledger.js';
 import { formatProcessFailure, runProcess } from '../runtime/safe-process.js';
@@ -16,6 +16,61 @@ import {
   type QwenRuntimeCredential,
 } from './runtime-compat.js';
 import { QuotaHoldActiveError, providerRouteFromConfig, type QuotaHoldController } from './quota-hold.js';
+import {
+  isOpenRouterCroutonRoute,
+  OPENROUTER_CROUTON_BASE_URL,
+  OPENROUTER_CROUTON_CAPACITY_HOLD_KIND,
+  OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
+  OPENROUTER_CROUTON_MODEL,
+  openRouterCapacityExhaustionReason,
+  openRouterCroutonChildEnvironment,
+  openRouterCroutonCliArgs,
+} from './openrouter-route.js';
+
+/** Environment variable the OpenRouter key is delivered under for the
+ * OpenAI-compatible client inside Qwen Code; never the credential itself. */
+const CROUTON_CHILD_CREDENTIAL_ENV_KEY = 'OPENAI_API_KEY';
+
+/**
+ * Credential-minimized Crouton child environment that accepts the harness
+ * resolver's credential object. The resolved credential.apiKey is mapped into
+ * the env source only when its envKey is exactly OPENROUTER_API_KEY — a
+ * wrong-route credential (any other envKey) is ignored, never reinterpreted.
+ * The process environment remains the fallback when the credential carries no
+ * key. The key still reaches the child only as OPENAI_API_KEY on the pinned
+ * endpoint, never in arguments or output.
+ */
+export function openRouterCroutonChildEnvironmentFromCredential(
+  credential: QwenRuntimeCredential | null | undefined,
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const mapped: NodeJS.ProcessEnv = { ...source };
+  if (credential && credential.apiKey && credential.envKey === OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY) {
+    mapped[OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY] = credential.apiKey;
+  }
+  return openRouterCroutonChildEnvironment(mapped);
+}
+
+/**
+ * Resolve whether this project's qwen config is the exact opt-in OpenRouter
+ * stealth/crouton-alpha route. A config that names the Crouton model or
+ * endpoint without matching the full route fails closed instead of silently
+ * running on the Qwen path with mismatched credentials.
+ */
+export function isCroutonExecutionRoute(qwen: {
+  model: string;
+  baseUrl: string;
+  credentialEnvKey?: string;
+  billingPlan?: QwenBillingPlan;
+}): boolean {
+  if (isOpenRouterCroutonRoute(qwen)) return true;
+  if (qwen.model === OPENROUTER_CROUTON_MODEL || qwen.baseUrl.replace(/\/+$/, '') === OPENROUTER_CROUTON_BASE_URL) {
+    throw new Error(
+      `Crouton model or endpoint configured without the exact allowed route (model=${OPENROUTER_CROUTON_MODEL}, endpoint=${OPENROUTER_CROUTON_BASE_URL}, credential key OPENROUTER_API_KEY, billingPlan custom); refusing to fall back to the Qwen credential path`,
+    );
+  }
+  return false;
+}
 
 export interface QwenCodeRunInput {
   task: TaskRecord;
@@ -46,6 +101,9 @@ export interface QwenExecutor {
 interface StreamEvent {
   type?: string;
   subtype?: string;
+  is_error?: boolean;
+  reason?: string;
+  error?: string;
   session_id?: string;
   result?: string;
   usage?: Record<string, unknown>;
@@ -87,9 +145,11 @@ export class QwenCodeExecutor implements QwenExecutor {
     const freshSession = repairAttempt || automaticContinuation;
     const prompt = goalPromptFor(repairAttempt ? { ...input.task, qwenSessionId: null } : input.task, feedback, workflowPath);
 
+    const crouton = isCroutonExecutionRoute(this.config.qwen);
     const args = [
       '--model',
       this.config.qwen.model,
+      ...(crouton ? openRouterCroutonCliArgs() : []),
       '--prompt',
       prompt,
       '--output-format',
@@ -173,7 +233,9 @@ export class QwenCodeExecutor implements QwenExecutor {
     const selection = createQwenModelSelection({
       model: this.config.qwen.model,
       baseUrl: this.config.qwen.baseUrl,
-      envKey: this.config.qwen.credentialEnvKey,
+      // The Crouton child reads its key only from OPENAI_API_KEY, so the
+      // isolated selection must pin that exact env key, never a Qwen one.
+      envKey: crouton ? CROUTON_CHILD_CREDENTIAL_ENV_KEY : this.config.qwen.credentialEnvKey,
     });
     // Durable provider-wide quota hold: never spawn a Qwen Code process
     // against a held route. The supervisor parks the task on this signal
@@ -200,21 +262,42 @@ export class QwenCodeExecutor implements QwenExecutor {
       signal: input.signal,
       maxOutputBytes: 25 * 1024 * 1024,
       onStdout: consume,
-      env: {
-        ...qwenEnvironment(process.env, this.credential),
-        ...selection.env,
-        ...writerEnvironment,
-        QWEN_CODE_UNATTENDED_RETRY: '1',
-        ...qwenWorkflowEnvironment({
-          maxConcurrency: this.config.worker.maxReadOnlyAgents,
-          maxAgents: Math.max(4, this.config.worker.maxReadOnlyAgents + 2),
-          maxSeconds: this.config.qwen.maxWorkflowSeconds,
-          maxTokens: this.config.qwen.maxWorkflowTokens,
-          maxSubagentTurns: this.config.qwen.maxWorkflowSubagentTurns,
-          maxSubagentMinutes: this.config.qwen.maxWorkflowSubagentMinutes,
-        }),
-        QWEN_SANDBOX: this.config.qwen.sandbox ? 'true' : 'false',
-      },
+      env: crouton
+        // Crouton: key reaches the child ONLY as OPENAI_API_KEY on the pinned
+        // OpenAI-compatible endpoint; the Qwen credential path is never used.
+        // The harness-resolved credential (which may come from a private
+        // worker .env rather than process.env) supplies the key, with the
+        // process environment as fallback.
+        ? {
+          ...openRouterCroutonChildEnvironmentFromCredential(this.credential, process.env),
+          ...selection.env,
+          ...writerEnvironment,
+          QWEN_CODE_UNATTENDED_RETRY: '1',
+          ...qwenWorkflowEnvironment({
+            maxConcurrency: this.config.worker.maxReadOnlyAgents,
+            maxAgents: Math.max(4, this.config.worker.maxReadOnlyAgents + 2),
+            maxSeconds: this.config.qwen.maxWorkflowSeconds,
+            maxTokens: this.config.qwen.maxWorkflowTokens,
+            maxSubagentTurns: this.config.qwen.maxWorkflowSubagentTurns,
+            maxSubagentMinutes: this.config.qwen.maxWorkflowSubagentMinutes,
+          }),
+          QWEN_SANDBOX: this.config.qwen.sandbox ? 'true' : 'false',
+        }
+        : {
+          ...qwenEnvironment(process.env, this.credential),
+          ...selection.env,
+          ...writerEnvironment,
+          QWEN_CODE_UNATTENDED_RETRY: '1',
+          ...qwenWorkflowEnvironment({
+            maxConcurrency: this.config.worker.maxReadOnlyAgents,
+            maxAgents: Math.max(4, this.config.worker.maxReadOnlyAgents + 2),
+            maxSeconds: this.config.qwen.maxWorkflowSeconds,
+            maxTokens: this.config.qwen.maxWorkflowTokens,
+            maxSubagentTurns: this.config.qwen.maxWorkflowSubagentTurns,
+            maxSubagentMinutes: this.config.qwen.maxWorkflowSubagentMinutes,
+          }),
+          QWEN_SANDBOX: this.config.qwen.sandbox ? 'true' : 'false',
+        },
     }).finally(() => selection.cleanup());
     if (buffered.trim()) {
       const parsed = parseEvent(buffered);
@@ -229,6 +312,29 @@ export class QwenCodeExecutor implements QwenExecutor {
     }
 
     if (receipt.aborted) throw new Error(formatProcessFailure(receipt));
+    // OpenRouter documents HTTP 402 for spending limits. On the exact Crouton
+    // route only, a confirmed structured 402 capacity error from the bounded
+    // structured goal reason or the capped stderr tail parks the route behind
+    // the durable provider hold — a provider wait, never a code failure and
+    // never an unbounded resume loop (OpenRouter supplies no reset timestamp,
+    // so the hold uses bounded exponential backoff). Generic 402 wording or
+    // incidental prose stays fail-closed below.
+    const failedResult = latest.resultEvent?.type === 'result' &&
+      (latest.resultEvent.is_error === true || latest.resultEvent.subtype === 'error');
+    const resultReason = failedResult
+      ? latest.resultEvent?.reason ?? latest.resultEvent?.error ?? latest.resultEvent?.result
+      : null;
+    const capacityReason = crouton && receipt.exitCode !== 0 && !receipt.aborted && !receipt.timedOut
+      ? openRouterCapacityExhaustionReason(latest.goalReason, receipt.stderr) ??
+        openRouterCapacityExhaustionReason(resultReason, '')
+      : null;
+    if (capacityReason !== null) {
+      const heldUntil = this.quotaHold?.applyHold(providerRouteFromConfig(this.config.qwen), {
+        resetAt: null,
+        kind: OPENROUTER_CROUTON_CAPACITY_HOLD_KIND,
+      }) ?? null;
+      throw new QuotaHoldActiveError(heldUntil);
+    }
     const budgetExit = receipt.exitCode === 53 || receipt.exitCode === 55 || receipt.timedOut;
     // A narrow multi-marker context-exhaustion pause on a known session is a
     // local process boundary of this machine's run, not a task failure: the

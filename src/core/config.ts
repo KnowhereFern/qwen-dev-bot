@@ -2,6 +2,10 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { CONFIG_VERSION, SUPPORTED_CONFIG_VERSIONS, type GateDefinition, type ProjectConfig } from './types.js';
 import { DEFAULT_QWEN_BASE_URL, QWEN_HARNESS_MODEL, TOKEN_PLAN_QWEN_BASE_URL } from '../qwen/runtime-compat.js';
+import {
+  OPENROUTER_CROUTON_MODEL,
+  openRouterCroutonRouteProblem,
+} from '../qwen/openrouter-route.js';
 
 export const PROJECT_CONFIG_PATH = path.join('.qwen-harness', 'project.yml');
 
@@ -308,7 +312,23 @@ export function validateProjectConfig(value: unknown, source = 'project config')
     throw new Error(`${source}: project.githubRepo is required and must be owner/name`);
   }
   if (config.qwen?.model !== QWEN_HARNESS_MODEL) {
-    throw new Error(`${source}: this template requires qwen.model to be "${QWEN_HARNESS_MODEL}"`);
+    // v2 opt-in: the only accepted alternate route is the exact OpenRouter
+    // stealth/crouton-alpha route (model, endpoint, credential, billing all
+    // matching). v1 configs and any other model stay rejected.
+    if (config.qwen?.model === OPENROUTER_CROUTON_MODEL) {
+      if (config.configVersion !== CONFIG_VERSION) {
+        throw new Error(`${source}: the OpenRouter ${OPENROUTER_CROUTON_MODEL} route requires configVersion ${CONFIG_VERSION}`);
+      }
+      const problem = openRouterCroutonRouteProblem({
+        model: config.qwen.model,
+        baseUrl: typeof config.qwen.baseUrl === 'string' ? config.qwen.baseUrl : '',
+        credentialEnvKey: config.qwen.credentialEnvKey,
+        billingPlan: config.qwen.billingPlan,
+      });
+      if (problem) throw new Error(`${source}: ${problem}`);
+    } else {
+      throw new Error(`${source}: this template requires qwen.model to be "${QWEN_HARNESS_MODEL}"`);
+    }
   }
   if (!config.qwen.command?.trim()) throw new Error(`${source}: qwen.command is required`);
   if (!config.qwen.baseUrl || !isHttpsUrl(config.qwen.baseUrl)) {

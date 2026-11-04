@@ -1,9 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultProjectConfig } from '../src/core/config.js';
 import type { TaskRecord } from '../src/core/types.js';
 import { ObservedTokenBudget, UsageBudgetActiveError, UsageLedger } from '../src/core/usage-ledger.js';
 import { QwenCodeExecutor } from '../src/qwen/qwen-code-executor.js';
-import { ProviderQuotaHold, providerRouteFromConfig, QuotaHoldActiveError } from '../src/qwen/quota-hold.js';
+import { ProviderQuotaHold, providerRouteFromConfig, QuotaHoldActiveError, type QuotaHoldController } from '../src/qwen/quota-hold.js';
 import { runProcess } from '../src/runtime/safe-process.js';
 import { qwenWriterGuardEnvironment, WRITER_GUARD_FAILURE } from '../src/qwen/writer-guard.js';
 import { makeTmp } from './helpers.js';
@@ -561,5 +561,202 @@ describe('Qwen executor usage ledger integration', () => {
       const summary = reopened.summary();
       expect(summary).toMatchObject({ qwenSessionCount: 1, observedTotalTokens: 30, unmeteredCount: 0, anomalyCount: 1 });
     } finally { reopened.close(); }
+  });
+});
+
+describe('Qwen execution OpenRouter Crouton route', () => {
+  const croutonKey = 'sk-crouton-test-key';
+  const croutonTask = {
+    id: 'task', issueNumber: 35, title: 'Verify existing behavior', body: 'Keep the approved contract.',
+    spec: null, qwenSessionId: null, qwenWorkflowRunId: null, attempts: 0,
+  } as TaskRecord;
+  const croutonConfig = () => {
+    const base = defaultProjectConfig('/tmp/project', 'test', 'owner/repo');
+    return { ...base, qwen: { ...base.qwen,
+      model: 'stealth/crouton-alpha',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      credentialEnvKey: 'OPENROUTER_API_KEY',
+      billingPlan: 'custom' as const } };
+  };
+  const executeCrouton = (credential?: { envKey: string; apiKey?: string } | null) =>
+    new QwenCodeExecutor(croutonConfig(), credential ?? null)
+      .execute({ task: croutonTask, worktree: '/tmp/project' });
+
+  beforeEach(() => {
+    vi.mocked(qwenWriterGuardEnvironment).mockReset().mockReturnValue({});
+    vi.mocked(runProcess).mockReset();
+    vi.mocked(runProcess).mockImplementation(async (options) => {
+      options.onStdout?.(`${JSON.stringify({ event: { type: 'goal_state', state: 'complete' } })}\n`);
+      return { command: options.command, args: options.args ?? [], cwd: options.cwd,
+        exitCode: 0, timedOut: false, aborted: false, durationMs: 1, stdout: '', stderr: '' };
+    });
+    vi.stubEnv('OPENROUTER_API_KEY', croutonKey);
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('authenticates only through OPENAI_API_KEY on the pinned endpoint, never in args', async () => {
+    await executeCrouton();
+    const options = vi.mocked(runProcess).mock.calls[0]![0];
+    expect(options.args!.slice(options.args!.indexOf('--model'), options.args!.indexOf('--model') + 4))
+      .toEqual(['--model', 'stealth/crouton-alpha', '--auth-type', 'openai']);
+    expect(JSON.stringify(options.args)).not.toContain(croutonKey);
+    expect(options.env!.OPENAI_API_KEY).toBe(croutonKey);
+    expect(options.env!.OPENAI_BASE_URL).toBe('https://openrouter.ai/api/v1');
+    expect(options.env!.OPENROUTER_API_KEY).toBeUndefined();
+    expect(options.env!.DASHSCOPE_API_KEY).toBeUndefined();
+  });
+
+  it('keeps the Qwen credential path and its environment for the default route', async () => {
+    await new QwenCodeExecutor(defaultProjectConfig('/tmp/project', 'test', 'owner/repo'))
+      .execute({ task: croutonTask, worktree: '/tmp/project' });
+    const options = vi.mocked(runProcess).mock.calls[0]![0];
+    expect(options.args).not.toContain('--auth-type');
+    expect(options.env!.OPENAI_BASE_URL).toBeUndefined();
+    expect(options.env!.OPENROUTER_API_KEY).toBeUndefined();
+  });
+
+  it('refuses to spawn without the OpenRouter key in the parent environment', async () => {
+    delete process.env.OPENROUTER_API_KEY;
+    await expect(executeCrouton()).rejects.toThrow('Crouton route requires OPENROUTER_API_KEY');
+    expect(runProcess).not.toHaveBeenCalled();
+  });
+
+  it('maps a harness-resolved OpenRouter credential when the key is absent from process.env', async () => {
+    delete process.env.OPENROUTER_API_KEY;
+    const resolved = { envKey: 'OPENROUTER_API_KEY', apiKey: 'sk-crouton-resolved-key' };
+    await executeCrouton(resolved);
+    const options = vi.mocked(runProcess).mock.calls[0]![0];
+    expect(JSON.stringify(options.args)).not.toContain('sk-crouton-resolved-key');
+    expect(options.env!.OPENAI_API_KEY).toBe('sk-crouton-resolved-key');
+    expect(options.env!.OPENAI_BASE_URL).toBe('https://openrouter.ai/api/v1');
+    expect(options.env!.OPENROUTER_API_KEY).toBeUndefined();
+    expect(options.env!.DASHSCOPE_API_KEY).toBeUndefined();
+  });
+
+  it('refuses a wrong-route resolved credential instead of reusing it on the Crouton path', async () => {
+    delete process.env.OPENROUTER_API_KEY;
+    const wrongRoute = { envKey: 'DASHSCOPE_API_KEY', apiKey: 'sk-qwen-wrong-route-key' };
+    await expect(executeCrouton(wrongRoute)).rejects.toThrow('Crouton route requires OPENROUTER_API_KEY');
+    expect(runProcess).not.toHaveBeenCalled();
+  });
+
+  it('fails closed on a partial Crouton config instead of falling back to the Qwen path', async () => {
+    const base = defaultProjectConfig('/tmp/project', 'test', 'owner/repo');
+    const partial = { ...base, qwen: { ...base.qwen, model: 'stealth/crouton-alpha' } };
+    await expect(new QwenCodeExecutor(partial).execute({ task: croutonTask, worktree: '/tmp/project' }))
+      .rejects.toThrow('refusing to fall back to the Qwen credential path');
+    expect(runProcess).not.toHaveBeenCalled();
+  });
+});
+
+describe('Qwen executor OpenRouter 402 capacity hold', () => {
+  const capacityStderr = 'Error: 402 {"error":{"code":402,"message":"Payment required","metadata":{"limit_source":"openrouter_credits","reason":"spending limit reached"}}}';
+  const task = {
+    id: 'task', issueNumber: 35, title: 'Verify existing behavior', body: '', spec: null,
+    qwenSessionId: 'prior-session', qwenWorkflowRunId: 'prior-workflow', attempts: 0,
+  } as TaskRecord;
+  const croutonConfig = () => {
+    const base = defaultProjectConfig('/tmp/project', 'test', 'owner/repo');
+    return { ...base, qwen: { ...base.qwen,
+      model: 'stealth/crouton-alpha',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      credentialEnvKey: 'OPENROUTER_API_KEY',
+      billingPlan: 'custom' as const } };
+  };
+
+  /** A failed Crouton run with the given stderr and goal reason. */
+  function failedRun(stderr: string, reason?: string, exitCode: number | null = 1, timedOut = false) {
+    vi.mocked(runProcess).mockImplementationOnce(async input => {
+      if (reason) input.onStdout?.(`${JSON.stringify({ event: { type: 'goal_state', goal_state: { goal: { status: 'paused', lastReason: reason } } } })}\n`);
+      return { command: input.command, args: input.args ?? [], cwd: input.cwd,
+        exitCode, timedOut, aborted: false, durationMs: 1, stdout: '', stderr };
+    });
+  }
+
+  /** Records every applyHold call; applyHold itself throws when unexpected. */
+  function recordingHold(expectCall: boolean): { controller: QuotaHoldController; calls: Array<{ kind: string; resetAt: number | null }> } {
+    const calls: Array<{ kind: string; resetAt: number | null }> = [];
+    return {
+      calls,
+      controller: {
+        heldUntil: () => null,
+        applyHold: (route, input) => {
+          expect(expectCall).toBe(true);
+          expect(providerRouteFromConfig(croutonConfig().qwen)).toEqual(route);
+          calls.push({ kind: input.kind, resetAt: input.resetAt ?? null });
+          return Date.now() + 60 * 60_000;
+        },
+      },
+    };
+  }
+
+  beforeEach(() => {
+    vi.mocked(qwenWriterGuardEnvironment).mockReset().mockReturnValue({});
+    vi.mocked(runProcess).mockReset();
+    vi.stubEnv('OPENROUTER_API_KEY', 'sk-crouton-capacity-key');
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('parks a confirmed 402 capacity error from bounded stderr behind the durable hold', async () => {
+    failedRun(capacityStderr);
+    const hold = recordingHold(true);
+    const executor = new QwenCodeExecutor(croutonConfig(), null, hold.controller);
+    await expect(executor.execute({ task, worktree: '/tmp/project', feedback: [] }))
+      .rejects.toMatchObject({ name: 'QuotaHoldActiveError' });
+    expect(hold.calls).toEqual([{ kind: 'openrouter_capacity', resetAt: null }]);
+  });
+
+  it('parks a confirmed 402 capacity error from the structured goal reason', async () => {
+    failedRun('', '{"error":{"code":402,"message":"Payment required","metadata":{"limit_source":"openrouter_key_limit"}}}');
+    const hold = recordingHold(true);
+    const executor = new QwenCodeExecutor(croutonConfig(), null, hold.controller);
+    await expect(executor.execute({ task, worktree: '/tmp/project', feedback: [] }))
+      .rejects.toMatchObject({ name: 'QuotaHoldActiveError' });
+    expect(hold.calls).toEqual([{ kind: 'openrouter_capacity', resetAt: null }]);
+  });
+
+  it('parks a confirmed 402 capacity error from a failed result event', async () => {
+    vi.mocked(runProcess).mockImplementationOnce(async input => {
+      input.onStdout?.(`${JSON.stringify({ type: 'result', subtype: 'error', is_error: true,
+        reason: '{"error":{"code":402,"metadata":{"limit_source":"openrouter_key_limit"}}}' })}\n`);
+      return { command: input.command, args: input.args ?? [], cwd: input.cwd,
+        exitCode: 1, timedOut: false, aborted: false, durationMs: 1, stdout: '', stderr: '' };
+    });
+    const hold = recordingHold(true);
+    const executor = new QwenCodeExecutor(croutonConfig(), null, hold.controller);
+    await expect(executor.execute({ task, worktree: '/tmp/project', feedback: [] }))
+      .rejects.toMatchObject({ name: 'QuotaHoldActiveError' });
+    expect(hold.calls).toEqual([{ kind: 'openrouter_capacity', resetAt: null }]);
+  });
+
+  it('fails a generic 402 or incidental prose closed as a process failure without a hold', async () => {
+    for (const stderr of ['Error: 402 Payment required', 'payment required: your openrouter credits are exhausted']) {
+      failedRun(stderr);
+      const hold = recordingHold(false);
+      const executor = new QwenCodeExecutor(croutonConfig(), null, hold.controller);
+      await expect(executor.execute({ task, worktree: '/tmp/project', feedback: [] }))
+        .rejects.toThrow();
+      expect(hold.calls).toHaveLength(0);
+    }
+  });
+
+  it('never applies a capacity hold off the exact Crouton route', async () => {
+    failedRun(capacityStderr);
+    const hold = recordingHold(false);
+    const executor = new QwenCodeExecutor(defaultProjectConfig('/tmp/project', 'test', 'owner/repo'), null, hold.controller);
+    await expect(executor.execute({ task, worktree: '/tmp/project', feedback: [] }))
+      .rejects.toThrow();
+    expect(hold.calls).toHaveLength(0);
+  });
+
+  it('keeps a timed-out run out of the capacity hold even when stderr carries the 402 marker', async () => {
+    failedRun(capacityStderr, undefined, null, true);
+    const hold = recordingHold(false);
+    const executor = new QwenCodeExecutor(croutonConfig(), null, hold.controller);
+    // A timeout is a budget process boundary, not a confirmed provider
+    // capacity signal: it resolves as a continuation, never as a hold.
+    const result = await executor.execute({ task, worktree: '/tmp/project', feedback: [] });
+    expect(result).toMatchObject({ needsContinuation: true, continuationKind: 'budget' });
+    expect(hold.calls).toHaveLength(0);
   });
 });

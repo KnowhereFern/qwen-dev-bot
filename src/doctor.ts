@@ -12,6 +12,7 @@ import {
   QWEN_MM_CORE_MCP_SERVER,
   qwenCodeVersionAtLeast,
 } from './qwen/runtime-compat.js';
+import { OPENROUTER_CROUTON_MODEL } from './qwen/openrouter-route.js';
 import { runProcess } from './runtime/safe-process.js';
 import { githubSlugFromRemote } from './git/git-workspace.js';
 
@@ -194,7 +195,9 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
         compatibilityProblem ? 'fail' : config.qwen.billingPlan === 'custom' ? 'warn' : 'pass',
         compatibilityProblem ??
           (config.qwen.billingPlan === 'custom'
-            ? 'Custom Qwen billing route selected; verify its credential and endpoint compatibility'
+            ? config.qwen.model === OPENROUTER_CROUTON_MODEL
+              ? `OpenRouter ${config.qwen.model} route selected; verify its credential and endpoint compatibility`
+              : 'Custom Qwen billing route selected; verify its credential and endpoint compatibility'
             : `${config.qwen.billingPlan} credential family and endpoint are consistent`),
       ),
     );
@@ -248,6 +251,7 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
         apiKey: credential.apiKey,
         credentialEnvKey: config.qwen.credentialEnvKey,
         baseUrl: config.qwen.baseUrl,
+        billingPlan: config.qwen.billingPlan,
         usageLedger,
         usageBudget: new ObservedTokenBudget(config.configVersion === 1 ? null : config.usage?.maxObservedTokens ?? null, usageLedger),
       });
@@ -257,9 +261,9 @@ export async function runDoctor(config: ProjectConfig, options: { live?: boolean
         reasoningEffort: 'low',
         maxTokens: 32,
       });
-      checks.push(check('qwen-live', result.value.ok === true ? 'pass' : 'fail', result.value.ok === true ? 'Live Qwen3.8-Max call passed' : 'Live Qwen response failed validation'));
+      checks.push(check('qwen-live', result.value.ok === true ? 'pass' : 'fail', result.value.ok === true ? `Live ${config.qwen.model} call passed` : `Live ${config.qwen.model} response failed validation`));
     } catch (error) {
-      checks.push(check('qwen-live', 'fail', 'Live Qwen3.8-Max call failed', error instanceof Error ? error.message : String(error)));
+      checks.push(check('qwen-live', 'fail', `Live ${config.qwen.model} call failed`, error instanceof Error ? error.message : String(error)));
     } finally {
       usageLedger.close();
     }
@@ -518,7 +522,7 @@ function qwenProjectSettingsCheck(config: ProjectConfig): DoctorCheck {
       'qwen-project-settings',
       valid ? 'pass' : 'fail',
       valid
-        ? 'Qwen3.8-Max provider, sandboxed leaf delegation, workflows, credential reference, and native computer-use boundary configured'
+        ? `${config.qwen.model} provider, sandboxed leaf delegation, workflows, credential reference, and native computer-use boundary configured`
         : 'Project Qwen provider settings do not match the harness configuration',
     );
   } catch {

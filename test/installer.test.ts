@@ -82,6 +82,101 @@ describe('guided installer', () => {
     expect(result.config.qwen.baseUrl).toBe('https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1');
   });
 
+  it('stores the opt-in OpenRouter Crouton route exactly and without Qwen generation flags', async () => {
+    const root = makeTmp('installer-crouton-plan');
+    process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-crouton-plan-state');
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'fixture' }));
+    const result = await installProject({
+      root,
+      yes: true,
+      answers: {
+        projectName: 'fixture',
+        githubRepo: 'owner/fixture',
+        trustedAuthor: 'owner',
+        qwenModel: 'stealth/crouton-alpha',
+        installQwen: false,
+        linkExtension: false,
+        installService: false,
+        bootstrapDependencies: false,
+        configureGitHub: false,
+      },
+    });
+
+    expect(result.config.qwen.model).toBe('stealth/crouton-alpha');
+    expect(result.config.qwen.baseUrl).toBe('https://openrouter.ai/api/v1');
+    expect(result.config.qwen.credentialEnvKey).toBe('OPENROUTER_API_KEY');
+    expect(result.config.qwen.billingPlan).toBe('custom');
+
+    const settingsFile = path.join(root, '.qwen', 'settings.json');
+    const settings = JSON.parse(readFileSync(settingsFile, 'utf8'));
+    expect(settings.model.name).toBe('stealth/crouton-alpha');
+    const provider = settings.modelProviders.openai.find((candidate: { id: string }) => candidate.id === 'stealth/crouton-alpha');
+    expect(provider).toMatchObject({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      envKey: 'OPENROUTER_API_KEY',
+      name: 'stealth/crouton-alpha (OpenRouter)',
+    });
+    expect(provider.generationConfig).toBeUndefined();
+    expect(provider).not.toHaveProperty('generationConfig');
+  });
+
+  it('rejects an explicit conflicting Crouton route field before mutating the existing config', async () => {
+    const root = makeTmp('installer-crouton-conflict');
+    process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-crouton-conflict-state');
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'fixture' }));
+    const baseAnswers = {
+      projectName: 'fixture',
+      githubRepo: 'owner/fixture',
+      trustedAuthor: 'owner',
+      qwenModel: 'stealth/crouton-alpha',
+      installQwen: false,
+      linkExtension: false,
+      installService: false,
+      bootstrapDependencies: false,
+      configureGitHub: false,
+    };
+    await installProject({ root, yes: true, answers: { ...baseAnswers, qwenModel: 'qwen3.8-max' } });
+    const configFile = path.join(root, '.qwen-harness', 'project.yml');
+    const originalConfig = readFileSync(configFile, 'utf8');
+
+    for (const conflicting of [
+      { qwenBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+      { qwenCredentialEnvKey: 'DASHSCOPE_API_KEY' },
+      { qwenBillingPlan: 'standard' as const },
+    ]) {
+      await expect(
+        installProject({ root, yes: true, answers: { ...baseAnswers, ...conflicting } }),
+      ).rejects.toThrow(/stealth\/crouton-alpha model requires/);
+      expect(readFileSync(configFile, 'utf8')).toBe(originalConfig);
+    }
+  });
+
+  it('accepts an explicit Crouton route only when every field matches the pinned constants', async () => {
+    const root = makeTmp('installer-crouton-exact');
+    process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-crouton-exact-state');
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'fixture' }));
+    const result = await installProject({
+      root, yes: true,
+      answers: {
+        projectName: 'fixture',
+        githubRepo: 'owner/fixture',
+        trustedAuthor: 'owner',
+        qwenModel: 'stealth/crouton-alpha',
+        qwenBaseUrl: 'https://openrouter.ai/api/v1/',
+        qwenCredentialEnvKey: 'OPENROUTER_API_KEY',
+        qwenBillingPlan: 'custom' as const,
+        installQwen: false,
+        linkExtension: false,
+        installService: false,
+        bootstrapDependencies: false,
+        configureGitHub: false,
+      },
+    });
+    expect(result.config.qwen.baseUrl).toBe('https://openrouter.ai/api/v1');
+    expect(result.config.qwen.credentialEnvKey).toBe('OPENROUTER_API_KEY');
+    expect(result.config.qwen.billingPlan).toBe('custom');
+  });
+
   it('preserves exact config formatting on no-op updates but persists semantic changes', async () => {
     const root = makeTmp('installer-config-format');
     process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-config-format-state');

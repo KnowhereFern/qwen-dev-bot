@@ -1,9 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import type { ReasoningEffort, StructuredOutputSchema } from '../core/types.js';
+import type { QwenBillingPlan, ReasoningEffort, StructuredOutputSchema } from '../core/types.js';
 import { redactText } from '../core/ledger.js';
 import { UsageBudgetActiveError, type UsageBudgetController, type UsageLedger } from '../core/usage-ledger.js';
 import { harnessStateRoot } from '../core/state-paths.js';
 import { DEFAULT_QWEN_BASE_URL, QWEN_HARNESS_MODEL } from './runtime-compat.js';
+import {
+  OPENROUTER_CROUTON_BILLING_PLAN,
+  OPENROUTER_CROUTON_CAPACITY_HOLD_KIND,
+  OPENROUTER_CROUTON_MODEL,
+  assertOpenRouterCroutonRoute,
+  isOpenRouterCapacityExhaustion,
+  openRouterCroutonRequestBody,
+} from './openrouter-route.js';
 import { isMonthlyQuotaExhaustion, parseProviderResetAt } from './provider-reset.js';
 import {
   ProviderQuotaHold,
@@ -11,6 +19,7 @@ import {
   QuotaHoldActiveError,
   type ProviderRoute,
   type QuotaHoldController,
+  type QuotaHoldKind,
 } from './quota-hold.js';
 
 export const DEFAULT_QWEN_API_TIMEOUT_MS = 5 * 60_000;
@@ -20,6 +29,7 @@ export interface QwenApiOptions {
   credentialEnvKey?: string;
   baseUrl?: string;
   model?: string;
+  billingPlan?: QwenBillingPlan;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   maxAttempts?: number;
@@ -60,6 +70,7 @@ export class QwenApiClient {
   private readonly usageBudget?: UsageBudgetController;
   private readonly usesInjectedFetch: boolean;
   private readonly route: ProviderRoute;
+  private readonly croutonRoute: boolean;
 
   constructor(options: QwenApiOptions = {}) {
     const credentialEnvKey = options.credentialEnvKey ?? 'DASHSCOPE_API_KEY';
@@ -76,7 +87,9 @@ export class QwenApiClient {
       throw new Error('Qwen API baseUrl must be HTTPS and must not embed credentials');
     }
     this.model = options.model ?? QWEN_HARNESS_MODEL;
-    if (this.model !== QWEN_HARNESS_MODEL) throw new Error(`Delivery harness model must be ${QWEN_HARNESS_MODEL}`);
+    if (this.model !== QWEN_HARNESS_MODEL && this.model !== OPENROUTER_CROUTON_MODEL) {
+      throw new Error(`Delivery harness model must be ${QWEN_HARNESS_MODEL}`);
+    }
     this.usesInjectedFetch = options.fetchImpl !== undefined;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_QWEN_API_TIMEOUT_MS;
@@ -88,6 +101,16 @@ export class QwenApiClient {
     this.route = { baseUrl: this.baseUrl, model: this.model, credentialEnvKey };
     // Fail fast on a route key that cannot be sanitized safely.
     providerRouteKey(this.route);
+    // The only accepted alternate execution route is the exact OpenRouter
+    // stealth/crouton-alpha route; endpoint, credential, and billing must all
+    // match it, never a partial or mismatched combination.
+    this.croutonRoute = this.model === OPENROUTER_CROUTON_MODEL;
+    if (this.croutonRoute) {
+      if (options.billingPlan !== OPENROUTER_CROUTON_BILLING_PLAN) {
+        throw new Error(`Crouton route requires billingPlan ${OPENROUTER_CROUTON_BILLING_PLAN}; got ${String(options.billingPlan)}`);
+      }
+      assertOpenRouterCroutonRoute({ ...this.route, billingPlan: options.billingPlan });
+    }
     if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs <= 0) throw new Error('Qwen API timeoutMs must be positive');
     if (!Number.isSafeInteger(this.maxAttempts) || this.maxAttempts <= 0) throw new Error('Qwen API maxAttempts must be positive');
   }
@@ -106,7 +129,7 @@ export class QwenApiClient {
     // this invocation is recorded against it, and duplicate recordings of the
     // same id (retries, replays) count exactly once in the usage ledger.
     const callId = randomUUID();
-    const request = {
+    const baseRequest = {
       model: this.model,
       messages: [
         { role: 'system', content: input.system + (input.jsonSchema && this.structuredOutputMode === 'json_object' ? `\nReturn JSON conforming to this schema:\n${JSON.stringify(input.jsonSchema.schema)}` : '') },
@@ -121,6 +144,9 @@ export class QwenApiClient {
         ? { type: 'json_schema', json_schema: { ...input.jsonSchema, strict: true } }
         : { type: 'json_object' },
     };
+    // Crouton route: drop Qwen-only enable_thinking/preserve_thinking and pin
+    // the model, preserving every standardized request field.
+    const request = this.croutonRoute ? openRouterCroutonRequestBody(baseRequest) : baseRequest;
     for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
       if (input.signal?.aborted) throw new Error('Qwen API request aborted');
       // A durable provider-wide quota hold blocks every direct request and
@@ -160,6 +186,15 @@ export class QwenApiClient {
         if (response.status === 429 && isMonthlyQuotaExhaustion(body)) {
           const resetAt = parseProviderResetAt(body, Date.now());
           const heldUntil = this.recordHold(resetAt);
+          throw new QuotaHoldActiveError(heldUntil ?? null);
+        }
+        // OpenRouter documents HTTP 402 for spending limits. On the exact
+        // Crouton route only, a confirmed structured 402 capacity error is a
+        // provider wait: persist the durable hold (bounded backoff; OpenRouter
+        // supplies no reset timestamp) and never retry or report a code
+        // failure. Generic 402 bodies stay fail-closed below.
+        if (response.status === 402 && this.croutonRoute && isOpenRouterCapacityExhaustion(body)) {
+          const heldUntil = this.recordHold(null, OPENROUTER_CROUTON_CAPACITY_HOLD_KIND);
           throw new QuotaHoldActiveError(heldUntil ?? null);
         }
         if (isRetryableStatus(response.status) && attempt < this.maxAttempts) {
@@ -219,12 +254,12 @@ export class QwenApiClient {
     }
   }
 
-  private recordHold(resetAt: number | null): number | null {
-    if (this.quotaHold) return this.quotaHold.applyHold(this.route, { resetAt, kind: 'insufficient_quota' });
+  private recordHold(resetAt: number | null, kind: QuotaHoldKind = 'insufficient_quota'): number | null {
+    if (this.quotaHold) return this.quotaHold.applyHold(this.route, { resetAt, kind });
     if (this.usesInjectedFetch) return null;
     const hold = new ProviderQuotaHold(harnessStateRoot());
     try {
-      return hold.applyHold(this.route, { resetAt, kind: 'insufficient_quota' });
+      return hold.applyHold(this.route, { resetAt, kind });
     } finally {
       hold.close();
     }
