@@ -8,6 +8,7 @@ import {
   OPENROUTER_CROUTON_MODEL,
 } from '../src/qwen/openrouter-route.js';
 import { QWEN_GATE_RUNNER_COMMAND } from '../src/qwen/runtime-compat.js';
+import { gateRunnerCommand, resolveInstalledGateRunner } from '../src/qwen/gate-runner.js';
 import { makeTmp } from './helpers.js';
 
 function fixture() {
@@ -63,7 +64,7 @@ describe('invocation-scoped Qwen model selection', () => {
     expect(() => createQwenModelSelection(f.input)).toThrow('valid JSON object');
   });
 
-  it('allows only the exact gate runner command when opted in, preserving system permissions', () => {
+  it('allows only the exact gate runner commands when opted in, preserving system permissions', () => {
     const f = fixture();
     writeFileSync(f.systemPath, JSON.stringify({
       permissions: { allow: ['Read(**)'], deny: ['Shell(rm -rf *)'] },
@@ -72,12 +73,14 @@ describe('invocation-scoped Qwen model selection', () => {
     const file = selected.env.QWEN_CODE_SYSTEM_SETTINGS_PATH!;
     try {
       const overlay = JSON.parse(readFileSync(file, 'utf8'));
-      expect(overlay.permissions.allow).toEqual(['Read(**)', `Shell(${QWEN_GATE_RUNNER_COMMAND})`]);
+      const installed = process.platform === 'win32' ? gateRunnerCommand(resolveInstalledGateRunner())
+        : `${process.execPath} ${resolveInstalledGateRunner()}`;
+      expect(overlay.permissions.allow).toEqual(['Read(**)', `Shell(${QWEN_GATE_RUNNER_COMMAND})`, `Shell(${installed})`]);
       expect(overlay.permissions.deny).toEqual(['Shell(rm -rf *)']);
     } finally { selected.cleanup(); }
   });
 
-  it('does not grant the gate runner command by default', () => {
+  it('does not grant the gate runner commands by default', () => {
     const f = fixture();
     writeFileSync(f.systemPath, JSON.stringify({
       permissions: { allow: ['Read(**)'], deny: ['Shell(rm -rf *)'] },
@@ -88,6 +91,7 @@ describe('invocation-scoped Qwen model selection', () => {
       const overlay = JSON.parse(readFileSync(file, 'utf8'));
       expect(overlay.permissions).toEqual({ allow: ['Read(**)'], deny: ['Shell(rm -rf *)'] });
       expect(JSON.stringify(overlay)).not.toContain(QWEN_GATE_RUNNER_COMMAND);
+      expect(JSON.stringify(overlay)).not.toContain(resolveInstalledGateRunner());
     } finally { selected.cleanup(); }
   });
 
