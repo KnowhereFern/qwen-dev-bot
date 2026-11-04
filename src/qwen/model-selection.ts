@@ -5,6 +5,7 @@ import {
   OPENROUTER_CROUTON_MANDATORY_REASONING_CAPABILITY,
   isOpenRouterCroutonRoute,
 } from './openrouter-route.js';
+import { gateRunnerCommand, resolveInstalledGateRunner } from './gate-runner.js';
 import { QWEN_GATE_RUNNER_COMMAND } from './runtime-compat.js';
 
 type Settings = Record<string, unknown>;
@@ -87,20 +88,36 @@ export function createQwenModelSelection(options: {
     baseUrl: options.baseUrl,
   });
   // Qwen merges permissions.allow across settings scopes while deny/ask keep
-  // precedence, so appending the single audited gate runner command only ever
-  // allows that exact command — and only when the implementation execution
-  // opts in; rewards and doctor overlays stay permission-free.
-  const systemPermissions = object(system.permissions) ? system.permissions : {};
-  const gatePermissions = {
-    ...systemPermissions,
-    allow: [
-      ...(Array.isArray(systemPermissions.allow) ? systemPermissions.allow : []),
-      `Shell(${QWEN_GATE_RUNNER_COMMAND})`,
-    ],
-  };
+  // precedence, so appending the two audited gate runner commands only ever
+  // allows those exact commands — and only when the implementation execution
+  // opts in; rewards and doctor overlays stay permission-free. The prompt's
+  // exact installed command (quoted absolute node and script paths) needs its
+  // own rule alongside the audited relative one.
+  const gatePermissions = options.allowGateRunnerCommand ? (() => {
+    const systemPermissions = object(system.permissions) ? system.permissions : {};
+    const installedRunner = resolveInstalledGateRunner();
+    // Qwen matches Shell permissions against parsed command tokens. POSIX
+    // quoting is needed to execute paths with spaces but must not appear in
+    // the permission rule. Refuse paths with shell metacharacters rather than
+    // broadening the rule to a wildcard.
+    const installedPermissionCommand = platform === 'win32'
+      ? gateRunnerCommand(installedRunner)
+      : `${process.execPath} ${installedRunner}`;
+    if (platform !== 'win32' && !/^[A-Za-z0-9_./ -]+$/.test(installedPermissionCommand)) {
+      throw new Error('Installed gate runner path cannot be represented safely in a Qwen shell permission rule');
+    }
+    return {
+      ...systemPermissions,
+      allow: [
+        ...(Array.isArray(systemPermissions.allow) ? systemPermissions.allow : []),
+        `Shell(${QWEN_GATE_RUNNER_COMMAND})`,
+        `Shell(${installedPermissionCommand})`,
+      ],
+    };
+  })() : undefined;
   const overlay = {
     ...system,
-    ...(options.allowGateRunnerCommand ? { permissions: gatePermissions } : {}),
+    ...(gatePermissions === undefined ? {} : { permissions: gatePermissions }),
     model: { ...(object(system.model) ? system.model : {}), name: options.model, baseUrl: options.baseUrl },
     security: { ...security, auth: { ...auth, selectedType: 'openai' } },
     modelProviders: { openai: [{ id: options.model, baseUrl: options.baseUrl, envKey: options.envKey,
