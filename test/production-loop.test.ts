@@ -378,6 +378,56 @@ const MANAGED_ASSET_PATHS = [
 ] as const;
 
 describe('production supervisor trace', () => {
+  it.each(['satisfied', 'closure-retry', 'started', 'cancelled-started', 'partial'] as const)(
+    'retires only unstarted portfolio work after reassessment: %s', async (scenario) => {
+      const root = makeTmp('satisfied-story-root');
+      const state = makeTmp('satisfied-story-state');
+      const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+      config.program.enabled = true;
+      config.intake.trustedAuthors.push('bot');
+      config.gates = [{ id: 'unit', kind: 'unit', command: 'node', args: ['--version'], required: true, timeoutMs: 10_000 }];
+      const store = new PersistentTaskStore(`satisfied-story-${scenario}`, state);
+      const github = new MockGitHub();
+      github.issues.clear();
+      try {
+        const coordinator = new PortfolioCoordinator(config, store, github);
+        const created = await coordinator.createDraft({ sourcePath: 'OBJECTIVE.md', content: 'Deliver culling.', draft: {
+          title: 'Culling', objective: 'Deliver culling.', constraints: [], definitionOfDone: ['Culling verified'],
+          technologyDecisions: [], deploymentDecisions: [], stories: [{
+            key: 'S1', title: 'Deliver culling', goal: 'Deliver culling', acceptanceCriteria: ['Culling verified'],
+            constraints: [], requiredGateIds: ['unit'], rewardCriterionIds: ['execution', 'acceptance', 'independent-review'],
+            risk: 'low', workType: 'implement', dependsOn: [], rollback: 'Revert change',
+            technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['CULL'],
+          }],
+        } });
+        const approved = await coordinator.approve(created.plan.id);
+        const issueNumber = approved.stories[0]!.normalizedIssueNumber as number;
+        const task = store.upsert({ issueNumber, title: 'Deliver culling', state: 'ready' });
+        if (scenario === 'started') store.patch(task.id, { attempts: 1 });
+        if (scenario === 'cancelled-started') {
+          store.patch(task.id, { attempts: 1, commitSha: 'previous-attempt' });
+          store.transition(task.id, 'cancelled');
+        }
+        store.savePortfolioPlan({ ...approved, coverage: [{
+          id: 'CULL', requirement: 'Deliver culling.', status: scenario === 'partial' ? 'partial' : 'implemented',
+          requiredAction: scenario === 'partial' ? 'implement' : 'none', rationale: 'Exact-commit verification', evidence: [],
+        }] });
+        if (scenario === 'closure-retry') github.closureFailures = 1;
+        const supervisor = new HarnessSupervisor(config, store, github, new GitWorkspace(root, state, config),
+          new ReadOnlyQwenExecutor(), new MockNormalizer(), new GateRunner(), new UniversalRewardEngine([]),
+          silentLogger, 'satisfied-story-worker');
+        await supervisor.syncIntake();
+        const shouldRetire = scenario === 'satisfied' || scenario === 'closure-retry';
+        expect(store.findByIssue(issueNumber)?.state).toBe(shouldRetire || scenario === 'cancelled-started' ? 'cancelled' : 'ready');
+        expect(store.listPortfolioPlans()[0]!.stories[0]!.supersededAt != null).toBe(shouldRetire);
+        expect(github.closedIssues.has(issueNumber)).toBe(scenario === 'satisfied');
+        await supervisor.syncIntake();
+        expect(store.findByIssue(issueNumber)?.state).toBe(shouldRetire || scenario === 'cancelled-started' ? 'cancelled' : 'ready');
+        expect(github.closedIssues.has(issueNumber)).toBe(shouldRetire);
+      } finally { store.close(); }
+    },
+  );
+
   it.each(['no-plan', 'draft', 'active-without-approval'] as const)('blocks every execution path until initial program approval: %s', async (scenario) => {
     const root = makeTmp('approval-boundary-root');
     const state = makeTmp('approval-boundary-state');
