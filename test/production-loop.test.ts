@@ -61,6 +61,20 @@ class ReadOnlyQwenExecutor implements QwenExecutor {
   }
 }
 
+/** Captures the feedback lines each session received (RC98 operator-feedback repair). */
+class FeedbackCapturingQwenExecutor implements QwenExecutor {
+  readonly received: string[][] = [];
+  async execute(input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
+    this.received.push([...(input.feedback ?? [])]);
+    input.onSession?.('qwen-feedback-session');
+    writeFileSync(path.join(input.worktree, 'feature.txt'), `safe implementation v${this.received.length}\n`);
+    return {
+      sessionId: 'qwen-feedback-session', workflowRunId: 'workflow-feedback', summary: 'safe implementation',
+      goalState: 'complete', goalReason: null, needsContinuation: false, usage: { output_tokens: 10 }, durationMs: 5,
+    };
+  }
+}
+
 class BlockingQwenExecutor implements QwenExecutor {
   async execute(input: QwenCodeRunInput): Promise<QwenCodeRunResult> {
     input.onSession?.('qwen-session-interrupted');
@@ -1305,6 +1319,89 @@ describe('production supervisor trace', () => {
     expect(task?.lastError).toContain('Worker shutdown interrupted');
     store.close();
   }, 30_000);
+
+  it('suppresses replay of an operator-rejected candidate and passes the finding to the next Qwen session', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    config.worker.autoMerge = true;
+    config.gates = [{ id: 'unit', kind: 'unit', command: process.execPath, args: ['check.mjs'], required: true, timeoutMs: 10_000 }];
+    const state = makeTmp('feedback-reject-state');
+    const store = new PersistentTaskStore('feedback-reject-project', state);
+    try {
+      const github = new MockGitHub();
+      const git = new GitWorkspace(repo, state, config);
+      const qwen = new FeedbackCapturingQwenExecutor();
+      const reviewer = new PassingEvaluator('agentic');
+      const evaluate = vi.spyOn(reviewer, 'evaluate');
+      const rewards = new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), reviewer]);
+      const gates = new BlockingGateRunner();
+      const controller = new AbortController();
+      const firstTick = new HarnessSupervisor(config, store, github, git, qwen, new MockNormalizer(), gates, rewards, silentLogger, 'worker-feedback-abort').tick(controller.signal);
+      await gates.started;
+      controller.abort();
+      await firstTick;
+      const aborted = store.findByIssue(2)!;
+      const rejectedSha = aborted.commitSha as string;
+      expect(aborted).toMatchObject({ state: 'ready', attempts: 0 });
+      const originalMarker = store.listEvents('task.candidate_ready')
+        .find((event) => event.taskId === aborted.id && event.payload.commitSha === rejectedSha)!;
+
+      // RC98 live issue #435: operator feedback rejects the exact saved candidate commit.
+      const feedbackTask = store.recordOperatorFeedback(aborted.id, {
+        authorizationId: 'rev-435', authorizedBy: 'Fern',
+        reason: `candidate ${rejectedSha.slice(0, 7)} leaves the unsafe test unchanged`,
+      });
+      expect(feedbackTask.lastError).toContain('Operator feedback (rev-435)');
+      expect(store.listEvents('task.operator_feedback')[0]!.payload.candidateCommitSha).toBe(rejectedSha);
+
+      // An interrupted replay after the feedback re-creates a marker for the same
+      // rejected commit, and a later worker shutdown overwrites lastError.
+      const replayMarker = store.recordEvent('task.candidate_ready', aborted.id, originalMarker.payload, 'replayed-candidate-marker');
+      store.recordEvent('task.interrupted', aborted.id,
+        { from: 'verifying', candidateReadyEventId: replayMarker.id }, 'replayed-interrupted-feedback');
+      store.patch(aborted.id, { lastError: 'Worker shutdown interrupted the prior attempt; inspect and continue from the existing worktree. The controller selects the appropriate session for recovery.' });
+
+      const supervisor = new HarnessSupervisor(config, store, github, git, qwen, new MockNormalizer(), new GateRunner(), rewards, silentLogger, 'worker-feedback-repair');
+      await supervisor.tick();
+      const final = store.findByIssue(2)!;
+      expect(final).toMatchObject({ state: 'done', attempts: 0 });
+      expect(final.commitSha).not.toBe(rejectedSha);
+      const consumptions = store.listEvents('task.candidate_recovery_consumed');
+      expect(consumptions).toHaveLength(1);
+      expect(consumptions[0]!.payload).toMatchObject({ markerId: replayMarker.id, eligible: false, rejectedByOperatorFeedback: true });
+      const lines = qwen.received.at(-1)!.join('\n');
+      expect(lines).toContain('Operator feedback (rev-435)');
+      expect(lines).toContain('unsafe test unchanged');
+      expect(lines).toContain('Worker shutdown interrupted');
+      expect(github.prs.size).toBe(1);
+      expect(evaluate).toHaveBeenCalled();
+    } finally {
+      store.close();
+    }
+  }, 30_000);
+
+  it('does not inject stale operator feedback once a new candidate commit replaces the rejected SHA', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('feedback-stale-state');
+    const store = new PersistentTaskStore('feedback-stale-project', state);
+    try {
+      const task = store.upsert({ issueNumber: 11, title: 'stale feedback', state: 'ready', maxAttempts: 5, spec: null });
+      const worktree = makeTmp('feedback-stale-worktree');
+      store.patch(task.id, { attempts: 1, lineageFailures: 1, worktreePath: worktree, commitSha: 'c'.repeat(40) });
+      store.recordOperatorFeedback(task.id, { authorizationId: 'rev-old', authorizedBy: 'Fern', reason: 'old finding' });
+      store.patch(task.id, { commitSha: 'd'.repeat(40), lastError: 'gate failure on the new candidate' });
+      // The persisted finding stays bound to the replaced commit SHA, so the
+      // supervisor's SHA-keyed lookup cannot inject it for the new candidate.
+      const feedback = store.listEvents('task.operator_feedback')[0]!;
+      expect(feedback.payload.candidateCommitSha).toBe('c'.repeat(40));
+      expect(feedback.payload.candidateCommitSha).not.toBe(store.get(task.id).commitSha);
+    } finally {
+      store.close();
+    }
+  });
 
   it.each(['pass', 'fail', 'recovery-abort'] as const)('recovers an interrupted exact candidate by rerunning verification without Qwen: %s', async (outcome) => {
     const { repo } = await createGitFixture();

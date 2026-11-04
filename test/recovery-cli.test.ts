@@ -152,6 +152,7 @@ describe('operator task-feedback command', () => {
   });
 
   it('binds feedback to the exact issue and authorization', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     expect(await main(['task-feedback', ...flags, '/tmp/test-project', '--yes', '--json'])).toBe(0);
     expect(mock.config).toHaveBeenCalledWith('/tmp/test-project');
     expect(mock.find).toHaveBeenCalledWith(35);
@@ -159,6 +160,18 @@ describe('operator task-feedback command', () => {
       authorizationId: 'rev-1', authorizedBy: 'Fern', reason: 'Test deletes product database files',
     });
     expect(mock.close).toHaveBeenCalledOnce();
+    log.mockRestore();
+  });
+
+  it('reports the effective retry ceiling, not the raw configured maxAttempts', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await main(['task-feedback', ...flags, '--yes']);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('attempts 2/8'));
+    await main(['task-feedback', ...flags, '--yes', '--json']);
+    const reported = JSON.parse(log.mock.calls.at(-1)![0] as string);
+    expect(reported).toMatchObject({ attempts: 2, retryLimit: 8, failures: 5 });
+    expect(reported.maxAttempts).toBeUndefined();
+    log.mockRestore();
   });
 
   it('does not record feedback for missing tasks and always closes the store', async () => {

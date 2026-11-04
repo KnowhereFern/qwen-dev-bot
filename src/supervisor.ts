@@ -366,7 +366,7 @@ export class HarnessSupervisor {
       const advanced = await this.advanceImplementationBase(task, worktree.path);
       if (advanced) task = advanced;
       await prepareProjectCheckout(worktree.path, executionSignal);
-      const feedback = task.lastError ? [task.lastError] : [];
+      const feedback = this.operatorFeedbackFor(task);
       const recoveryGuidance = this.authorizedRecoveryFeedback(task);
       if (recoveryGuidance !== null) feedback.push(recoveryGuidance);
       const removedPaths = await this.applyAuthorizedGitRmPreflight(task, worktree.path);
@@ -830,6 +830,16 @@ export class HarnessSupervisor {
     this.logger.info('task released after worker shutdown', { taskId, from: current.state });
   }
 
+  /** Keep an operator finding attached to the rejected commit even if shutdown overwrote lastError. */
+  private operatorFeedbackFor(task: TaskRecord): string[] {
+    const event = this.store.listEvents('task.operator_feedback')
+      .filter((entry) => entry.taskId === task.id && entry.payload.candidateCommitSha === task.commitSha)
+      .at(-1);
+    if (!event) return task.lastError ? [task.lastError] : [];
+    const finding = `Operator feedback (${event.payload.authorizationId}): ${event.payload.reason}`;
+    return task.lastError && task.lastError !== finding ? [finding, task.lastError] : [finding];
+  }
+
   private async recoverInterruptedCandidate(
     task: TaskRecord,
     worktreePath: string,
@@ -850,6 +860,20 @@ export class HarnessSupervisor {
       (event) => event.id === interrupted.payload.candidateReadyEventId && event.taskId === task.id,
     );
     if (!marker || this.store.hasIdempotencyKey(`candidate-consumed:${marker.id}`)) return { kind: 'none' };
+    // A review finding rejects the candidate commit, including any later marker
+    // produced by replaying that same commit after the feedback was recorded.
+    if (this.store.listEvents('task.operator_feedback').some((event) =>
+      event.taskId === task.id && typeof marker.payload.commitSha === 'string' &&
+      event.payload.candidateCommitSha === marker.payload.commitSha,
+    )) {
+      const holder = this.store.get(task.id);
+      if (!ownsActiveLease(holder)) return { kind: 'lost-lease' };
+      onInheritedMarker?.(null);
+      this.store.recordEvent('task.candidate_recovery_consumed', task.id,
+        { markerId: marker.id, eligible: false, rejectedByOperatorFeedback: true },
+        `candidate-consumed:${marker.id}`);
+      return { kind: 'none' };
+    }
     const stored = this.store.get(task.id);
     if (!ownsActiveLease(stored)) return { kind: 'lost-lease' };
     onInheritedMarker?.(marker.id);
