@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.95] - 2026-11-04
+
+- Permit one operator-approved tracked-file removal command during an existing recovery retry, without broadening headless shell access or resetting the retry history.
+
 ## [1.0.0-rc.94] - 2026-11-04
 
 - Send reviewed, bounded recovery guidance to Qwen when an operator grants another attempt on the same task contract.

@@ -1,8 +1,9 @@
-import { mkdirSync } from 'node:fs';
+import { lstatSync, mkdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { EventLedger, redactForLedger, redactText } from './ledger.js';
+import { runProcess } from '../runtime/safe-process.js';
 import { assertTaskTransition, isTaskLeased } from './task-state.js';
 import type {
   ControllerRelease,
@@ -680,13 +681,17 @@ export class PersistentTaskStore {
 
   authorizeRecovery(id: string, authorization: {
     authorizationId: string; additionalAttempts: number; authorizedBy: string; reason: string;
+    allowGitRm?: string[];
   }): TaskRecord {
     if (!Number.isSafeInteger(authorization.additionalAttempts) || authorization.additionalAttempts < 1 || authorization.additionalAttempts > 3 ||
         [authorization.authorizationId, authorization.authorizedBy, authorization.reason].some((value) => typeof value !== 'string' || !value.trim())) {
       throw new Error('Recovery requires a named authorization, author, reason and 1-3 additional attempts');
     }
+    const allowGitRm = authorization.allowGitRm ?? [];
+    for (const requested of allowGitRm) assertSafeGitRmPathSyntax(requested);
     const binding = createHash('sha256').update(JSON.stringify({ id, authorizationId: authorization.authorizationId,
-      additionalAttempts: authorization.additionalAttempts, authorizedBy: authorization.authorizedBy, reason: authorization.reason })).digest('hex');
+      additionalAttempts: authorization.additionalAttempts, authorizedBy: authorization.authorizedBy, reason: authorization.reason,
+      ...(allowGitRm.length === 0 ? {} : { allowGitRm }) })).digest('hex');
     const key = `task:recovery:${authorization.authorizationId}`;
     let event: HarnessEvent | undefined;
     let result: TaskRecord;
@@ -704,6 +709,9 @@ export class PersistentTaskStore {
         }
         if (budget.members.some((member) => isTaskLeased(member.state))) throw new Error('Recovery lineage still has active execution');
         if (current.mergeSha) throw new Error('Merged tasks require post-merge recovery, not implementation reentry');
+        if (allowGitRm.length > 0 && typeof current.worktreePath !== 'string') {
+          throw new Error('Tracked-file removal authorization requires the failed task worktree');
+        }
         const now = Date.now();
         result = { ...current, state: 'ready', updatedAt: now, version: current.version + 1, leaseOwner: null, leaseExpiresAt: null };
         event = this.makeEvent('task.recovery_authorized', id, {
@@ -713,10 +721,87 @@ export class PersistentTaskStore {
           failureLineageId: current.failureLineageId ?? current.id,
           failures: budget.failures, priorLimit: budget.limit, absoluteLimit: budget.failures + authorization.additionalAttempts,
           priorState: current.state, priorVersion: current.version,
+          ...(allowGitRm.length === 0 ? {} : { allowGitRm }),
           contractHash: createHash('sha256').update(JSON.stringify(current.spec)).digest('hex'),
         }, key);
         this.writeTask(result, current.version);
         this.insertEvent(event);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    if (event) this.ledger.append(event);
+    return result;
+  }
+
+  /**
+   * Attach narrow tracked-file removal permission to an already-ready
+   * recovered task without adding another attempt. The grant is an
+   * append-only, idempotent event bound to the exact task, the current
+   * contract hash, the current active recovery authorization, the exact
+   * validated paths, and the operator input. Task state, attempts, and the
+   * retry budget are never changed; replaying the exact grant is a no-op and
+   * reusing its authorization ID with a different binding is rejected.
+   */
+  grantGitRmPermission(id: string, grant: {
+    authorizationId: string; authorizedBy: string; reason: string; allowGitRm: string[];
+  }): { recoveryAuthorizationId: string; contractHash: string } {
+    const allowGitRm = grant.allowGitRm ?? [];
+    if (!Array.isArray(allowGitRm) || allowGitRm.length === 0 || allowGitRm.length > GIT_RM_MAX_PATHS ||
+        !allowGitRm.every((entry) => typeof entry === 'string') ||
+        [grant.authorizationId, grant.authorizedBy, grant.reason].some((value) => typeof value !== 'string' || !value.trim())) {
+      throw new Error(`Tracked-file removal grant requires a named authorization, author, reason and 1-${GIT_RM_MAX_PATHS} paths`);
+    }
+    for (const requested of allowGitRm) assertSafeGitRmPathSyntax(requested);
+    const operatorBinding = createHash('sha256').update(JSON.stringify({ id, authorizationId: grant.authorizationId,
+      authorizedBy: grant.authorizedBy, reason: grant.reason, allowGitRm })).digest('hex');
+    const key = `task:git-rm-grant:${grant.authorizationId}`;
+    let event: HarnessEvent | undefined;
+    let result: { recoveryAuthorizationId: string; contractHash: string };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const prior = this.listEvents('task.git_rm_granted').find((entry) => entry.idempotencyKey === key);
+      if (prior) {
+        if (prior.payload.operatorBinding !== operatorBinding) {
+          throw new Error('Tracked-file removal grant conflicts with its original binding');
+        }
+        const current = this.get(id);
+        const contractHash = createHash('sha256').update(JSON.stringify(current.spec)).digest('hex');
+        const recovery = this.listEvents('task.recovery_authorized').filter((entry) => entry.taskId === id).at(-1);
+        if (prior.taskId !== id || prior.payload.contractHash !== contractHash ||
+            prior.payload.recoveryAuthorizationId !== recovery?.payload.authorizationId) {
+          throw new Error('Tracked-file removal grant is stale for the current task or recovery');
+        }
+        result = { recoveryAuthorizationId: String(prior.payload.recoveryAuthorizationId), contractHash: String(prior.payload.contractHash) };
+      } else {
+        const current = this.get(id);
+        if (current.state !== 'ready' || current.leaseOwner !== null || current.leaseExpiresAt !== null) {
+          throw new Error('Tracked-file removal grant requires an unleased ready task');
+        }
+        if (typeof current.worktreePath !== 'string' || !current.worktreePath.trim()) {
+          throw new Error('Tracked-file removal grant requires the task worktree');
+        }
+        const contractHash = createHash('sha256').update(JSON.stringify(current.spec)).digest('hex');
+        const recovery = this.listEvents('task.recovery_authorized').filter((entry) => entry.taskId === id).at(-1);
+        if (!recovery || recovery.payload.contractHash !== contractHash ||
+            typeof recovery.payload.authorizationId !== 'string' || !recovery.payload.authorizationId) {
+          throw new Error('Tracked-file removal grant requires an active recovery authorization for the current contract');
+        }
+        const budget = this.failureBudget(current);
+        if (budget.failures >= budget.limit) {
+          throw new Error('Tracked-file removal grant requires remaining retry budget');
+        }
+        event = this.makeEvent('task.git_rm_granted', id, {
+          operatorBinding, authorizationId: grant.authorizationId,
+          authorizedBy: redactText(grant.authorizedBy), reason: redactText(grant.reason),
+          recoveryAuthorizationId: recovery.payload.authorizationId,
+          allowGitRm, contractHash,
+          failures: budget.failures, limit: budget.limit, taskVersion: current.version,
+        }, key);
+        this.insertEvent(event);
+        result = { recoveryAuthorizationId: String(event.payload.recoveryAuthorizationId), contractHash };
       }
       this.db.exec('COMMIT');
     } catch (error) {
@@ -925,6 +1010,99 @@ export class PersistentTaskStore {
       );
     if (Number(result.changes) !== 1) throw new Error(`Concurrent task update rejected for ${task.id}`);
   }
+}
+
+/** Maximum number of tracked files a single recovery authorization may allow. */
+export const GIT_RM_MAX_PATHS = 5;
+
+/**
+ * Basename patterns that mark a repository path as credential-bearing. Any
+ * match rejects a tracked-file removal authorization: a deleted credential
+ * file is exactly the artifact a recovery must never be granted for.
+ */
+const GIT_RM_CREDENTIAL_NAME =
+  /^(?:\.env(?:\.[^.]+)?|\.(?:npmrc|netrc|pypirc)|credentials(?:\.[^.]+)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|(?:.*\.)?(?:pem|key)|.*(?:secret|token|password|credential|apikey).*)$/i;
+
+/** One path segment: no shell metacharacters, whitespace, quotes, or escapes. */
+const GIT_RM_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._+-]*$|^\.[A-Za-z0-9_][A-Za-z0-9._+-]*$/;
+
+function assertSafeGitRmPathSyntax(requested: string): void {
+  if (typeof requested !== 'string' || requested.length === 0) {
+    throw new Error('Tracked-file removal paths must be non-empty strings');
+  }
+  if (path.isAbsolute(requested) || requested.startsWith('/') || requested.includes('\\') || requested.startsWith('~')) {
+    throw new Error(`Tracked-file removal path must be worktree-relative: ${requested}`);
+  }
+  const segments = requested.split('/');
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
+    throw new Error(`Tracked-file removal path contains traversal or empty segments: ${requested}`);
+  }
+  if (segments.some((segment) => !GIT_RM_SEGMENT.test(segment))) {
+    throw new Error(`Tracked-file removal path contains shell metacharacters or unsafe characters: ${requested}`);
+  }
+  const basename = segments[segments.length - 1] as string;
+  if (GIT_RM_CREDENTIAL_NAME.test(basename)) {
+    throw new Error(`Tracked-file removal path looks credential-bearing: ${requested}`);
+  }
+}
+
+function isProtectedGitRmPath(requested: string, protectedPaths: string[]): boolean {
+  return protectedPaths.some((protectedPath) =>
+    protectedPath.endsWith('/') ? requested.startsWith(protectedPath) : requested === protectedPath || requested.startsWith(protectedPath),
+  );
+}
+
+/**
+ * Validate a recovery authorization's tracked-file removal paths against the
+ * exact failed task worktree. Every path must be a worktree-relative,
+ * tracked, regular-file path free of traversal, shell metacharacters,
+ * symlinks (in any ancestor segment), credential names, and configured
+ * protected paths. Returns the validated paths or throws with the first
+ * violation; no partial authorization is possible.
+ */
+export async function validateAuthorizedGitRmPaths(
+  worktree: string,
+  requested: string[],
+  protectedPaths: string[],
+): Promise<string[]> {
+  if (!Array.isArray(requested) || requested.length === 0 || requested.length > GIT_RM_MAX_PATHS) {
+    throw new Error(`Tracked-file removal requires 1-${GIT_RM_MAX_PATHS} paths`);
+  }
+  if (new Set(requested).size !== requested.length) {
+    throw new Error('Tracked-file removal paths must not contain duplicates');
+  }
+  for (const candidate of requested) assertSafeGitRmPathSyntax(candidate);
+  const root = path.resolve(worktree);
+  for (const candidate of requested) {
+    if (isProtectedGitRmPath(candidate, protectedPaths)) {
+      throw new Error(`Tracked-file removal path is protected: ${candidate}`);
+    }
+    const absolute = path.resolve(root, candidate);
+    if (absolute !== root && !absolute.startsWith(root + path.sep)) {
+      throw new Error(`Tracked-file removal path escapes the task worktree: ${candidate}`);
+    }
+    // Reject symlinks in any ancestor segment, not only the final path.
+    let ancestor = root;
+    for (const segment of candidate.split('/')) {
+      ancestor = path.join(ancestor, segment);
+      const link = lstatSync(ancestor, { throwIfNoEntry: false });
+      if (link === undefined) throw new Error(`Tracked-file removal path is missing in the task worktree: ${candidate}`);
+      if (link.isSymbolicLink()) throw new Error(`Tracked-file removal path traverses a symlink: ${candidate}`);
+    }
+    if (!statSync(absolute).isFile()) {
+      throw new Error(`Tracked-file removal path is not a regular file: ${candidate}`);
+    }
+    const tracked = await runProcess({
+      command: 'git',
+      args: ['ls-files', '--', candidate],
+      cwd: root,
+      timeoutMs: 20_000,
+    });
+    if (tracked.exitCode !== 0 || !tracked.stdout.trim().split('\n').includes(candidate)) {
+      throw new Error(`Tracked-file removal path is not tracked in the task worktree: ${candidate}`);
+    }
+  }
+  return [...requested];
 }
 
 export function failureFingerprint(error: string): string {
