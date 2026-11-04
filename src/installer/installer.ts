@@ -44,6 +44,7 @@ import {
   OPENROUTER_CROUTON_BASE_URL,
   OPENROUTER_CROUTON_BILLING_PLAN,
   OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY,
+  OPENROUTER_CROUTON_MANDATORY_REASONING_CAPABILITY,
   OPENROUTER_CROUTON_MODEL,
 } from '../qwen/openrouter-route.js';
 import { resolveQwenCredential } from '../qwen/credential-resolver.js';
@@ -745,16 +746,7 @@ function mergeQwenSettings(file: string, config: ProjectConfig): Record<string, 
     ...(croutonRoute ? {} : { generationConfig: { extra_body: { enable_thinking: true, preserve_thinking: true } } }),
     // Qwen Code side queries must keep reasoning enabled for this route.
     ...(croutonRoute
-      ? {
-          capabilities: {
-            reasoning: {
-              profile: 'openai-reasoning',
-              efforts: ['low', 'medium', 'high', 'xhigh'],
-              defaultEffort: 'xhigh',
-              canDisable: false,
-            },
-          },
-        }
+      ? { capabilities: OPENROUTER_CROUTON_MANDATORY_REASONING_CAPABILITY }
       : {}),
   });
   if (croutonRoute) {

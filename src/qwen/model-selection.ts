@@ -1,6 +1,10 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {
+  OPENROUTER_CROUTON_MANDATORY_REASONING_CAPABILITY,
+  isOpenRouterCroutonRoute,
+} from './openrouter-route.js';
 
 type Settings = Record<string, unknown>;
 const object = (value: unknown): value is Settings => typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -72,12 +76,21 @@ export function createQwenModelSelection(options: {
   }
   const security = object(system.security) ? system.security : {};
   const auth = object(security.auth) ? security.auth : {};
+  // The exact pinned Crouton route carries the mandatory reasoning capability
+  // into the overlay even when the task worktree settings predate it; every
+  // other route stays untouched.
+  const crouton = isOpenRouterCroutonRoute({
+    model: options.model,
+    baseUrl: options.baseUrl,
+    credentialEnvKey: options.envKey,
+  });
   const overlay = {
     ...system,
     model: { ...(object(system.model) ? system.model : {}), name: options.model, baseUrl: options.baseUrl },
     security: { ...security, auth: { ...auth, selectedType: 'openai' } },
     modelProviders: { openai: [{ id: options.model, baseUrl: options.baseUrl, envKey: options.envKey,
-      ...(generationConfig === undefined ? {} : { generationConfig }) }] },
+      ...(generationConfig === undefined ? {} : { generationConfig }),
+      ...(crouton ? { capabilities: OPENROUTER_CROUTON_MANDATORY_REASONING_CAPABILITY } : {}) }] },
   };
   assertNonsecret(overlay);
   const directory = mkdtempSync(path.join(os.tmpdir(), 'fern-qwen-model-'));

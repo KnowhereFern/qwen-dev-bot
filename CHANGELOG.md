@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.87] - 2026-11-04
+
+- Carry Crouton's mandatory reasoning setting into isolated Qwen Code sessions, including resumed worktrees created before the route change.
+
 ## [1.0.0-rc.86] - 2026-11-04
 
 - Keep reasoning enabled for OpenRouter Crouton side queries so Qwen Code Goal verification can run.

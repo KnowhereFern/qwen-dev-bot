@@ -10,6 +10,21 @@ export const OPENROUTER_CROUTON_MODEL = 'stealth/crouton-alpha';
 export const OPENROUTER_CROUTON_CREDENTIAL_ENV_KEY = 'OPENROUTER_API_KEY';
 export const OPENROUTER_CROUTON_BILLING_PLAN: QwenBillingPlan = 'custom';
 
+/**
+ * Mandatory reasoning capability every stealth/crouton-alpha provider entry
+ * must carry (installer-written project settings and invocation-scoped
+ * overlays alike), so Qwen Code side queries keep reasoning enabled on this
+ * route regardless of stale task worktree settings.
+ */
+export const OPENROUTER_CROUTON_MANDATORY_REASONING_CAPABILITY = Object.freeze({
+  reasoning: Object.freeze({
+    profile: 'openai-reasoning',
+    efforts: Object.freeze(['low', 'medium', 'high', 'xhigh']),
+    defaultEffort: 'xhigh',
+    canDisable: false,
+  }),
+});
+
 /** Fields the Qwen-only direct API body uses that the OpenRouter model must never receive. */
 const QWEN_ONLY_BODY_FIELDS = ['enable_thinking', 'preserve_thinking'] as const;
 
