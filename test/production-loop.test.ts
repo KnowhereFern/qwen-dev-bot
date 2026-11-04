@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -676,6 +677,77 @@ describe('production supervisor trace', () => {
     expect(waitEvents.map((event) => event.payload.reason)).toEqual(['provider temporarily overloaded', 'provider temporarily overloaded']);
     store.close();
   });
+
+  it('delivers operator-authorized recovery guidance to Qwen for the same task and keeps lastError feedback', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('recovery-guidance-state');
+    const store = new PersistentTaskStore('recovery-guidance-project', state);
+    const executor = new MockQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-recovery-guidance',
+    );
+
+    await supervisor.syncIntake();
+    const task = store.findByIssue(2) as NonNullable<ReturnType<typeof store.findByIssue>>;
+    expect(task.state).toBe('ready');
+    const unrelated = store.upsert({ issueNumber: 3, title: 'Unrelated finished task', state: 'done' });
+    store.patch(task.id, { lastError: 'Reward verification failed: gate unit failed' });
+    const contractHash = createHash('sha256').update(JSON.stringify(task.spec)).digest('hex');
+    // Guidance authorized for a different task must never reach this task...
+    store.recordEvent('task.recovery_authorized', unrelated.id, {
+      reason: 'Unrelated guidance must never leak across tasks', contractHash,
+    });
+    // ...while guidance for this exact task contract is delivered, bounded to 2000 characters.
+    store.recordEvent('task.recovery_authorized', task.id, {
+      reason: `Pivot the repair ${'a'.repeat(3_000)}`, contractHash,
+    });
+
+    await supervisor.tick();
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    const feedback = execute.mock.calls[0]![0].feedback as string[];
+    expect(feedback).toHaveLength(2);
+    expect(feedback[0]).toContain('Reward verification failed: gate unit failed');
+    const guidance = feedback[1]!;
+    expect(guidance.startsWith('Operator-authorized recovery guidance: Pivot the repair ')).toBe(true);
+    expect(guidance.length).toBeLessThanOrEqual('Operator-authorized recovery guidance: '.length + 2_000);
+    expect(feedback.join('\n')).not.toContain('Unrelated guidance');
+    store.close();
+  }, 30_000);
+
+  it('withholds recovery guidance whose contract hash does not match the current task spec', async () => {
+    const { repo } = await createGitFixture();
+    const config = defaultProjectConfig(repo, 'fixture', 'owner/fixture');
+    config.intake.trustedAuthors.push('bot');
+    const state = makeTmp('recovery-guidance-stale-state');
+    const store = new PersistentTaskStore('recovery-guidance-stale-project', state);
+    const executor = new MockQwenExecutor();
+    const execute = vi.spyOn(executor, 'execute');
+    const supervisor = new HarnessSupervisor(
+      config, store, new MockGitHub(), new GitWorkspace(repo, state, config),
+      executor, new MockNormalizer(), new GateRunner(),
+      new UniversalRewardEngine([new ExecutionEvaluator(), new PassingEvaluator('rubric'), new PassingEvaluator('agentic')]),
+      silentLogger, 'worker-recovery-guidance-stale',
+    );
+
+    await supervisor.syncIntake();
+    const task = store.findByIssue(2) as NonNullable<ReturnType<typeof store.findByIssue>>;
+    store.recordEvent('task.recovery_authorized', task.id, {
+      reason: 'Stale guidance against an obsolete contract', contractHash: 'deadbeef',
+    });
+
+    await supervisor.tick();
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls[0]![0].feedback).toEqual([]);
+    store.close();
+  }, 30_000);
 
   it('applies a durable cross-project quota hold from a confirmed Qwen Code quota result', async () => {
     const { repo } = await createGitFixture();
