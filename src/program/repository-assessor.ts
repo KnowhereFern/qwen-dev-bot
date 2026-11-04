@@ -144,7 +144,10 @@ export class RepositoryAssessor {
     reviewFeedback?: string,
     priorCoverage: ObjectiveCoverage[] = [],
   ): Promise<RepositoryAssessment> {
-    const snapshot = await collectRepositorySnapshot(this.config, signal, commitSha);
+    const focus = priorCoverage
+      .filter((entry) => ['partial', 'missing', 'unverified'].includes(entry.status))
+      .map((entry) => entry.requirement);
+    const snapshot = await collectRepositorySnapshot(this.config, signal, commitSha, focus);
     const evidenceContext: EvidenceValidationContext = {
       files: snapshot.files,
       commitSha: snapshot.commitSha,
@@ -349,7 +352,7 @@ export class RepositoryAssessor {
   }
 }
 
-export async function collectRepositorySnapshot(config: ProjectConfig, signal?: AbortSignal, expectedCommitSha?: string): Promise<{
+export async function collectRepositorySnapshot(config: ProjectConfig, signal?: AbortSignal, expectedCommitSha?: string, focusRequirements: string[] = []): Promise<{
   commitSha: string;
   dirty: boolean;
   files: string[];
@@ -383,21 +386,45 @@ export async function collectRepositorySnapshot(config: ProjectConfig, signal?: 
   const candidates = tracked.exitCode === 0
     ? tracked.stdout.split('\n').map((value) => value.trim()).filter(Boolean)
     : listFiles(root);
-  const files = [...new Set(candidates)]
-    .filter((relative) => safeRelative(relative) && !sensitivePath(relative))
-    .sort()
-    .slice(0, config.program.maxAssessmentFiles);
-  const prioritized = [...files].sort((left, right) => filePriority(left) - filePriority(right) || left.localeCompare(right));
+  const safeFiles = [...new Set(candidates)]
+    .filter((relative) => safeRelative(relative) && !sensitivePath(relative));
+  const focusTokens = focusRequirements.map(pathTokens).filter((tokens) => tokens.size > 0);
+  const score = (relative: string): number => {
+    const tokens = pathTokens(relative);
+    return focusTokens.reduce((total, requirement) => total + [...tokens].filter((token) => requirement.has(token)).length, 0);
+  };
+  const prioritized = safeFiles.sort((left, right) => {
+    const leftScore = score(left);
+    const rightScore = score(right);
+    const tier = (relative: string, relevance: number): number => {
+      const priority = filePriority(relative);
+      if (priority === 0) return 0;
+      if (priority <= 2) return relevance > 0 ? 1 : 2;
+      return 3;
+    };
+    // Documentation can support an assessment, but cannot consume the
+    // context before relevant executable source and tests are shown.
+    return tier(left, leftScore) - tier(right, rightScore)
+      || rightScore - leftScore
+      || filePriority(left) - filePriority(right)
+      || left.localeCompare(right);
+  }).slice(0, config.program.maxAssessmentFiles);
+  const files = [...prioritized].sort();
   const excerpts: Array<{ path: string; content: string }> = [];
   let remaining = config.program.maxAssessmentBytes;
   for (const relative of prioritized) {
     if (remaining <= 0) break;
     if (!isTextFile(relative)) continue;
+    const focused = filePriority(relative) <= 2 && score(relative) > 0;
+    const perFileLimit = focused ? 64_000 : 16_000;
     let content: string;
     try {
       if (expectedCommitSha) {
-        const shown = await runProcess({ command: 'git', args: ['show', `${commitSha}:${relative}`], cwd: root, timeoutMs: 10_000, signal, maxOutputBytes: 24_000 });
-        if (shown.exitCode !== 0 || shown.stdout.includes('\0')) continue;
+        // A head/tail excerpt must use the real blob tail. Skip unusually
+        // large blobs instead of presenting the tail of a truncated prefix.
+        const maxBlobBytes = 10_000_000;
+        const shown = await runProcess({ command: 'git', args: ['show', `${commitSha}:${relative}`], cwd: root, timeoutMs: 10_000, signal, maxOutputBytes: maxBlobBytes });
+        if (shown.exitCode !== 0 || Buffer.byteLength(shown.stdout) >= maxBlobBytes || shown.stdout.includes('\0')) continue;
         content = redactText(shown.stdout);
       } else {
         const absolute = path.resolve(root, relative);
@@ -409,7 +436,8 @@ export async function collectRepositorySnapshot(config: ProjectConfig, signal?: 
     } catch {
       continue;
     }
-    const excerpt = content.slice(0, Math.min(remaining, 24_000));
+    const limit = Math.min(remaining, perFileLimit);
+    const excerpt = focused ? headTailExcerpt(content, limit) : utf8Prefix(content, limit);
     remaining -= Buffer.byteLength(excerpt);
     excerpts.push({ path: relative, content: excerpt });
   }
@@ -566,8 +594,33 @@ function listFiles(root: string, cursor = root): string[] {
 
 function filePriority(relative: string): number {
   if (PRIORITY_FILES.has(relative) || PRIORITY_FILES.has(path.basename(relative))) return 0;
-  if (/(^|\/)(test|tests|spec|docs|server|src|web|app)(\/|$)/.test(relative)) return 1;
-  return 2;
+  if (/(^|\/)(server|src|web|app|lib)(\/|$)/.test(relative)) return 1;
+  if (/(^|\/)(test|tests|spec|__tests__)(\/|$)/.test(relative) || /\.(test|spec)\.[cm]?[jt]sx?$/.test(relative)) return 2;
+  if (/(^|\/)(docs?|documentation)(\/|$)/.test(relative) || /\.(md|mdx|txt)$/.test(relative)) return 4;
+  return 3;
+}
+
+function pathTokens(value: string): Set<string> {
+  return new Set(value.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase()
+    .split(/[^a-z0-9]+/).filter((token) => token.length > 2));
+}
+
+function headTailExcerpt(content: string, limit: number): string {
+  if (Buffer.byteLength(content) <= limit) return content;
+  const marker = '\n[...middle of focused file omitted...]\n';
+  if (limit <= marker.length + 2) return utf8Prefix(content, limit);
+  const headBytes = Math.floor((limit - Buffer.byteLength(marker)) / 2);
+  const tailBytes = limit - Buffer.byteLength(marker) - headBytes;
+  const bytes = Buffer.from(content);
+  const head = utf8Prefix(bytes.subarray(0, headBytes).toString('utf8'), headBytes);
+  const tail = bytes.subarray(-tailBytes).toString('utf8').replace(/^\uFFFD+/, '');
+  return head + marker + tail;
+}
+
+function utf8Prefix(content: string, limit: number): string {
+  let excerpt = Buffer.from(content).subarray(0, limit).toString('utf8');
+  while (Buffer.byteLength(excerpt) > limit) excerpt = excerpt.slice(0, -1);
+  return excerpt;
 }
 
 function isTextFile(relative: string): boolean {

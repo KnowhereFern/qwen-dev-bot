@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.100] - 2026-11-04
+
+- Prioritize source and tests during repository assessment, and include both ends of files tied to unresolved requirements so documentation cannot hide current implementation evidence.
+
 ## [1.0.0-rc.96] - 2026-11-04
 
 - Let the controller apply one audited, operator-approved tracked-file cleanup before a sandboxed recovery session and reconcile it safely after interruption.
