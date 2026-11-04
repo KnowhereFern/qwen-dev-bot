@@ -56,6 +56,8 @@ describe('QwenAgenticEvaluator streamed verdict', () => {
     expect(options.args).toContain('--json-schema');
     expect(options.args).not.toContain('--allowed-tools');
     const prompt = options.args?.[options.args.indexOf('--prompt') + 1] ?? '';
+    expect(prompt).toContain('Call the structured_output tool');
+    expect(prompt).toContain('Do not return JSON as ordinary assistant text');
     expect(prompt).toContain(`Your working directory is the candidate worktree: ${options.cwd}`);
     expect(prompt).toContain('Use relative paths from this directory for every read, grep, and glob.');
     const excluded = options.args?.slice(options.args.indexOf('--exclude-tools') + 1, options.args.indexOf('--exclude-tools') + 3).join(',') ?? '';

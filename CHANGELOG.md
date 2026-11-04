@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.92] - 2026-11-04
+
+- Tell independent reviewers to submit verdicts through Qwen's required structured output tool.
+
 ## [1.0.0-rc.91] - 2026-11-04
 
 - Permit the immutable installed gate runner using Qwen's parsed exact-command rule, including installation paths with spaces.
