@@ -304,11 +304,30 @@ describe('RepositoryAssessor', () => {
     expect(firstDoc).toBeGreaterThan(test);
   });
 
-  it('shows the tail of a focused exact-commit source file without leaking tracked secrets', async () => {
+  it('applies the file-count cap after ranking relevant source', async () => {
+    const root = gitRepo();
+    mkdirSync(path.join(root, 'docs'), { recursive: true });
+    mkdirSync(path.join(root, 'src'), { recursive: true });
+    for (let index = 0; index < 8; index += 1) {
+      writeFileSync(path.join(root, 'docs', `guide-${index}.md`), 'documentation\n');
+    }
+    writeFileSync(path.join(root, 'src', 'target.ts'), 'export const target = true;\n');
+    execFileSync('git', ['add', '.'], { cwd: root });
+    execFileSync('git', ['commit', '-qm', 'add capped evidence'], { cwd: root });
+    const config = defaultProjectConfig(root, 'fixture', 'owner/fixture');
+    config.program.maxAssessmentFiles = 4;
+
+    const snapshot = await collectRepositorySnapshot(config, undefined, undefined, ['target']);
+    expect(snapshot.files).toContain('src/target.ts');
+    expect(snapshot.excerpts.find((entry) => entry.path === 'src/target.ts')?.content).toContain('target = true');
+    expect(snapshot.files.length).toBeLessThanOrEqual(4);
+  });
+
+  it('shows the actual tail of a large focused exact-commit file without leaking tracked secrets', async () => {
     const root = gitRepo();
     mkdirSync(path.join(root, 'src'), { recursive: true });
     writeFileSync(path.join(root, 'src', 'phenotype-store.ts'),
-      `export const beginning = true;\n${'// 🔋 filler\n'.repeat(8_000)}export function setTokenBudget() { return true; }\n`);
+      `export const beginning = true;\n${'// 🔋 filler\n'.repeat(25_000)}export function setTokenBudget() { return true; }\n`);
     writeFileSync(path.join(root, '.env'), 'PRIVATE_VALUE=do-not-show\n');
     execFileSync('git', ['add', '.'], { cwd: root });
     execFileSync('git', ['commit', '-qm', 'add focused source'], { cwd: root });

@@ -386,16 +386,14 @@ export async function collectRepositorySnapshot(config: ProjectConfig, signal?: 
   const candidates = tracked.exitCode === 0
     ? tracked.stdout.split('\n').map((value) => value.trim()).filter(Boolean)
     : listFiles(root);
-  const files = [...new Set(candidates)]
-    .filter((relative) => safeRelative(relative) && !sensitivePath(relative))
-    .sort()
-    .slice(0, config.program.maxAssessmentFiles);
+  const safeFiles = [...new Set(candidates)]
+    .filter((relative) => safeRelative(relative) && !sensitivePath(relative));
   const focusTokens = focusRequirements.map(pathTokens).filter((tokens) => tokens.size > 0);
   const score = (relative: string): number => {
     const tokens = pathTokens(relative);
     return focusTokens.reduce((total, requirement) => total + [...tokens].filter((token) => requirement.has(token)).length, 0);
   };
-  const prioritized = [...files].sort((left, right) => {
+  const prioritized = safeFiles.sort((left, right) => {
     const leftScore = score(left);
     const rightScore = score(right);
     const tier = (relative: string, relevance: number): number => {
@@ -410,7 +408,8 @@ export async function collectRepositorySnapshot(config: ProjectConfig, signal?: 
       || rightScore - leftScore
       || filePriority(left) - filePriority(right)
       || left.localeCompare(right);
-  });
+  }).slice(0, config.program.maxAssessmentFiles);
+  const files = [...prioritized].sort();
   const excerpts: Array<{ path: string; content: string }> = [];
   let remaining = config.program.maxAssessmentBytes;
   for (const relative of prioritized) {
@@ -421,8 +420,11 @@ export async function collectRepositorySnapshot(config: ProjectConfig, signal?: 
     let content: string;
     try {
       if (expectedCommitSha) {
-        const shown = await runProcess({ command: 'git', args: ['show', `${commitSha}:${relative}`], cwd: root, timeoutMs: 10_000, signal, maxOutputBytes: focused ? 200_000 : 80_000 });
-        if (shown.exitCode !== 0 || shown.stdout.includes('\0')) continue;
+        // A head/tail excerpt must use the real blob tail. Skip unusually
+        // large blobs instead of presenting the tail of a truncated prefix.
+        const maxBlobBytes = 10_000_000;
+        const shown = await runProcess({ command: 'git', args: ['show', `${commitSha}:${relative}`], cwd: root, timeoutMs: 10_000, signal, maxOutputBytes: maxBlobBytes });
+        if (shown.exitCode !== 0 || Buffer.byteLength(shown.stdout) >= maxBlobBytes || shown.stdout.includes('\0')) continue;
         content = redactText(shown.stdout);
       } else {
         const absolute = path.resolve(root, relative);
