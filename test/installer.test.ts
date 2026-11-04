@@ -118,6 +118,55 @@ describe('guided installer', () => {
     });
     expect(provider.generationConfig).toBeUndefined();
     expect(provider).not.toHaveProperty('generationConfig');
+    expect(provider.capabilities).toEqual({
+      reasoning: {
+        profile: 'openai-reasoning',
+        efforts: ['low', 'medium', 'high', 'xhigh'],
+        defaultEffort: 'xhigh',
+        canDisable: false,
+      },
+    });
+    expect(settings.model.reasoningEffort).toBe('xhigh');
+  });
+
+  it('drops the Crouton mandatory-reasoning declaration when switching back to QwenCloud', async () => {
+    const root = makeTmp('installer-crouton-switchback');
+    process.env.QWEN_HARNESS_STATE_DIR = makeTmp('installer-crouton-switchback-state');
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'fixture' }));
+    const baseAnswers = {
+      projectName: 'fixture',
+      githubRepo: 'owner/fixture',
+      trustedAuthor: 'owner',
+      installQwen: false,
+      linkExtension: false,
+      installService: false,
+      bootstrapDependencies: false,
+      configureGitHub: false,
+    };
+    await installProject({ root, yes: true, answers: { ...baseAnswers, qwenModel: 'stealth/crouton-alpha' } });
+    await installProject({
+      root,
+      yes: true,
+      answers: {
+        ...baseAnswers,
+        qwenModel: 'qwen3.8-max',
+        qwenBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        qwenCredentialEnvKey: 'DASHSCOPE_API_KEY',
+        qwenBillingPlan: 'standard' as const,
+      },
+    });
+
+    const settingsFile = path.join(root, '.qwen', 'settings.json');
+    const settings = JSON.parse(readFileSync(settingsFile, 'utf8'));
+    const provider = settings.modelProviders.openai.find((candidate: { id: string }) => candidate.id === 'qwen3.8-max');
+    expect(provider).toMatchObject({
+      generationConfig: { extra_body: { enable_thinking: true, preserve_thinking: true } },
+    });
+    expect(provider).not.toHaveProperty('capabilities');
+    // The retired Crouton entry may remain for history, but it must not leak
+    // stale QwenCloud generation flags either.
+    const crouton = settings.modelProviders.openai.find((candidate: { id: string }) => candidate.id === 'stealth/crouton-alpha');
+    expect(crouton).not.toHaveProperty('generationConfig');
   });
 
   it('rejects an explicit conflicting Crouton route field before mutating the existing config', async () => {

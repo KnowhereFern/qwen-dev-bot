@@ -743,8 +743,25 @@ function mergeQwenSettings(file: string, config: ProjectConfig): Record<string, 
     baseUrl: config.qwen.baseUrl,
     envKey: config.qwen.credentialEnvKey,
     ...(croutonRoute ? {} : { generationConfig: { extra_body: { enable_thinking: true, preserve_thinking: true } } }),
+    // Qwen Code side queries must keep reasoning enabled for this route.
+    ...(croutonRoute
+      ? {
+          capabilities: {
+            reasoning: {
+              profile: 'openai-reasoning',
+              efforts: ['low', 'medium', 'high', 'xhigh'],
+              defaultEffort: 'xhigh',
+              canDisable: false,
+            },
+          },
+        }
+      : {}),
   });
-  if (croutonRoute) delete qwenProvider.generationConfig;
+  if (croutonRoute) {
+    delete qwenProvider.generationConfig;
+  } else {
+    delete qwenProvider.capabilities;
+  }
   const merged = deepMerge(existing, {
     model: {
       name: config.qwen.model,
