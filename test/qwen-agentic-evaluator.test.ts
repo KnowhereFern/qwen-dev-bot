@@ -68,6 +68,24 @@ describe('QwenAgenticEvaluator streamed verdict', () => {
     }
   });
 
+  it('filters the neutral "No blocking findings" sentinel instead of creating a false blocker', async () => {
+    output([terminal(JSON.stringify({ ...verdict, blockingFindings: ['  NO BLOCKING FINDINGS. '] }))]);
+    const result = await fixture()();
+    expect(result).toMatchObject({ score: 1, blockingFindings: [] });
+  });
+
+  it('keeps a real finding alongside the neutral sentinel', async () => {
+    output([terminal(JSON.stringify({ ...verdict, blockingFindings: ['No blocking findings', 'missing provider verification'] }))]);
+    const result = await fixture()();
+    expect(result.blockingFindings).toEqual(['missing provider verification']);
+  });
+
+  it('does not filter sentinel-like substantive findings', async () => {
+    output([terminal(JSON.stringify({ ...verdict, blockingFindings: ['No blocking findings were recorded for the rollback criterion'] }))]);
+    const result = await fixture()();
+    expect(result.blockingFindings).toEqual(['No blocking findings were recorded for the rollback criterion']);
+  });
+
   it('accepts object verdicts', async () => {
     output([terminal(verdict)]);
     expect(await fixture()()).toMatchObject(verdict);

@@ -642,7 +642,15 @@ function validateJudge(value: JudgeOutput): void {
   if (value.blockingFindings !== undefined && (!Array.isArray(value.blockingFindings) || value.blockingFindings.some((item) => typeof item !== 'string'))) {
     throw new Error('Qwen judge returned invalid blocking findings');
   }
-  value.blockingFindings ??= [];
+  value.blockingFindings = normalizeBlockingFindings(value.blockingFindings);
+}
+
+/** Drop the literal neutral sentinel "No blocking findings" that reviewers
+ * emit even on passing verdicts; with outer whitespace, case, or one
+ * terminal period tolerated. Any other string is substantive and kept. */
+function normalizeBlockingFindings(findings: string[] | undefined): string[] {
+  if (!findings) return [];
+  return findings.filter((item) => item.trim().replace(/[.]$/, '').toLowerCase() !== 'no blocking findings');
 }
 
 function sha256(value: string | Buffer): string {

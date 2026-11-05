@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.108] - 2026-11-05
+
+- Ignore the reviewer's literal "No blocking findings" placeholder while retaining substantive review findings.
+
 ## [1.0.0-rc.107] - 2026-11-05
 
 - Require the independent reviewer to cite a repository line or passing gate for every task acceptance criterion, and keep those claims in the review evidence.
