@@ -24,6 +24,19 @@ import { AssessmentContractError, RepositoryAssessor } from './repository-assess
  * observation escalate to recovery-blocked. */
 const PENDING_CHECKS_ESCALATION_MS = 60 * 60 * 1_000;
 
+/** Operator coverage challenge projected from a persisted
+ * program.coverage_challenged event. */
+interface CoverageChallenge {
+  coverageId: string;
+  reason: string;
+  commitSha: string;
+  files: string[];
+  authorizationId: string;
+  authorizedBy: string;
+  planRevision: number;
+  createdAt: number;
+}
+
 export interface ProgramTickResult {
   action: 'disabled' | 'idle' | 'deployed' | 'deployment-failed' | 'reassessed' | 'recovery-blocked' | 'checks-pending' | 'awaiting-material-approval' | 'delivered' | 'maintaining';
   planId: string | null;
@@ -191,7 +204,33 @@ export class ProgramController {
         }]
       : [];
     const operationalEvidence = [...checkEvidence, ...deploymentEvidence];
-    const assessment = await this.assessor.assess(document, signal, operationalEvidence, targetCommitSha, undefined, plan.coverage ?? []);
+    // Durable operator coverage challenges: an accepted product constraint can
+    // contradict the model's implemented classification. Unresolved
+    // challenges deterministically hold their coverage partial/implement until
+    // a NEW approved unsuperseded implement story from a revision later than
+    // the challenge's recorded plan revision completes with a persisted
+    // passing exact-merge post-merge verification. Global gates, model
+    // evidence, and pre-challenge completed stories never clear the hold.
+    const unresolvedChallenges = await this.unresolvedCoverageChallenges(plan, targetCommitSha, signal);
+    signal?.throwIfAborted();
+    const challengedCoverageIds = new Set(unresolvedChallenges.map((challenge) => challenge.coverageId));
+    // Bounded structured summary for the assessor; challenge content is
+    // untrusted evidence for classification, never acceptance authority.
+    const challengeFeedback = unresolvedChallenges.length
+      ? JSON.stringify(unresolvedChallenges.map((challenge) => ({
+          coverageId: challenge.coverageId,
+          reason: challenge.reason.slice(0, 500),
+          evidenceCommitSha: challenge.commitSha,
+          evidenceFiles: challenge.files.slice(0, 5),
+          planRevision: challenge.planRevision,
+        })))
+      : undefined;
+    // Challenged prior coverage stays in snapshot focus even when the frozen
+    // plan coverage still says implemented; the clone changes only the status
+    // handed to the assessor, never the frozen id or requirement.
+    const priorCoverage = (plan.coverage ?? []).map((entry) =>
+      challengedCoverageIds.has(entry.id) ? { ...entry, status: 'partial' as const } : entry);
+    const assessment = await this.assessor.assess(document, signal, operationalEvidence, targetCommitSha, challengeFeedback, priorCoverage);
     signal?.throwIfAborted();
     // Guard: an approved, unsuperseded verify story with an issued task that
     // has not finished is the standing acceptance contract for its coverage.
@@ -206,6 +245,15 @@ export class ProgramController {
       entry.status = 'unverified';
       entry.requiredAction = 'verify';
       entry.rationale = `Implemented claim from repository checks is held unverified pending accepted verification task #${contract.story.normalizedIssueNumber} (story ${contract.story.key}); no accepted verification or merge has completed that contract`;
+    }
+    // Deterministic challenge hold: overrides whatever the model or global
+    // evidence claimed for the challenged coverage.
+    for (const entry of assessment.coverage) {
+      const challenge = unresolvedChallenges.find((candidate) => candidate.coverageId === entry.id);
+      if (!challenge) continue;
+      entry.status = 'partial';
+      entry.requiredAction = 'implement';
+      entry.rationale = `Operator coverage challenge ${challenge.authorizationId} holds this coverage partial: the accepted constraint "${challenge.reason.slice(0, 200)}" is not satisfied by current evidence; only a new approved implement story from a revision later than ${challenge.planRevision} with an exact-merge passing post-merge verification can restore it`;
     }
     // Deterministic requirement-proof binding: an implemented coverage entry is
     // only accepted when a harness-tracked story/task chain explicitly covers
@@ -255,7 +303,8 @@ export class ProgramController {
     // not — the planner may propose an approved-scope replacement repair
     // story with preserved lineage for their coverage.
     const planningVerify = this.pendingVerifyContracts(plan);
-    const planningAssessment = await this.planningOnlyAssessment(plan, assessment, checks, signal, planningVerify);
+    const pendingChallengedImplement = this.pendingChallengedImplementContracts(plan, unresolvedChallenges);
+    const planningAssessment = await this.planningOnlyAssessment(plan, assessment, checks, signal, planningVerify, pendingChallengedImplement);
     signal?.throwIfAborted();
     if (!planningAssessment.coverage.some((entry) => entry.requiredAction !== 'none')) {
       // Guard: when the only actionable work is already assigned to pending
@@ -264,7 +313,9 @@ export class ProgramController {
       // result). Retain the active/blocked program state with the updated
       // coverage and leave the pending task contracts intact.
       const heldByPendingTasks = [...planningVerify.keys()].some((id) =>
-        planningAssessment.coverage.some((entry) => entry.id === id && entry.status === 'unverified'));
+        planningAssessment.coverage.some((entry) => entry.id === id && entry.status === 'unverified')) ||
+        [...pendingChallengedImplement.keys()].some((id) =>
+          planningAssessment.coverage.some((entry) => entry.id === id && entry.status === 'partial'));
       const retainedStatus = heldByPendingTasks && ['active', 'blocked'].includes(plan.status) ? plan.status : 'blocked';
       await this.coordinator.updateProgramState(plan.id, retainedStatus, {
         assessmentId: assessment.id,
@@ -369,6 +420,7 @@ export class ProgramController {
     checks: CheckSummary,
     signal?: AbortSignal,
     pendingVerify: Map<string, { story: PortfolioStory; task: TaskRecord | null }> = new Map(),
+    pendingChallengedImplement: Map<string, { story: PortfolioStory; task: TaskRecord | null }> = new Map(),
   ): Promise<RepositoryAssessment> {
     const coverage: ObjectiveCoverage[] = structuredClone(assessment.coverage);
     const verifiedChecks = checks.complete && checks.successful && checks.failed.length === 0;
@@ -424,6 +476,12 @@ export class ProgramController {
     for (const entry of coverage) {
       if (entry.requiredAction === 'verify' && pendingVerify.has(entry.id)) entry.requiredAction = 'none';
     }
+    // Guard: challenged implementation already assigned to an approved
+    // pending implement story from a later revision must not be planned
+    // again; the persisted coverage stays partial until that story resolves.
+    for (const entry of coverage) {
+      if (entry.requiredAction === 'implement' && pendingChallengedImplement.has(entry.id)) entry.requiredAction = 'none';
+    }
     return { ...assessment, coverage };
   }
 
@@ -463,6 +521,74 @@ export class ProgramController {
       if (task?.state === 'done') continue;
       if (task && !options.includeFailed && ['failed', 'quarantined', 'cancelled'].includes(task.state)) continue;
       for (const id of story.coverageIds ?? []) {
+        if (!pending.has(id)) pending.set(id, { story, task });
+      }
+    }
+    return pending;
+  }
+
+  /** Durable operator coverage challenge projected from persisted events. */
+  private coverageChallenges(plan: PortfolioPlan): CoverageChallenge[] {
+    return this.store.listEvents('program.coverage_challenged')
+      .filter((event) => event.payload.planId === plan.id)
+      .map((event) => ({
+        coverageId: String(event.payload.coverageId ?? ''),
+        reason: String(event.payload.reason ?? ''),
+        commitSha: String(event.payload.commitSha ?? ''),
+        files: Array.isArray(event.payload.files) ? event.payload.files.map(String) : [],
+        authorizationId: String(event.payload.authorizationId ?? ''),
+        authorizedBy: String(event.payload.authorizedBy ?? ''),
+        planRevision: Number(event.payload.planRevision ?? 1),
+        createdAt: event.createdAt,
+      }));
+  }
+
+  private async unresolvedCoverageChallenges(plan: PortfolioPlan, commitSha: string, signal?: AbortSignal): Promise<CoverageChallenge[]> {
+    const unresolved: CoverageChallenge[] = [];
+    for (const challenge of this.coverageChallenges(plan)) {
+      if (!await this.challengeResolutionProof(plan, challenge, commitSha, signal)) unresolved.push(challenge);
+    }
+    return unresolved;
+  }
+
+  /** A challenge clears only for a NEW approved unsuperseded implement story
+   * from a revision strictly later than the challenged plan revision whose
+   * issued task is done, whose merge is an ancestor of the assessed commit,
+   * and with a persisted passing exact-merge post-merge verification.
+   * Pre-challenge stories, global gates, and model evidence never resolve it. */
+  private async challengeResolutionProof(plan: PortfolioPlan, challenge: CoverageChallenge, commitSha: string, signal?: AbortSignal): Promise<boolean> {
+    if (plan.approvedAt === null) return false;
+    const postmergeEvents = this.store.listEvents('postmerge.verification');
+    for (const story of plan.stories) {
+      if (story.supersededAt || story.workType !== 'implement' || story.normalizedIssueNumber === null) continue;
+      if (!story.coverageIds?.includes(challenge.coverageId)) continue;
+      if ((story.revision ?? 0) <= challenge.planRevision) continue;
+      const task = this.store.findByIssue(story.normalizedIssueNumber);
+      if (!task || task.state !== 'done' || !isCommitSha(task.mergeSha)) continue;
+      if (!await safeMergeAncestor(this.config.project.root, task.mergeSha, commitSha, signal)) continue;
+      if (postmergeEvents.some((event) => event.taskId === task.id && event.payload.mergeSha === task.mergeSha && event.payload.passed === true)) return true;
+    }
+    return false;
+  }
+
+  /** Challenged coverage mapped to an approved unsuperseded implement story
+   * from a revision later than its challenge whose work is actively pending —
+   * either an issued task that has not finished or a story whose issue has
+   * not yet been normalized. Duplicate implement planning is suppressed for
+   * that coverage while the persisted coverage stays partial.
+   * Failed/quarantined/cancelled tasks are excluded so a replacement
+   * implement story can still be planned. */
+  private pendingChallengedImplementContracts(plan: PortfolioPlan, unresolved: CoverageChallenge[]): Map<string, { story: PortfolioStory; task: TaskRecord | null }> {
+    const pending = new Map<string, { story: PortfolioStory; task: TaskRecord | null }>();
+    if (plan.approvedAt === null) return pending;
+    for (const story of plan.stories) {
+      if (story.supersededAt || story.workType !== 'implement') continue;
+      const task = story.normalizedIssueNumber === null ? null : this.store.findByIssue(story.normalizedIssueNumber) ?? null;
+      if (task?.state === 'done') continue;
+      if (task && ['failed', 'quarantined', 'cancelled'].includes(task.state)) continue;
+      for (const id of story.coverageIds ?? []) {
+        const challenge = unresolved.find((candidate) => candidate.coverageId === id);
+        if (!challenge || (story.revision ?? 0) <= challenge.planRevision) continue;
         if (!pending.has(id)) pending.set(id, { story, task });
       }
     }

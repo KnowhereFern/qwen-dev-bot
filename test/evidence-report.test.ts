@@ -148,6 +148,29 @@ describe('program evidence report', () => {
     expect(markdown).not.toContain(outOfScope.id);
     store.close();
   });
+  it('includes operator coverage challenges as governance interventions', () => {
+    const store = new PersistentTaskStore('evidence-challenge', makeTmp('evidence-report-challenge'));
+    store.recordEvent('program.coverage_challenged', null, {
+      planId: 'plan_ch', coverageId: 'TOKEN-CULLING', commitSha: 'a'.repeat(40), files: ['src/app.ts'],
+      reason: 'Mounted-only overbudget must be observable', authorizationId: 'challenge-1', authorizedBy: 'Fern',
+      planRevision: 1, requirement: 'Mounted-only overbudget must be observable', binding: 'fixture',
+    });
+    store.recordEvent('program.coverage_challenged', null, { planId: 'other_plan', coverageId: 'X', authorizationId: 'challenge-2' });
+    const plan: PortfolioPlan = {
+      id: 'plan_ch', projectId: store.projectId, sourcePath: 'PROJECT.md', contentHash: 'objective', sourceContent: 'Build it',
+      title: 'Challenge', objective: 'Build it', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [],
+      status: 'active', epicIssueNumber: null, epicIssueUrl: null,
+      stories: [], coverage: [{ id: 'TOKEN-CULLING', requirement: 'Mounted-only overbudget must be observable', status: 'partial', requiredAction: 'implement', rationale: 'Challenged', evidence: [] }],
+      createdAt: 1_000, updatedAt: 2_000, approvedAt: 1_100,
+    };
+    const report = buildEvidenceReport(store, plan, 3_000);
+    const challenge = report.interventions.find((event) => event.type === 'program.coverage_challenged');
+    expect(challenge?.payload).toMatchObject({ planId: 'plan_ch', coverageId: 'TOKEN-CULLING', authorizationId: '[REDACTED]' });
+    expect(report.interventions).toHaveLength(1);
+    expect(report.metrics.interventionCount).toBe(1);
+    expect(formatEvidenceReport(report)).toContain('program.coverage_challenged');
+    store.close();
+  });
 });
 
 function spec(url: string): TaskSpec {

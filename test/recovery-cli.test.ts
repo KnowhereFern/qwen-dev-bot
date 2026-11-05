@@ -1,18 +1,27 @@
+import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mock = vi.hoisted(() => ({
   config: vi.fn(), authorize: vi.fn(), close: vi.fn(), find: vi.fn(), validateGitRm: vi.fn(), grant: vi.fn(), feedback: vi.fn(),
+  getPlan: vi.fn(), listEvents: vi.fn(), recordEvent: vi.fn(), runProcess: vi.fn(),
 }));
 vi.mock('../src/core/config.js', async (original) => ({
   ...await original<typeof import('../src/core/config.js')>(),
   loadProjectConfig: mock.config,
 }));
+vi.mock('../src/runtime/safe-process.js', () => ({
+  runProcess: mock.runProcess,
+}));
 vi.mock('../src/core/persistent-store.js', () => ({
   PersistentTaskStore: class {
+    projectId = 'test-project';
     findByIssue = mock.find;
     authorizeRecovery = mock.authorize;
     grantGitRmPermission = mock.grant;
     recordOperatorFeedback = mock.feedback;
+    getPortfolioPlan = mock.getPlan;
+    listEvents = mock.listEvents;
+    recordEvent = mock.recordEvent;
     retryBudget = () => ({ failures: 5, limit: 8 });
     close = mock.close;
   },
@@ -193,5 +202,107 @@ describe('operator task-feedback command', () => {
     mock.feedback.mockImplementationOnce(() => { throw new Error('Operator feedback authorization conflicts'); });
     await expect(main(['task-feedback', ...flags, '--yes'])).rejects.toThrow('conflicts');
     expect(mock.close).toHaveBeenCalledOnce();
+  });
+});
+
+describe('operator coverage-challenge command', () => {
+  const commit = 'a'.repeat(40);
+  const planFixture = {
+    id: 'plan_9', approvedAt: 1, revision: 1, repositorySha: commit,
+    coverage: [{ id: 'TOKEN-CULLING', requirement: 'Mounted-only overbudget is observable', status: 'implemented', requiredAction: 'none', rationale: 'Verified', evidence: [] }],
+  };
+  const challengePayload = {
+    planId: 'plan_9',
+    coverageId: 'TOKEN-CULLING',
+    commitSha: commit,
+    files: ['src/app.ts'],
+    reason: 'Mounted-only overbudget must be observable',
+    authorizationId: 'challenge-1',
+    authorizedBy: 'Fern',
+    planRevision: 1,
+    requirement: 'Mounted-only overbudget is observable',
+  };
+  const challengeBinding = createHash('sha256').update(JSON.stringify(challengePayload)).digest('hex');
+  const challengeKey = 'program:coverage-challenge:plan_9:challenge-1';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mock.config.mockReturnValue({ project: { name: 'test', root: '/tmp/test-project', githubRepo: 'owner/test' } });
+    mock.getPlan.mockReturnValue(planFixture);
+    mock.listEvents.mockReturnValue([]);
+    mock.recordEvent.mockImplementation((type: string, taskId: string | null, payload: Record<string, unknown>, idempotencyKey: string | null) =>
+      ({ id: 'event-1', type, taskId, payload, idempotencyKey, createdAt: 1 }));
+    mock.runProcess.mockResolvedValue({ exitCode: 0, stdout: 'blob\n', stderr: '' });
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+  const flags = ['--plan', 'plan_9', '--coverage', 'TOKEN-CULLING', '--commit', commit, '--file', 'src/app.ts',
+    '--reason', 'Mounted-only overbudget must be observable', '--authorization', 'challenge-1', '--authorized-by', 'Fern'];
+
+  it('requires explicit operator confirmation and every binding before opening state', async () => {
+    await expect(main(['coverage-challenge', ...flags])).rejects.toThrow('requires --yes');
+    await expect(main(['coverage-challenge', ...flags.slice(0, -2), '--yes'])).rejects.toThrow('requires --yes');
+    const shortCommit = ['--plan', 'plan_9', '--coverage', 'TOKEN-CULLING', '--commit', 'abc123', '--file', 'src/app.ts',
+      '--reason', 'Mounted-only overbudget must be observable', '--authorization', 'challenge-1', '--authorized-by', 'Fern'];
+    await expect(main(['coverage-challenge', ...shortCommit, '--yes'])).rejects.toThrow('full 40-hex');
+    expect(mock.config).not.toHaveBeenCalled();
+    expect(mock.recordEvent).not.toHaveBeenCalled();
+  });
+
+  it('rejects unknown plans, unapproved plans, unknown coverage ids, and stale commits', async () => {
+    mock.getPlan.mockReturnValue(undefined);
+    await expect(main(['coverage-challenge', ...flags, '--yes'])).rejects.toThrow('Unknown portfolio plan');
+    mock.getPlan.mockReturnValue({ ...planFixture, approvedAt: null });
+    await expect(main(['coverage-challenge', ...flags, '--yes'])).rejects.toThrow('approved plan');
+    mock.getPlan.mockReturnValue({ ...planFixture, coverage: [] });
+    await expect(main(['coverage-challenge', ...flags, '--yes'])).rejects.toThrow('Unknown coverage id');
+    mock.getPlan.mockReturnValue(planFixture);
+    const stale = ['--plan', 'plan_9', '--coverage', 'TOKEN-CULLING', '--commit', 'b'.repeat(40), '--file', 'src/app.ts',
+      '--reason', 'Mounted-only overbudget must be observable', '--authorization', 'challenge-1', '--authorized-by', 'Fern'];
+    await expect(main(['coverage-challenge', ...stale, '--yes'])).rejects.toThrow('does not match');
+    expect(mock.recordEvent).not.toHaveBeenCalled();
+  });
+
+  it('rejects cited paths that are not tracked at the exact commit', async () => {
+    mock.runProcess.mockResolvedValue({ exitCode: 128, stdout: '', stderr: 'not found' });
+    await expect(main(['coverage-challenge', ...flags, '--yes'])).rejects.toThrow('not a tracked file');
+    expect(mock.recordEvent).not.toHaveBeenCalled();
+    expect(mock.close).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a tracked directory as cited file', async () => {
+    mock.runProcess.mockResolvedValue({ exitCode: 0, stdout: 'tree\n', stderr: '' });
+    await expect(main(['coverage-challenge', ...flags, '--yes'])).rejects.toThrow('not a tracked file');
+    expect(mock.recordEvent).not.toHaveBeenCalled();
+  });
+
+  it('appends the idempotent challenge event with the exact payload', async () => {
+    expect(await main(['coverage-challenge', ...flags, '/tmp/test-project', '--yes', '--json'])).toBe(0);
+    expect(mock.config).toHaveBeenCalledWith('/tmp/test-project');
+    expect(mock.recordEvent).toHaveBeenCalledOnce();
+    expect(mock.recordEvent).toHaveBeenCalledWith('program.coverage_challenged', null,
+      { ...challengePayload, binding: challengeBinding }, challengeKey);
+    expect(mock.close).toHaveBeenCalledOnce();
+  });
+
+  it('rejects reusing an authorization id with a different payload', async () => {
+    mock.listEvents.mockReturnValue([{ idempotencyKey: challengeKey, payload: { binding: 'different-binding' } }]);
+    await expect(main(['coverage-challenge', ...flags, '--yes'])).rejects.toThrow('conflicts with its original binding');
+    expect(mock.recordEvent).not.toHaveBeenCalled();
+  });
+
+  it('rejects a conflicting authorization inserted between lookup and append', async () => {
+    mock.recordEvent.mockReturnValue({ idempotencyKey: challengeKey, payload: { binding: 'different-binding' } });
+    await expect(main(['coverage-challenge', ...flags, '--yes'])).rejects.toThrow('conflicts with its original binding');
+    expect(mock.recordEvent).toHaveBeenCalledOnce();
+  });
+
+  it('treats an identical replay as idempotent without writing again', async () => {
+    mock.listEvents.mockReturnValue([{ idempotencyKey: challengeKey, payload: { binding: challengeBinding } }]);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(await main(['coverage-challenge', ...flags, '--yes', '--json'])).toBe(0);
+    expect(mock.recordEvent).not.toHaveBeenCalled();
+    expect(JSON.parse(log.mock.calls.at(-1)![0] as string)).toMatchObject({ planId: 'plan_9', coverageId: 'TOKEN-CULLING', reused: true });
+    log.mockRestore();
   });
 });

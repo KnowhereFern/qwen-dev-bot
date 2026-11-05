@@ -105,6 +105,7 @@ export function buildEvidenceReport(store: PersistentTaskStore, plan: PortfolioP
       'portfolio.redrafted',
       'program.external_commit_observed',
       'program.manual_intervention_observed',
+      'program.coverage_challenged',
       'task.recovery_authorized',
       'program.revised',
       'program.objective_accepted',
