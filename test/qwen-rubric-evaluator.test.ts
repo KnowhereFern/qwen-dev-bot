@@ -143,6 +143,16 @@ describe('repository-aware empty-diff rubric', () => {
     expect(result.blockingFindings).toEqual(['No provider verification evidence', 'evidence claim rejected: missing claim for criterionIndex 0']);
   });
 
+  it('filters the neutral "No blocking findings" sentinel but keeps a real finding', async () => {
+    const { context, criterion, evaluator, completeJson } = fixture();
+    completeJson.mockResolvedValue({
+      value: { ...verdict, blockingFindings: [' No Blocking Findings.', 'No provider verification evidence'] },
+      raw: '', usage: {},
+    });
+    const result = await evaluator.evaluate(criterion, { ...context, changedFiles: ['payment.ts'], diff: '+ change' });
+    expect(result.blockingFindings).toEqual(['No provider verification evidence']);
+  });
+
   it('keeps API rubric compatibility for tasks without acceptance criteria', async () => {
     const { context, criterion, evaluator, completeJson } = fixture();
     context.task.spec = { ...context.task.spec!, acceptanceCriteria: [] };
