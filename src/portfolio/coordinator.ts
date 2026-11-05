@@ -297,15 +297,28 @@ export class PortfolioCoordinator {
     const recoveryOrigins = this.recoveryOrigins(current, input.draft, input.assessment, input.material);
     const nextRevision = (current.revision ?? 1) + 1;
     const now = Date.now();
+    // Durable wave selection: no reassessment may skip past an unfinished
+    // wave, whatever its reason. Retain (or restore, after an older controller
+    // already advanced past it) the earliest unsuperseded wave that still has
+    // normalized execution work pending, so its verification is not obscured
+    // by newer proposals. The material approval boundary is unchanged, and
+    // when every prior task is done or terminal the wave advances normally —
+    // so quarantine recovery whose only failed work is terminal still advances,
+    // while a wave with another ready task does not activate future work early.
+    const unfinishedWave = earliestUnfinishedWave(current, this.store.list());
+    const durableWave = unfinishedWave !== null && unfinishedWave <= (current.currentWave ?? 1)
+      ? unfinishedWave
+      : null;
+    const resumeWave = durableWave ?? (current.currentWave ?? 1);
     const preserved = current.stories.map((story) =>
-      story.normalizedIssueNumber === null && (story.wave ?? 1) > (current.currentWave ?? 1)
+      story.normalizedIssueNumber === null && (story.wave ?? 1) > resumeWave
         ? { ...story, supersededAt: story.supersededAt ?? now }
         : story,
     );
     const priorKeys = new Set(preserved.map((story) => story.key));
     const keyMap = new Map(input.draft.stories.map((story) => [story.key, uniqueRevisionKey(nextRevision, story.key, priorKeys)]));
     const priorWaveKeys = input.reason === 'quarantine' ? [] : current.stories
-      .filter((story) => (story.wave ?? 1) === (current.currentWave ?? 1) && !story.supersededAt)
+      .filter((story) => (story.wave ?? 1) === resumeWave && !story.supersededAt)
       .map((story) => story.key);
     const revisedDrafts = input.draft.stories.map((story) => ({
       ...story,
@@ -313,7 +326,7 @@ export class PortfolioCoordinator {
       key: keyMap.get(story.key) as string,
       dependsOn: unique(story.dependsOn.map((key) => keyMap.get(key) ?? key)),
     }));
-    const waves = assignWaves(revisedDrafts, current.currentWave ?? 1);
+    const waves = assignWaves(revisedDrafts, resumeWave);
     const newStories = waves.map((story): PortfolioStory => ({
       ...story,
       dependsOn: unique([
@@ -357,7 +370,7 @@ export class PortfolioCoordinator {
       repositorySha: input.assessment.commitSha,
       coverage: structuredClone(input.assessment.coverage),
       revision: nextRevision,
-      currentWave: (current.currentWave ?? 1) + 1,
+      currentWave: durableWave ?? resumeWave + 1,
       revisions: [...(current.revisions ?? []), revision],
       status: input.material && !input.approvedMaterial ? 'awaiting_material_approval' : 'assessing',
       updatedAt: now,
@@ -914,6 +927,30 @@ function renderStoryDecisions(plan: PortfolioPlan, story: PortfolioStory): strin
   return technologies.length || deployments.length
     ? [...technologies, ...deployments, '- Authority is limited to the approved task and configured staging target; production requires approval.']
     : ['- None.'];
+}
+
+const TERMINAL_TASK_STATES = new Set(['failed', 'quarantined', 'cancelled', 'done']);
+
+/**
+ * Earliest wave that still holds unsuperseded normalized execution work:
+ * a story whose normalized issue exists and whose ingested task is in a
+ * non-terminal state (ready/active/waiting/verifying/etc.), or whose
+ * normalized issue has not been ingested into a task yet — issue publication
+ * can precede intake, so such a story still blocks until its task lands.
+ * Terminal work (done/failed/quarantined/cancelled) never blocks. Returns
+ * null when every prior task is done or terminal, allowing normal wave
+ * advancement.
+ */
+function earliestUnfinishedWave(plan: PortfolioPlan, tasks: TaskRecord[]): number | null {
+  let earliest: number | null = null;
+  for (const story of plan.stories) {
+    if (story.supersededAt || story.normalizedIssueNumber === null) continue;
+    const task = tasks.find((candidate) => candidate.issueNumber === story.normalizedIssueNumber);
+    if (task && TERMINAL_TASK_STATES.has(task.state)) continue;
+    const wave = story.wave ?? 1;
+    if (earliest === null || wave < earliest) earliest = wave;
+  }
+  return earliest;
 }
 
 function taskForStory(story: PortfolioStory, tasks: TaskRecord[]): TaskRecord | undefined {

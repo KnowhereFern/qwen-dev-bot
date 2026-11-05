@@ -458,4 +458,98 @@ describe('PersistentTaskStore', () => {
     expect(store.recordPostMergeFailure(task.id, 'detached verification failed at /tmp/run-3', 3).state).toBe('quarantined');
     store.close();
   });
+
+  describe('claim-time portfolio wave authorization', () => {
+    interface StoryOverrides {
+      key: string;
+      wave?: number;
+      revision?: number;
+      supersededAt?: number | null;
+      normalizedIssueNumber: number;
+    }
+
+    function wavePlan(stories: StoryOverrides[], overrides: Partial<PortfolioPlan> = {}, projectId = 'wave-gate'): PortfolioPlan {
+      return {
+        id: 'wave-plan', projectId, sourcePath: 'OBJECTIVE.md', contentHash: 'objective',
+        title: 'Objective', objective: 'Deliver product', constraints: [], definitionOfDone: ['Verified'],
+        technologyDecisions: [], deploymentDecisions: [], status: 'active',
+        epicIssueNumber: null, epicIssueUrl: null, createdAt: 1, updatedAt: 1,
+        approvedAt: 1, repositorySha: 'a'.repeat(40), revision: 1, currentWave: 1,
+        stories: stories.map((story) => ({
+          title: 'Work', goal: 'Work', acceptanceCriteria: ['Verified'], constraints: [], requiredGateIds: [],
+          rewardCriterionIds: [], risk: 'low' as const, dependsOn: [], rollback: 'Revert',
+          technologyDecisionIds: [], deploymentDecisionIds: [],
+          sourceIssueNumber: null, sourceIssueUrl: null,
+          normalizedIssueUrl: null, wave: story.wave, revision: story.revision,
+          supersededAt: story.supersededAt ?? null, normalizedIssueNumber: story.normalizedIssueNumber,
+          key: story.key,
+        })),
+        ...overrides,
+      };
+    }
+
+    it('holds a ready future-wave normalized issue without dependencies until the wave advances', () => {
+      const dir = makeTmp('wave-gate-future');
+      let store = new PersistentTaskStore('wave-gate', dir);
+      store.savePortfolioPlan(wavePlan([{ key: 'S1', wave: 2, normalizedIssueNumber: 101 }]));
+      const task = store.upsert({ issueNumber: 101, title: 'future wave', state: 'ready', spec: taskSpec([]) });
+      const before = store.get(task.id);
+
+      expect(store.claimNext('worker', 1_000, 100)).toBeNull();
+      const held = store.get(task.id);
+      expect(held).toMatchObject({ state: 'ready', attempts: 0, version: before.version });
+      expect(store.listEvents('task.claimed')).toHaveLength(0);
+
+      // Wave advances: the same saved plan now authorizes the lease.
+      store.savePortfolioPlan(wavePlan([{ key: 'S1', wave: 2, normalizedIssueNumber: 101 }], { currentWave: 2, contentHash: 'objective-2' }));
+      expect(store.claimNext('worker', 1_000, 100)?.issueNumber).toBe(101);
+      store.close();
+
+      // Restart recovery: the gate and the advanced wave both survive reload.
+      store = new PersistentTaskStore('wave-gate', dir);
+      store.transition(store.findByIssue(101)!.id, 'ready', { leaseOwner: null, leaseExpiresAt: null });
+      store.savePortfolioPlan(wavePlan([{ key: 'S1', wave: 2, normalizedIssueNumber: 101 }], { currentWave: 1, contentHash: 'objective-3' }));
+      expect(store.claimNext('worker', 1_000, 100)).toBeNull();
+      store.savePortfolioPlan(wavePlan([{ key: 'S1', wave: 2, normalizedIssueNumber: 101 }], { currentWave: 2, contentHash: 'objective-4' }));
+      expect(store.claimNext('worker', 1_000, 100)?.issueNumber).toBe(101);
+      store.close();
+    });
+
+    it('holds pending-material and superseded portfolio stories', () => {
+      const store = new PersistentTaskStore('wave-gate-held', makeTmp('wave-gate-held'));
+      store.savePortfolioPlan(wavePlan(
+        [
+          { key: 'PENDING', wave: 1, revision: 2, normalizedIssueNumber: 201 },
+          { key: 'GONE', wave: 1, supersededAt: 5, normalizedIssueNumber: 202 },
+        ],
+        {
+          revisions: [
+            { number: 1, assessmentId: 'assessment', repositorySha: 'a'.repeat(40), reason: 'initial',
+              material: false, summary: 'initial', createdAt: 1, approvedAt: 1 },
+            { number: 2, assessmentId: 'assessment', repositorySha: 'a'.repeat(40), reason: 'signal',
+              material: true, summary: 'pending material revision', createdAt: 2, approvedAt: null },
+          ],
+        },
+        'wave-gate-held',
+      ));
+      const pending = store.upsert({ issueNumber: 201, title: 'pending material', state: 'ready', spec: taskSpec([]) });
+      const superseded = store.upsert({ issueNumber: 202, title: 'superseded', state: 'ready', spec: taskSpec([]) });
+      expect(store.claimNext('worker', 1_000, 100)).toBeNull();
+      expect(store.get(pending.id)).toMatchObject({ state: 'ready', attempts: 0 });
+      expect(store.get(superseded.id)).toMatchObject({ state: 'ready', attempts: 0 });
+      expect(store.listEvents('task.claimed')).toHaveLength(0);
+      store.close();
+    });
+
+    it('still claims legacy tasks and approved current-wave portfolio stories', () => {
+      const store = new PersistentTaskStore('wave-gate-pass', makeTmp('wave-gate-pass'));
+      store.savePortfolioPlan(wavePlan([{ key: 'S1', wave: 1, normalizedIssueNumber: 301 }], {}, 'wave-gate-pass'));
+      store.upsert({ issueNumber: 301, title: 'current wave story', state: 'ready', spec: taskSpec([]) });
+      store.upsert({ issueNumber: 302, title: 'legacy issue task', state: 'ready', priority: 1, spec: taskSpec([]) });
+
+      expect(store.claimNext('worker', 1_000, 100)?.issueNumber).toBe(301);
+      expect(store.claimNext('worker', 1_000, 100)?.issueNumber).toBe(302);
+      store.close();
+    });
+  });
 });

@@ -278,7 +278,11 @@ describe('ProgramController', () => {
       latestDeploymentId: null, deliveredAt: null, maintenanceStartedAt: null,
     };
     store.savePortfolioPlan(plan);
-    store.upsert({ issueNumber: 10, title: 'Objective', state: 'done' });
+    const done = store.upsert({ issueNumber: 10, title: 'Objective', state: 'done' });
+    store.patch(done.id, { mergeSha: sha });
+    store.recordEvent('postmerge.verification', done.id, {
+      runId: 'fixture-run', mergeSha: sha, startedAt: 1, finishedAt: 2, passed: true, sideEffectFailure: false, gates: [],
+    });
     const controller = new ProgramController(
       config, store, github, new RepositoryAssessor(config, model), new PortfolioPlanner(config, model),
       new EvolutionSignalCollector(config, store, github, model),
@@ -623,7 +627,7 @@ describe('ProgramController', () => {
     });
     const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
     const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
-    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan');
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockResolvedValue(req1Draft());
     try {
       const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
       expect(result.action).not.toBe('delivered');
@@ -632,7 +636,6 @@ describe('ProgramController', () => {
       expect(updated?.status).not.toBe('maintaining');
       expect(updated?.deliveredAt).toBeNull();
       expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
-      expect(planning).not.toHaveBeenCalled();
     } finally {
       assess.mockRestore(); planning.mockRestore(); fixture.store.close();
     }
@@ -692,6 +695,410 @@ describe('ProgramController', () => {
       assess.mockRestore(); planning.mockRestore(); fixture.store.close();
     }
   });
+
+  it('holds a model-implemented claim unverified while its approved verify task is pending, without a duplicate story or delivery', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'VER', requirement: 'Verified behavior', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'VER1', workType: 'verify', coverageIds: ['VER'] })],
+      doneTasks: [],
+    });
+    fixture.store.upsert({ issueNumber: 10, title: 'Verify objective', state: 'ready' });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan');
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'manual', undefined, false, repo.docsSha);
+      expect(result).toMatchObject({ action: 'reassessed', planId: 'repeat_plan' });
+      expect(result.detail).toMatch(/already assigned to pending accepted tasks/);
+      // The pending accepted task holds the coverage unverified: no audit pass.
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
+      // No duplicate verification story and no revision.
+      expect(planning).not.toHaveBeenCalled();
+      const updated = fixture.store.getPortfolioPlan('repeat_plan');
+      expect(updated?.revision).toBe(1);
+      expect(updated?.stories).toHaveLength(1);
+      expect(updated?.stories[0]).toMatchObject({ key: 'VER1', supersededAt: null });
+      expect(updated?.status).not.toBe('delivered');
+      expect(updated?.deliveredAt).toBeNull();
+      // Updated coverage is retained without a revision.
+      expect(updated?.coverage?.[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('holds coverage unverified and suppresses duplicate verify planning while the published issue awaits ingestion', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'VER', requirement: 'Verified behavior', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'VER1', workType: 'verify', coverageIds: ['VER'] })],
+      doneTasks: [],
+    });
+    // No local task is ingested for issue 10: publication preceded intake.
+    expect(fixture.store.findByIssue(10)).toBeNull();
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan');
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'manual', undefined, false, repo.docsSha);
+      expect(result).toMatchObject({ action: 'reassessed', planId: 'repeat_plan' });
+      expect(result.detail).toMatch(/already assigned to pending accepted tasks/);
+      // Global gate evidence must not claim the objective implemented/delivered.
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
+      // No duplicate verification story and no revision while awaiting ingestion.
+      expect(planning).not.toHaveBeenCalled();
+      const updated = fixture.store.getPortfolioPlan('repeat_plan');
+      expect(updated?.revision).toBe(1);
+      expect(updated?.stories).toHaveLength(1);
+      expect(updated?.status).not.toBe('delivered');
+      expect(updated?.deliveredAt).toBeNull();
+      expect(updated?.coverage?.[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('releases the cancelled acceptance contract once its story is superseded', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'VER', requirement: 'Verified behavior', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [
+        priorStory({ key: 'VER1', workType: 'verify', coverageIds: ['VER'], supersededAt: 2 }),
+        priorStory({ key: 'IMP1', workType: 'implement', coverageIds: ['VER'], normalizedIssueNumber: 11, normalizedIssueUrl: 'https://github.test/issues/11' }),
+      ],
+      doneTasks: [{ issueNumber: 11, mergeSha: repo.baseSha, postmergePass: true }],
+    });
+    fixture.store.upsert({ issueNumber: 10, title: 'Verify objective', state: 'cancelled' });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'manual', undefined, false, repo.docsSha);
+      expect(['delivered', 'maintaining']).toContain(result.action);
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'implemented' });
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(1);
+    } finally {
+      assess.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it.each(['failed', 'quarantined', 'cancelled'] as const)(
+    'keeps coverage unverified for a %s verify task while allowing replacement repair planning', async (state) => {
+      const repo = await committedRepeatRepo();
+      const coverage: ObjectiveCoverage[] = [
+        { id: 'VER', requirement: 'Verified behavior', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified', evidence: [] },
+      ];
+      const fixture = buildRepeatProgram({
+        repo: repo.repo, commitSha: repo.docsSha, coverage,
+        stories: [priorStory({ key: 'VER1', workType: 'verify', coverageIds: ['VER'] })],
+        doneTasks: [],
+      });
+      fixture.store.upsert({ issueNumber: 10, title: 'Verify objective', state });
+      const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+      const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+      let planned: RepositoryAssessment | undefined;
+      const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockImplementation(async (...args) => {
+        planned = args[2] as RepositoryAssessment;
+        return {
+          title: 'Repair wave', objective: 'Deliver', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [],
+          stories: [{
+            key: 'VER2', title: 'Replacement verification', goal: 'Verify objective', acceptanceCriteria: ['Verified'], constraints: [],
+            requiredGateIds: [], rewardCriterionIds: [], risk: 'low' as const, workType: 'verify' as const, dependsOn: [],
+            rollback: 'Revert', technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['VER'],
+          }],
+        };
+      });
+      try {
+        const result = await fixture.controller.reassess(fixture.plan, 'manual', undefined, false, repo.docsSha);
+        // The failed/quarantined/cancelled contract no longer suppresses planning: a
+        // replacement repair story is planned and a revision is created.
+        expect(result).toMatchObject({ action: 'reassessed', planId: 'repeat_plan', detail: 'revision 2' });
+        expect(planning).toHaveBeenCalledOnce();
+        expect(planned?.coverage.find((entry) => entry.id === 'VER')).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+        // Acceptance stays guarded: the coverage is held unverified in the
+        // persisted assessment and no delivery is claimed from it.
+        expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+        expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
+        const updated = fixture.store.getPortfolioPlan('repeat_plan');
+        expect(updated?.status).not.toBe('delivered');
+        expect(updated?.deliveredAt).toBeNull();
+        expect(updated?.coverage?.[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+      } finally {
+        assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+      }
+    }, 30_000);
+
+  it('plans other actionable work normally while suppressing only the pending verification contract', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'VER', requirement: 'Verified behavior', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified', evidence: [] },
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Absent', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'VER1', workType: 'verify', coverageIds: ['VER'] })],
+      doneTasks: [],
+    });
+    fixture.store.upsert({ issueNumber: 10, title: 'Verify objective', state: 'ready' });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    let planned: RepositoryAssessment | undefined;
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockImplementation(async (...args) => {
+      planned = args[2] as RepositoryAssessment;
+      return gapDraft();
+    });
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'manual', undefined, false, repo.docsSha);
+      expect(result).toMatchObject({ action: 'reassessed', planId: 'repeat_plan', detail: 'revision 2' });
+      // The pending contract is left intact for the planner: only the gap plans.
+      expect(planned?.coverage.find((entry) => entry.id === 'VER')).toMatchObject({ status: 'unverified', requiredAction: 'none' });
+      expect(planned?.coverage.find((entry) => entry.id === 'GAP')?.requiredAction).toBe('implement');
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage.find((entry) => entry.id === 'VER')).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('permits delivery once the pending verification task completes with merged proof', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'VER', requirement: 'Verified behavior', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'VER1', workType: 'verify', coverageIds: ['VER'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha, postmergePass: true }],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(['delivered', 'maintaining']).toContain(result.action);
+      const updated = fixture.store.getPortfolioPlan('repeat_plan');
+      expect(['delivered', 'maintaining']).toContain(updated?.status);
+      expect(updated?.coverage?.[0]).toMatchObject({ status: 'implemented' });
+      expect(updated?.deliveredAt).toBeTypeOf('number');
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(1);
+      // The controller's own story/task binding evidence is attached.
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]?.evidence).toEqual([
+        expect.objectContaining({ kind: 'git', locator: `story:VER1:task:10:${repo.baseSha}` }),
+      ]);
+    } finally {
+      assess.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('accepts read-only verify completion as requirement proof once exact checks and the scorecard match', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'VER', requirement: 'Verified behavior', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'VER1', workType: 'verify', coverageIds: ['VER'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha, readOnly: true }],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(['delivered', 'maintaining']).toContain(result.action);
+      const updated = fixture.store.getPortfolioPlan('repeat_plan');
+      expect(['delivered', 'maintaining']).toContain(updated?.status);
+      expect(updated?.coverage?.[0]).toMatchObject({ status: 'implemented' });
+      expect(updated?.deliveredAt).toBeTypeOf('number');
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(1);
+      // The controller's own binding cites the read-only verified commit.
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]?.evidence).toEqual([
+        expect.objectContaining({ kind: 'git', locator: `story:VER1:task:10:${repo.baseSha}`, summary: expect.stringContaining('read-only') }),
+      ]);
+    } finally {
+      assess.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it.each([
+    { label: 'missing read-only event', noEvent: true },
+    { label: 'event cites a stale commit sha', eventCommitSha: 'src' },
+    { label: 'event cites an unknown scorecard', eventScorecardId: 'missing-scorecard' },
+    { label: 'scorecard cites a different commit', scorecardCommitSha: 'src' },
+    { label: 'scorecard did not pass', scorecardPassed: false },
+    { label: 'task is cancelled, not done', taskState: 'cancelled' as const },
+    { label: 'implement story cannot substitute read-only proof', workType: 'implement' as const },
+  ] as const)('holds coverage unverified when read-only proof is stale or absent: $label', async (scenario) => {
+    const repo = await committedRepeatRepo();
+    const shaOf = (alias: 'base' | 'docs' | 'src') =>
+      alias === 'base' ? repo.baseSha : alias === 'docs' ? repo.docsSha : repo.srcSha;
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'VER', requirement: 'Verified behavior', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({
+        key: scenario.workType === 'implement' ? 'IMP1' : 'VER1',
+        workType: scenario.workType ?? 'verify',
+        coverageIds: ['VER'],
+      })],
+      doneTasks: [{
+        issueNumber: 10, mergeSha: repo.baseSha,
+        state: scenario.taskState,
+        readOnly: scenario.noEvent ? undefined : {
+          eventCommitSha: scenario.eventCommitSha ? shaOf(scenario.eventCommitSha) : undefined,
+          eventScorecardId: scenario.eventScorecardId,
+          scorecardCommitSha: scenario.scorecardCommitSha ? shaOf(scenario.scorecardCommitSha) : undefined,
+          scorecardPassed: scenario.scorecardPassed,
+        },
+      }],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockResolvedValue({
+      title: 'Next wave', objective: 'Deliver', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [],
+      stories: [{
+        key: 'S1', title: 'Close gap', goal: 'Verify objective', acceptanceCriteria: ['Works'], constraints: [], requiredGateIds: [],
+        rewardCriterionIds: [], risk: 'low' as const, workType: 'verify' as const, dependsOn: [], rollback: 'Revert',
+        technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['VER'],
+      }],
+    });
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(result.action).not.toBe('delivered');
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
+      const updated = fixture.store.getPortfolioPlan('repeat_plan');
+      expect(updated?.status).not.toBe('delivered');
+      expect(updated?.deliveredAt).toBeNull();
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('holds an implemented claim unverified when only global gates and a model-cited source file exist without a matching done story', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      {
+        id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified',
+        evidence: [
+          { kind: 'test', locator: 'Fern Delivery Harness / CI', summary: 'Required checks passed', commitSha: repo.srcSha },
+          { kind: 'file', locator: 'src/app.ts', summary: 'Implementation file', commitSha: repo.srcSha },
+        ],
+      },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.srcSha, coverage, stories: [], doneTasks: [], files: ['src/app.ts'],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.srcSha, coverage, ['src/app.ts']);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    let planned: RepositoryAssessment | undefined;
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockImplementation(async (...args) => {
+      planned = args[2] as RepositoryAssessment;
+      return req1Draft();
+    });
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.srcSha);
+      expect(result.action).not.toBe('delivered');
+      // The global gate and the model-selected file path are not requirement proof.
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
+      expect(planned?.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+      const updated = fixture.store.getPortfolioPlan('repeat_plan');
+      expect(updated?.status).not.toBe('delivered');
+      expect(updated?.deliveredAt).toBeNull();
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('accepts an implemented claim bound to a done implement story with a passing exact-merge post-merge event and merge ancestor', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'IMP1', workType: 'implement', coverageIds: ['REQ1'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha, postmergePass: true }],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(['delivered', 'maintaining']).toContain(result.action);
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'implemented' });
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(1);
+    } finally {
+      assess.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('holds an implemented claim unverified when the done story covers an unrelated requirement', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'IMP1', workType: 'implement', coverageIds: ['OTHER'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha, postmergePass: true }],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockResolvedValue(req1Draft());
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(result.action).not.toBe('delivered');
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it.each([
+    { label: 'merge sha is not an ancestor of the assessed commit', mergeSha: 'src', eventSha: 'src', passed: true },
+    { label: 'passing event cites a different merge sha', mergeSha: 'base', eventSha: 'docs', passed: true },
+    { label: 'matching event did not pass', mergeSha: 'base', eventSha: 'base', passed: false },
+  ] as const)('holds an implemented claim unverified when the proof is stale or nonpassing: $label', async ({ mergeSha, eventSha, passed }) => {
+    const repo = await committedRepeatRepo();
+    const shaOf = (alias: 'base' | 'docs' | 'src') =>
+      alias === 'base' ? repo.baseSha : alias === 'docs' ? repo.docsSha : repo.srcSha;
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Model says verified', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'IMP1', workType: 'implement', coverageIds: ['REQ1'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: shaOf(mergeSha) }],
+    });
+    const task = fixture.store.findByIssue(10);
+    expect(task).not.toBeNull();
+    fixture.store.recordEvent('postmerge.verification', task!.id, {
+      runId: 'fixture-run', mergeSha: shaOf(eventSha), startedAt: 1, finishedAt: 2, passed, sideEffectFailure: false, gates: [],
+    });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, coverage, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockResolvedValue(req1Draft());
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(result.action).not.toBe('delivered');
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'unverified', requiredAction: 'verify' });
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
 });
 
 function gapDraft() {
@@ -701,6 +1108,17 @@ function gapDraft() {
       key: 'S1', title: 'Close gap', goal: 'Implement gap', acceptanceCriteria: ['Works'], constraints: [], requiredGateIds: [],
       rewardCriterionIds: [], risk: 'low' as const, workType: 'implement' as const, dependsOn: [], rollback: 'Revert',
       technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['GAP'],
+    }],
+  };
+}
+
+function req1Draft() {
+  return {
+    title: 'Next wave', objective: 'Deliver', constraints: [], definitionOfDone: ['Verified'], technologyDecisions: [], deploymentDecisions: [],
+    stories: [{
+      key: 'S1', title: 'Close gap', goal: 'Implement gap', acceptanceCriteria: ['Works'], constraints: [], requiredGateIds: [],
+      rewardCriterionIds: [], risk: 'low' as const, workType: 'implement' as const, dependsOn: [], rollback: 'Revert',
+      technologyDecisionIds: [], deploymentDecisionIds: [], coverageIds: ['REQ1'],
     }],
   };
 }
@@ -744,7 +1162,24 @@ function buildRepeatProgram(input: {
   commitSha: string;
   coverage: ObjectiveCoverage[];
   stories: PortfolioStory[];
-  doneTasks: Array<{ issueNumber: number; mergeSha?: string; baseSha?: string; commitSha?: string }>;
+  doneTasks: Array<{
+    issueNumber: number;
+    mergeSha?: string;
+    baseSha?: string;
+    commitSha?: string;
+    postmergePass?: boolean;
+    state?: 'done' | 'cancelled';
+    /** Trusted read-only verification receipt: a task.read_only_verified event
+     * plus its persisted scorecard. `true` records fully matching evidence;
+     * an options object bends one field to simulate stale or absent proof. */
+    readOnly?: true | {
+      eventCommitSha?: string;
+      eventScorecardId?: string;
+      scorecardId?: string;
+      scorecardCommitSha?: string;
+      scorecardPassed?: boolean;
+    };
+  }>;
   files?: string[];
   checkSummary?: CheckSummary;
 }) {
@@ -763,9 +1198,30 @@ function buildRepeatProgram(input: {
   };
   store.savePortfolioPlan(plan);
   for (const done of input.doneTasks) {
-    const task = store.upsert({ issueNumber: done.issueNumber, title: 'Prior', state: 'done' });
+    const task = store.upsert({ issueNumber: done.issueNumber, title: 'Prior', state: done.state ?? 'done' });
     if (done.mergeSha) store.patch(task.id, { mergeSha: done.mergeSha });
     if (done.baseSha || done.commitSha) store.patch(task.id, { baseSha: done.baseSha ?? null, commitSha: done.commitSha ?? null });
+    if (done.postmergePass && done.mergeSha) {
+      store.recordEvent('postmerge.verification', task.id, {
+        runId: `fixture-run-${done.issueNumber}`, mergeSha: done.mergeSha, startedAt: 1, finishedAt: 2,
+        passed: true, sideEffectFailure: false, gates: [],
+      });
+    }
+    if (done.readOnly && done.mergeSha) {
+      const options = done.readOnly === true ? {} : done.readOnly;
+      const scorecardId = options.scorecardId ?? `scorecard-${done.issueNumber}`;
+      store.saveScorecard({
+        id: scorecardId, taskId: task.id, projectId: store.projectId,
+        commitSha: options.scorecardCommitSha ?? done.mergeSha, evaluatorVersion: 'fixture',
+        hardGatePass: options.scorecardPassed ?? true, aggregateScore: 1, aggregateThreshold: 1,
+        passed: options.scorecardPassed ?? true, criteria: [], evidence: [], blockingReasons: [], createdAt: 1,
+      });
+      store.recordEvent('task.read_only_verified', task.id, {
+        commitSha: options.eventCommitSha ?? done.mergeSha,
+        scorecardId: options.eventScorecardId ?? scorecardId,
+        issueNumber: done.issueNumber,
+      });
+    }
   }
   const github = new RecordingGitHub();
   if (input.checkSummary) github.checkSummary = input.checkSummary;

@@ -163,7 +163,7 @@ describe('portfolio planner validation', () => {
     expect(calls).toBe(3);
   });
 
-  it('rejects stories mapped exclusively to satisfied none-action coverage', () => {
+  it('rejects stories mapped to any satisfied none-action coverage, including mixed mappings', () => {
     const coverage = [
       { id: 'PAY', requirement: 'Payment settlement', status: 'implemented' as const, requiredAction: 'none' as const, rationale: 'Verified', evidence: [] },
       { id: 'GAP', requirement: 'Missing flow', status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [] },
@@ -184,15 +184,23 @@ describe('portfolio planner validation', () => {
       undefined,
       coverage,
     )).toThrow(/none-action/);
-    const mixed = validatePortfolioDraft(
+    expect(() => validatePortfolioDraft(
       { ...base, stories: [{ ...story('S1'), coverageIds: ['PAY', 'GAP'], workType: 'implement' }] },
       ['test'],
       ['execution'],
       10,
       undefined,
       coverage,
+    )).toThrow(/none-action/);
+    const actionable = validatePortfolioDraft(
+      { ...base, stories: [{ ...story('S1'), coverageIds: ['GAP'], workType: 'implement' }] },
+      ['test'],
+      ['execution'],
+      10,
+      undefined,
+      coverage,
     );
-    expect(mixed.stories[0]?.workType).toBe('implement');
+    expect(actionable.stories[0]?.workType).toBe('implement');
   });
 
   it('instructs the model never to repeat satisfied none-action coverage', async () => {
@@ -207,7 +215,7 @@ describe('portfolio planner validation', () => {
     await new PortfolioPlanner(config, model).plan(
       { sourcePath: 'OBJECTIVE.md', content: 'Build runner claims.' }, 5, runnerAssessment(),
     );
-    expect(system).toContain('Never propose a new story mapped exclusively to none-action coverage');
+    expect(system).toContain('Never map a new story to any none-action coverage id');
   });
 
   it('normalizes a valid dependency graph into topological order', () => {

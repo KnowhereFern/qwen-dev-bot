@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.104] - 2026-11-04
+
+- Keep an unfinished approved wave active during reassessment and block future-wave tasks from leasing early.
+- Hold unfinished verification requirements unverified and prevent duplicate work from revised plans.
+- Require completed, merged, post-merge-verified work tied to each requirement before accepting an implemented claim; a global passing test alone cannot prove it.
+
 ## [1.0.0-rc.103] - 2026-11-04
 
 - Let a later approved task proceed when an earlier, unstarted dependency was superseded by exact-commit evidence that its requirement is already implemented.
