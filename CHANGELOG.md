@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.105] - 2026-11-04
+
+- Record evidence-backed coverage challenges and keep contradicted requirements open until a later verified implementation resolves them.
+- Reject changes outside an explicit task path scope before commit and before review; instruct implementers and reviewers to reject unrelated work prompted by shared constraints.
+
 ## [1.0.0-rc.104] - 2026-11-04
 
 - Keep an unfinished approved wave active during reassessment and block future-wave tasks from leasing early.

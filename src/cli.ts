@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { CommunityCollector } from './community/collector.js';
@@ -7,6 +8,7 @@ import type { ControllerRelease, DeploymentRecord, EvolutionSignal, PortfolioPla
 import { budgetStatus, ObservedTokenBudget, UsageLedger } from './core/usage-ledger.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore, validateAuthorizedGitRmPaths } from './core/persistent-store.js';
+import { runProcess } from './runtime/safe-process.js';
 import { runDaemon } from './daemon.js';
 import { formatDoctor, runDoctor } from './doctor.js';
 import { createProductionHarness } from './factory.js';
@@ -34,7 +36,7 @@ import { readIntakeSource } from './intake/source.js';
 import { intakeConnection } from './intake/connection.js';
 import { draftSpecification, loadSpecification, renderSpecification, specificationDocument } from './intake/specification.js';
 
-const VERSION = '1.0.0-rc.104';
+const VERSION = '1.0.0-rc.105';
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? (process.stdin.isTTY && process.stdout.isTTY ? 'interactive' : 'help');
@@ -320,6 +322,74 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         else console.log(`Issue #${issue}: operator feedback recorded for ready task; attempts ${updated.attempts}/${budget.limit} preserved, next repair prompt will carry the finding. Authorization: ${authorizationId}.`);
         return 0;
       } finally { store.close(); }
+    }
+    case 'coverage-challenge': {
+      const planId = strictValueOf(args, '--plan');
+      const coverageId = strictValueOf(args, '--coverage');
+      const challengeCommit = strictValueOf(args, '--commit');
+      const citedFiles = valuesOf(args, '--file');
+      const reason = valueOf(args, '--reason');
+      const authorizationId = valueOf(args, '--authorization');
+      const authorizedBy = valueOf(args, '--authorized-by');
+      if (!hasFlag(args, '--yes') || !planId || !coverageId || !challengeCommit || citedFiles.length === 0 ||
+          !reason || !authorizationId || !authorizedBy ||
+          [reason, authorizationId, authorizedBy].some((value) => !value.trim() || value.startsWith('--'))) {
+        throw new Error('coverage-challenge requires --yes --plan ID --coverage ID --commit SHA --file PATH... --reason TEXT --authorization ID --authorized-by NAME [--json]');
+      }
+      if (!/^[0-9a-f]{40}$/.test(challengeCommit)) {
+        throw new Error('coverage-challenge --commit must be a full 40-hex commit SHA');
+      }
+      const config = loadProjectConfig(root);
+      const store = new PersistentTaskStore(projectIdFor(config), projectStateDir(config));
+      try {
+        const plan = store.getPortfolioPlan(planId);
+        if (!plan) throw new Error(`Unknown portfolio plan: ${planId}`);
+        if (plan.approvedAt === null) throw new Error('Coverage challenges require an approved plan');
+        const coverage = plan.coverage?.find((entry) => entry.id === coverageId);
+        if (!coverage) throw new Error(`Unknown coverage id ${coverageId} in plan ${planId}`);
+        if (plan.repositorySha !== challengeCommit) {
+          throw new Error(`Commit ${challengeCommit} does not match the plan's current repository commit ${plan.repositorySha ?? 'unknown'}`);
+        }
+        for (const file of citedFiles) {
+          if (!(await trackedFileExistsAtCommit(config.project.root, challengeCommit, file))) {
+            throw new Error(`Cited path is not a tracked file at ${challengeCommit}: ${file}`);
+          }
+        }
+        const payload = {
+          planId,
+          coverageId,
+          commitSha: challengeCommit,
+          files: citedFiles,
+          reason: reason.trim(),
+          authorizationId: authorizationId.trim(),
+          authorizedBy: authorizedBy.trim(),
+          planRevision: plan.revision ?? 1,
+          requirement: coverage.requirement,
+        };
+        const binding = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+        const key = `program:coverage-challenge:${planId}:${payload.authorizationId}`;
+        // Idempotent append: an identical replay is a no-op; the same
+        // authorization ID with a different payload is rejected before any write.
+        const prior = store.listEvents('program.coverage_challenged').find((event) => event.idempotencyKey === key);
+        let reused = false;
+        if (prior) {
+          if (prior.payload.binding !== binding) {
+            throw new Error('Coverage challenge authorization conflicts with its original binding');
+          }
+          reused = true;
+        } else {
+          const recorded = store.recordEvent('program.coverage_challenged', null, { ...payload, binding }, key);
+          if (recorded.payload.binding !== binding) {
+            throw new Error('Coverage challenge authorization conflicts with its original binding');
+          }
+        }
+        console.log(json
+          ? JSON.stringify({ planId, coverageId, authorizationId: payload.authorizationId, reused, challenge: payload }, null, 2)
+          : `Coverage challenge recorded for ${coverageId} on plan ${planId} (authorization ${payload.authorizationId})${reused ? '; identical request already recorded' : ''}. The challenged coverage stays held partial until a new approved implement story with exact-merge post-merge verification resolves it.`);
+        return 0;
+      } finally {
+        store.close();
+      }
     }
     case 'logs': {
       const config = loadProjectConfig(root);
@@ -762,7 +832,7 @@ function openUsageGuard(config: ProjectConfig): { ledger: UsageLedger; budget: O
 }
 
 function firstPositional(args: string[]): string | undefined {
-  const valueOptions = new Set(['--input', '--idea', '--pages', '--spec', '--name', '--repo', '--trusted-author', '--model', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment', '--additional-attempts', '--authorization', '--authorized-by', '--reason', '--allow-git-rm']);
+  const valueOptions = new Set(['--input', '--idea', '--pages', '--spec', '--name', '--repo', '--trusted-author', '--model', '--billing-plan', '--base-url', '--api-key-env', '--lines', '--task', '--issue', '--requirements', '--max-stories', '--plan', '--accept', '--reject', '--sha', '--release', '--revision', '--hash', '--assessment', '--additional-attempts', '--authorization', '--authorized-by', '--reason', '--allow-git-rm', '--coverage', '--commit', '--file']);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] as string;
     if (valueOptions.has(arg)) {
@@ -809,6 +879,19 @@ function strictValueOf(args: string[], flag: string): string | undefined {
   const value = valueOf(args, flag);
   if (!value?.trim() || value.startsWith('-')) throw new Error(`${flag} requires a value (use ./ before a filename beginning with a dash)`);
   return value;
+}
+
+/** A cited coverage-challenge path must be a tracked file at the exact commit. */
+async function trackedFileExistsAtCommit(root: string, commitSha: string, relative: string): Promise<boolean> {
+  if (!relative || path.posix.isAbsolute(relative) || relative.split('/').includes('..') ||
+      !/^[A-Za-z0-9._\-/]+$/.test(relative)) return false;
+  const result = await runProcess({
+    command: 'git',
+    args: ['cat-file', '-t', `${commitSha}:${relative}`],
+    cwd: root,
+    timeoutMs: 30_000,
+  });
+  return result.exitCode === 0 && result.stdout.trim() === 'blob';
 }
 
 function integerValue(args: string[], flag: string): number | undefined {
@@ -870,6 +953,7 @@ Commands:
   usage-status [--json] Read-only project usage ledger summary and budget state
   recovery-authorize   Record an explicit bounded recovery authorization; never reset history
   task-feedback        Record operator feedback for an unleased ready task; next repair prompt carries it
+  coverage-challenge   Record a durable operator challenge that holds one coverage entry partial
   logs [--lines N]     Tail the redacted append-only event ledger
   reward               Show the latest stored universal reward scorecard
   community [--force]  Scan allowlisted sources and create review-only issues
@@ -907,6 +991,13 @@ Task feedback options (operator-only):
   --yes --issue N --reason TEXT --authorization ID --authorized-by OPERATOR [--json]
   Appends one feedback event per authorization to an unleased ready task with retry budget
   and an existing worktree. Reusing an authorization ID with different bindings is rejected.
+
+Coverage challenge options (operator-only):
+  --yes --plan PLAN_ID --coverage COVERAGE_ID --commit SHA --file PATH... --reason TEXT --authorization ID --authorized-by NAME [--json]
+  Records an idempotent durable challenge event. Reassessment holds the challenged coverage
+  partial/implement until a NEW approved unsuperseded implement story from a later revision
+  completes with a passing exact-merge post-merge verification. Reusing an authorization ID
+  with a different payload is rejected; the challenge survives restarts and reassessments.
 
 Init options:
   --dry-run --yes --name NAME --repo OWNER/NAME --trusted-author LOGIN --billing-plan PLAN

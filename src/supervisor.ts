@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import type { CommunityCollector, CommunityScanResult } from './community/collector.js';
 import type { GateResult, HarnessEvent, ProjectConfig, RewardScorecard, RunCheckpoint, TaskRecord } from './core/types.js';
+import { assertChangedFilesWithinScope, parseChangeScopeMarker } from './core/change-scope.js';
 import { redactText } from './core/ledger.js';
 import { PersistentTaskStore, validateAuthorizedGitRmPaths } from './core/persistent-store.js';
 import { REQUIRED_GITHUB_CHECKS, REQUIRED_POST_MERGE_GITHUB_CHECKS, type GitHubControl } from './github/control-plane.js';
@@ -647,6 +648,11 @@ export class HarnessSupervisor {
     task = this.store.transition(task.id, 'verifying');
     const changedBeforeCommit = await this.git.changedFiles(worktreePath);
     this.git.assertNoProtectedChanges(changedBeforeCommit);
+    // Deterministic frozen-scope enforcement on the uncommitted candidate
+    // (covers additions, deletions, and both sides of renames). Inactive for
+    // tasks whose constraints carry no explicit Change scope marker; a
+    // malformed marker fails closed here.
+    enforceTaskChangeScope(task, changedBeforeCommit, 'before commit');
     const readOnly = changedBeforeCommit.length === 0 &&
       await this.git.headSha(worktreePath) === task.baseSha && this.isReadOnlyProgramTask(task);
     let commitSha: string;
@@ -678,6 +684,10 @@ export class HarnessSupervisor {
     onCandidateReady(candidateReadyEvent.id);
     const changedFiles = await this.git.filesChangedBetween(worktreePath, task.baseSha as string, commitSha);
     this.git.assertNoProtectedChanges(changedFiles);
+    // Same deterministic scope enforcement, base-to-candidate, after the
+    // commit (including recovered candidates) and before reward evaluation
+    // or push. Prompt instructions never replace this check.
+    enforceTaskChangeScope(task, changedFiles, 'base-to-candidate');
     const diff = await this.git.diff(worktreePath, task.baseSha as string, commitSha);
     const verificationPath = await this.git.createDetachedWorktree(
       commitSha,
@@ -1685,6 +1695,21 @@ function renderPullRequestBody(task: TaskRecord, summary: string, scorecard: Rew
 /** The exact staged-deletion porcelain v1 status a controller `git rm`
  * produces: deleted from the index and the worktree ('D '). */
 const STAGED_DELETION_STATUS = 'D ';
+
+/**
+ * Deterministic changed-path enforcement for tasks whose frozen constraints
+ * carry an explicit machine-readable `Change scope: path1, path2` marker.
+ * Returns immediately (guard inactive) when no marker is present; a
+ * malformed marker throws; out-of-scope changed paths throw. Thrown errors
+ * route through the normal attempt-failure path, so task history and retry
+ * behavior stay intact. Pure prompt instructions can never substitute for
+ * this check.
+ */
+export function enforceTaskChangeScope(task: TaskRecord, files: readonly string[], phase: string): void {
+  const scope = parseChangeScopeMarker(task.spec?.constraints ?? null);
+  if (scope === null) return;
+  assertChangedFilesWithinScope(files, scope, `task ${task.id} ${phase}`);
+}
 
 /** Idempotency key for the durable controller application event of an
  * operator-authorized tracked-file removal. */
