@@ -218,6 +218,83 @@ describe('portfolio planner validation', () => {
     expect(system).toContain('Never map a new story to any none-action coverage id');
   });
 
+  it('rejects stories mapped solely to externally blocked coverage, including document stories', () => {
+    const coverage = [
+      { id: 'BLK', requirement: 'Provider access', status: 'externally_blocked' as const, requiredAction: 'external' as const, rationale: 'Provider blocker recorded in coverage', evidence: [] },
+      { id: 'GAP', requirement: 'Missing flow', status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [] },
+    ];
+    const base = {
+      title: 'External guard',
+      objective: 'Deliver without unactionable blocker stories',
+      constraints: [],
+      definitionOfDone: ['Verified'],
+      technologyDecisions: [],
+      deploymentDecisions: [],
+    };
+    expect(() => validatePortfolioDraft(
+      { ...base, stories: [{ ...story('DOC1'), coverageIds: ['BLK'], workType: 'document' }] },
+      ['test'],
+      ['execution'],
+      10,
+      undefined,
+      coverage,
+    )).toThrow(/externally blocked coverage BLK/);
+    expect(() => validatePortfolioDraft(
+      { ...base, stories: [{ ...story('IMP2'), coverageIds: ['BLK'], workType: 'implement' }] },
+      ['test'],
+      ['execution'],
+      10,
+      undefined,
+      coverage,
+    )).toThrow(/externally blocked coverage BLK/);
+    // External coverage requires no proposed work of its own.
+    const actionable = validatePortfolioDraft(
+      { ...base, stories: [{ ...story('S1'), coverageIds: ['GAP'], workType: 'implement' }] },
+      ['test'],
+      ['execution'],
+      10,
+      undefined,
+      coverage,
+    );
+    expect(actionable.stories[0]?.coverageIds).toEqual(['GAP']);
+    // Mixing an external blocker into an actionable story still expands its scope.
+    expect(() => validatePortfolioDraft(
+      { ...base, stories: [{ ...story('S1'), coverageIds: ['BLK', 'GAP'], workType: 'implement' }] },
+      ['test'],
+      ['execution'],
+      10,
+      undefined,
+      coverage,
+    )).toThrow(/externally blocked coverage BLK/);
+  });
+
+  it('instructs the model never to map externally blocked coverage to stories', async () => {
+    let system = '';
+    const model: PortfolioPlanningModel = {
+      async completeJson<T>(input: Parameters<PortfolioPlanningModel['completeJson']>[0]): Promise<{ value: T }> {
+        system = input.system;
+        return { value: {
+          title: 'Blocked plan', objective: 'Deliver', constraints: [], definitionOfDone: ['Verified'],
+          technologyDecisions: [], deploymentDecisions: [],
+          stories: [{ ...story('S1'), goal: 'Close gap', workType: 'implement', coverageIds: ['GAP'], requiredGateIds: [], rewardCriterionIds: [] }],
+        } as T };
+      },
+    };
+    const config = defaultProjectConfig(makeTmp('planner-external-action'), 'fixture', 'owner/fixture');
+    const assessment: RepositoryAssessment = {
+      id: 'assessment-external', projectId: 'fixture', commitSha: 'a'.repeat(40), dirty: false,
+      detectedStacks: ['node'], files: [], analyses: [], createdAt: 1,
+      coverage: [
+        { id: 'BLK', requirement: 'Provider access', status: 'externally_blocked', requiredAction: 'external', rationale: 'Provider blocker recorded in coverage', evidence: [] },
+        { id: 'GAP', requirement: 'Missing flow', status: 'missing', requiredAction: 'implement', rationale: 'Missing', evidence: [] },
+      ],
+    };
+    await new PortfolioPlanner(config, model).plan(
+      { sourcePath: 'OBJECTIVE.md', content: 'Build the objective.' }, 5, assessment,
+    );
+    expect(system).toContain('never map externally blocked (external-action) coverage to any story');
+  });
+
   it('normalizes a valid dependency graph into topological order', () => {
     const result = validatePortfolioDraft(
       {

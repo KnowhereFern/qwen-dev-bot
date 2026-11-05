@@ -262,6 +262,17 @@ export class ProgramController {
     // commit, and a persisted passing post-merge verification for that exact
     // merge. Global gates, model-cited source/test files, signals, and global
     // staging deployments are not requirement-specific and never bind proof.
+    // Preserve accepted, requirement-specific proof across routine and manual
+    // reassessment when the model supplies only generic uncertainty. The
+    // historical approved assessment must name the exact same requirement.
+    await this.retainProvenCoverage(plan, assessment, {
+      reason,
+      checksSuccessful: checks.complete && checks.successful,
+      materialSignal: approvedMaterialSignal || sourceSignalId !== undefined,
+      challengedCoverageIds,
+      pendingVerify,
+      deployment,
+    }, signal);
     await this.bindImplementationProofs(plan, assessment, signal);
     this.store.saveRepositoryAssessment(assessment);
     await this.recordExternalCommits(plan, assessment.commitSha, signal);
@@ -626,6 +637,60 @@ export class ProgramController {
     }
   }
 
+  /** Retention of previously accepted coverage. See the
+   * call site for the full gate list; any doubt (failing checks, signal or
+   * quarantine context, unresolved challenge, pending verification contract,
+   * failed staging, no matching approved coverage, or no current
+   * deterministic proof) leaves the model's classification untouched. */
+  private async retainProvenCoverage(
+    plan: PortfolioPlan,
+    assessment: RepositoryAssessment,
+    context: {
+      reason: ProgramRevision['reason'];
+      checksSuccessful: boolean;
+      materialSignal: boolean;
+      challengedCoverageIds: Set<string>;
+      pendingVerify: Map<string, { story: PortfolioStory; task: TaskRecord | null }>;
+      deployment: { status: string } | null;
+    },
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (!['wave-complete', 'manual'].includes(context.reason) || !context.checksSuccessful || context.materialSignal) return;
+    if (context.deployment && ['failed', 'rolled_back'].includes(context.deployment.status)) return;
+    for (const entry of assessment.coverage) {
+      if (entry.status !== 'partial') continue;
+      if (context.challengedCoverageIds.has(entry.id) || context.pendingVerify.has(entry.id)) continue;
+      if (!isGenericProofUncertainty(entry)) continue;
+      // Walk backwards through approved assessments. A later concrete gap or
+      // changed requirement prevents an older implementation proof from
+      // silently overriding it; a later generic downgrade may be recovered.
+      let accepted = false;
+      for (const revision of [...(plan.revisions ?? [])].reverse()) {
+        if (revision.approvedAt === null || revision.rejectedAt) continue;
+        const prior = this.store.getRepositoryAssessment(revision.assessmentId)?.coverage.find((candidate) => candidate.id === entry.id);
+        if (!prior) { if (revision.material) break; else continue; }
+        if (prior.requirement !== entry.requirement) break;
+        if (prior.status === 'implemented') { accepted = true; break; }
+        if (revision.material || prior.status !== 'partial' || !isGenericProofUncertainty(prior)) break;
+      }
+      if (!accepted) continue;
+      const proof = await this.requirementProof(plan, entry.id, assessment.commitSha, signal);
+      signal?.throwIfAborted();
+      if (!proof) continue;
+      entry.status = 'implemented';
+      entry.requiredAction = 'none';
+      entry.rationale = `Retained implemented from prior accepted coverage: the reassessment cited only generic uncertainty, while story ${proof.story.key} (issue #${proof.task.issueNumber}) still proves this requirement at ${assessment.commitSha} via ${proof.via === 'read-only' ? 'a trusted read-only verification' : 'a passing exact-merge post-merge verification'}; no duplicate story is needed`;
+      this.store.recordEvent('program.coverage_retained', null, {
+        planId: plan.id,
+        coverageId: entry.id,
+        commitSha: assessment.commitSha,
+        storyKey: proof.story.key,
+        issueNumber: proof.task.issueNumber,
+        mergeSha: proof.mergeSha,
+      }, `program:coverage-retained:${plan.id}:${entry.id}:${assessment.commitSha}`);
+    }
+  }
+
   /** First deterministic story/task/merge proof chain that explicitly covers
    * the coverage ID, or null when none holds. Implementation stories (and
    * verify stories that merged) prove out via a passing exact-merge
@@ -819,6 +884,14 @@ export class ProgramController {
 
 function isCommitSha(sha: string | null): sha is string {
   return typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha);
+}
+
+function isGenericProofUncertainty(entry: ObjectiveCoverage): boolean {
+  const generic = /\bsupplied (?:detailed )?(?:content|detail|evidence) (?:does|do) not fully prove\b/i.test(entry.rationale);
+  const concreteGap = /\b(?:missing|fails?|rejects?|contradicts?|unimplemented|not implemented|gap remains|cannot)\b/i.test(entry.rationale);
+  const contraryEvidence = entry.evidence.some((item) =>
+    /\b(?:missing|fails?|rejects?|absent|contradicts?|unimplemented)\b/i.test(item.summary));
+  return generic && !concreteGap && !contraryEvidence;
 }
 
 async function safeMergeAncestor(root: string, mergeSha: string, commitSha: string, signal?: AbortSignal): Promise<boolean> {

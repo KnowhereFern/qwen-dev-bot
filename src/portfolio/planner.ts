@@ -128,10 +128,10 @@ export class PortfolioPlanner {
         'Technology decisions contain: id, category, technology, rationale. Include only choices relevant to this plan.',
         'Deployment decisions contain: id, component, provider, environment, rationale. environment is local, preview, staging, or production; provider must equal a declared technology value (for example Railway), not a decision id.',
         'Each story must contain: key, title, goal, acceptanceCriteria, constraints, requiredGateIds, rewardCriterionIds, risk, workType, dependsOn, rollback, technologyDecisionIds, deploymentDecisionIds, coverageIds.',
-        'workType is implement, verify, operate, or document and must match each mapped coverage item requiredAction; external coverage is handled by document work that records the blocker.',
+        'workType is implement, verify, operate, or document and must match each mapped coverage item requiredAction; never map externally blocked (external-action) coverage to any story, including document stories: the provider blocker is already recorded in coverage and unavailable provider access is not actionable product work.',
         'When repository coverage is supplied, create work only for non-implemented requirements and map every story to at least one coverage id.',
         'Every coverage item requiring implement must have an implementation story that delivers the missing behavior; verification-only work is insufficient.',
-        'Before returning, audit the mandatory coverage/action matrix item by item. Every non-none action must have a story whose workType exactly matches it (external maps to document), and implementation acceptance criteria must change product behavior rather than merely test or describe it.',
+        'Before returning, audit the mandatory coverage/action matrix item by item. Every non-none action must have a story whose workType exactly matches it, and implementation acceptance criteria must change product behavior rather than merely test or describe it. Externally blocked (external-action) coverage is the exception: it must not be mapped to any story.',
         'Coverage whose requiredAction is none is already satisfied (implemented, previously verified, or pending approved work). Never map a new story to any none-action coverage id, alone or mixed with actionable ids; repeating or duplicating that work is a planning defect.',
         'Do not add periodic polling, background workers, keepalive traffic, or scheduled provider health checks unless the objective and repository evidence explicitly require them. Preserve documented sleep, wake, cost, and worker-idleness behavior; prefer request-time or on-demand recovery where compatible.',
         'Do not create file-oriented cleanup, speculative infrastructure, or stories for capabilities proven implemented.',
@@ -443,18 +443,27 @@ function validateStory(
 
 function assertCoverageActions(stories: PortfolioStoryDraft[], coverage: ObjectiveCoverage[]): void {
   const noneAction = new Set(coverage.filter((entry) => entry.requiredAction === 'none').map((entry) => entry.id));
+  const externalAction = new Set(coverage.filter((entry) => entry.requiredAction === 'external').map((entry) => entry.id));
   for (const story of stories) {
     const mapped = story.coverageIds ?? [];
     const satisfied = mapped.filter((id) => noneAction.has(id));
     if (mapped.length > 0 && satisfied.length > 0) {
       throw new Error(`Story ${story.key} maps to satisfied (none-action) coverage ${satisfied.join(', ')}; that scope is already covered by pending or completed work`);
     }
+    // An external blocker is tracked in coverage until the provider becomes
+    // available. It never authorizes a product story, even alongside another
+    // actionable requirement.
+    const blocked = mapped.filter((id) => externalAction.has(id));
+    if (blocked.length > 0) {
+      throw new Error(`Story ${story.key} maps to externally blocked coverage ${blocked.join(', ')}; the provider blocker is recorded in coverage and unavailable provider access is not actionable product work`);
+    }
   }
   for (const entry of coverage) {
-    if (entry.requiredAction === 'none') continue;
+    if (entry.requiredAction === 'none' || entry.requiredAction === 'external') continue;
     const mapped = stories.filter((story) => story.coverageIds?.includes(entry.id));
     if (mapped.length === 0) throw new Error(`Coverage ${entry.id} has no proposed work`);
-    const expected: ProgramWorkType = entry.requiredAction === 'external' ? 'document' : entry.requiredAction;
+    // External-action coverage is excluded above: it must not receive work.
+    const expected = entry.requiredAction as ProgramWorkType;
     if (!mapped.some((story) => story.workType === expected)) {
       throw new Error(`Coverage ${entry.id} requires ${entry.requiredAction} work, not ${mapped.map((story) => story.workType).join(', ')}`);
     }
