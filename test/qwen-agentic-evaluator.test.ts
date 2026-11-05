@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { chmodSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { defaultProjectConfig } from '../src/core/config.js';
-import type { TaskRecord } from '../src/core/types.js';
+import type { GateResult, TaskRecord } from '../src/core/types.js';
 import { UsageBudgetActiveError, UsageLedger, budgetStatus } from '../src/core/usage-ledger.js';
 import { QwenAgenticEvaluator } from '../src/rewards/evaluators.js';
 import type { RewardContext } from '../src/rewards/engine.js';
@@ -319,5 +321,137 @@ describe('QwenAgenticEvaluator OpenRouter Crouton route', () => {
     const quotaHold: QuotaHoldController = { heldUntil: () => null, applyHold: () => { throw new Error('hold must not be applied'); } };
     await expect(croutonFixture({ quotaHold })()).rejects.toThrow('Qwen independent review failed');
     await expect(croutonFixture({ quotaHold })()).rejects.not.toMatchObject({ name: 'QuotaHoldActiveError' });
+  });
+});
+
+describe('QwenAgenticEvaluator evidence claim gate', () => {
+  const passingGate: GateResult = {
+    id: 'gate-unit', kind: 'custom', required: true, applicable: true, ok: true, exitCode: 0,
+    stdout: 'ok', stderr: '', durationMs: 1, command: [], evidenceHash: 'hash',
+  };
+
+  function evidenceFixture(options: { criteria: string[]; gates?: GateResult[]; setup?: (root: string) => void }) {
+    const root = makeTmp('agentic-evidence');
+    writeFileSync(path.join(root, 'feature.ts'), 'line one\nline two\nline three\n');
+    options.setup?.(root);
+    const config = defaultProjectConfig(root, 'fixture', 'owner/repo');
+    const task: TaskRecord = {
+      id: 'task', projectId: 'project', issueNumber: 1, title: 'task', body: '', labels: [], author: 'bot',
+      state: 'verifying', spec: {
+        goal: 'goal', source: { kind: 'user' }, acceptanceCriteria: options.criteria, constraints: [],
+        requiredGateIds: [], rewardCriterionIds: [], risk: 'low', dependencies: [], rollback: '',
+        technologyDecisions: [], deploymentDecisions: [],
+      },
+      priority: 0, attempts: 0, identicalFailures: 0,
+      lastFailureFingerprint: null, maxAttempts: 5, leaseOwner: 'worker', leaseExpiresAt: 1,
+      baseSha: 'base', branch: 'branch', worktreePath: root, commitSha: 'commit', qwenSessionId: null,
+      qwenWorkflowRunId: null, prNumber: null, prUrl: null, mergeSha: null, rewardRunId: null,
+      lastError: null, createdAt: 1, updatedAt: 1, version: 1,
+    };
+    const context: RewardContext = { config, task, worktree: root, commitSha: 'commit', changedFiles: [], diff: '', gateResults: options.gates ?? [] };
+    const criterion = config.rewards.criteria.find((entry) => entry.modality === 'agentic')!;
+    const evaluator = new QwenAgenticEvaluator(null, null, null, null);
+    return () => evaluator.evaluate(criterion, context);
+  }
+
+  function claimOutput(claims: unknown) {
+    output([terminal(JSON.stringify({ ...verdict, evidenceClaims: claims }))]);
+  }
+
+  beforeEach(() => { vi.mocked(runProcess).mockReset(); });
+
+  it('accepts one valid file-line claim and one passing-gate claim per criterion', async () => {
+    claimOutput([
+      { criterionIndex: 0, filePath: 'feature.ts', line: 2, gateId: null, note: 'feature.ts:2 rejects live keys' },
+      { criterionIndex: 1, filePath: null, line: null, gateId: 'gate-unit', note: 'gate-unit passed the unit suite' },
+    ]);
+    const result = await evidenceFixture({
+      criteria: ['behavior implemented', 'tests pass'],
+      gates: [passingGate],
+    })();
+    expect(result).toMatchObject(verdict);
+    expect(result.evidence[0]?.data.evidenceClaims).toEqual([
+      { criterionIndex: 0, filePath: 'feature.ts', line: 2, gateId: null, note: 'feature.ts:2 rejects live keys' },
+      { criterionIndex: 1, filePath: null, line: null, gateId: 'gate-unit', note: 'gate-unit passed the unit suite' },
+    ]);
+    const args = vi.mocked(runProcess).mock.calls[0]![0].args ?? [];
+    const text = args[args.indexOf('--prompt') + 1] ?? '';
+    expect(text).toContain('criterionIndex 0: behavior implemented');
+    expect(text).toContain('exactly one evidenceClaims entry per index');
+    expect(text).toContain('"evidenceClaims": array');
+    expect(text).toContain('nonblank note explaining how the cited file line or gate demonstrates the criterion');
+  });
+
+  it('rejects a missing claim for an indexed criterion', async () => {
+    claimOutput([{ criterionIndex: 0, filePath: 'feature.ts', line: 1, gateId: null, note: 'n' }]);
+    const result = await evidenceFixture({ criteria: ['a', 'b'], gates: [passingGate] })();
+    expect(result).toMatchObject({ score: 0, confidence: 1 });
+    expect(result.blockingFindings).toContain('evidence claim rejected: missing claim for criterionIndex 1');
+  });
+
+  it('rejects duplicate claims for one criterion', async () => {
+    claimOutput([
+      { criterionIndex: 0, filePath: 'feature.ts', line: 1, gateId: null, note: 'n' },
+      { criterionIndex: 0, filePath: null, line: null, gateId: 'gate-unit', note: 'n' },
+    ]);
+    const result = await evidenceFixture({ criteria: ['a'], gates: [passingGate] })();
+    expect(result.score).toBe(0);
+    expect(result.blockingFindings?.join('\n')).toContain('duplicate claim for criterionIndex 0');
+  });
+
+  it.each([
+    ['traversal', { criterionIndex: 0, filePath: '../feature.ts', line: 1, gateId: null, note: 'n' }],
+    ['absolute', { criterionIndex: 0, filePath: '/etc/hosts', line: 1, gateId: null, note: 'n' }],
+    ['nonexistent', { criterionIndex: 0, filePath: 'missing.ts', line: 1, gateId: null, note: 'n' }],
+    ['line out of range', { criterionIndex: 0, filePath: 'feature.ts', line: 99, gateId: null, note: 'n' }],
+    ['missing line', { criterionIndex: 0, filePath: 'feature.ts', gateId: null, note: 'n' }],
+    ['blank claim', { criterionIndex: 0, filePath: '   ', line: 1, gateId: '', note: 'n' }],
+    ['blank note', { criterionIndex: 0, filePath: 'feature.ts', line: 1, gateId: null, note: '   ' }],
+    ['missing note', { criterionIndex: 0, filePath: 'feature.ts', line: 1, gateId: null }],
+    ['unknown gate', { criterionIndex: 0, filePath: null, line: null, gateId: 'gate-nope', note: 'n' }],
+    ['failing gate', { criterionIndex: 0, filePath: null, line: null, gateId: 'gate-fail', note: 'n' }],
+    ['both file and gate', { criterionIndex: 0, filePath: 'feature.ts', line: 1, gateId: 'gate-unit', note: 'n' }],
+    ['out-of-range index', { criterionIndex: 7, filePath: 'feature.ts', line: 1, gateId: null, note: 'n' }],
+    ['claims not an array', 'nope'],
+  ])('fails the evaluation closed on %s claims without throwing', async (_name, claims) => {
+    claimOutput(claims);
+    const failingGate: GateResult = { ...passingGate, id: 'gate-fail', ok: false, exitCode: 1 };
+    const result = await evidenceFixture({ criteria: ['a'], gates: [passingGate, failingGate] })();
+    expect(result.score).toBe(0);
+    expect(result.blockingFindings?.length).toBeGreaterThan(0);
+    expect(result.blockingFindings?.every((finding) => finding.startsWith('evidence claim rejected:'))).toBe(true);
+  });
+
+  it('keeps a negative verdict reason and findings while appending missing-claim findings', async () => {
+    output([terminal(JSON.stringify({
+      score: 0, confidence: 0.8, reason: 'behavior missing', blockingFindings: ['no tests'], evidenceClaims: [],
+    }))]);
+    const result = await evidenceFixture({ criteria: ['a'], gates: [passingGate] })();
+    expect(result).toMatchObject({ score: 0, confidence: 0.8, reason: 'behavior missing' });
+    expect(result.blockingFindings).toEqual(['no tests', 'evidence claim rejected: missing claim for criterionIndex 0']);
+  });
+
+  it('yields a finding for an unreadable cited file instead of throwing', async () => {
+    claimOutput([{ criterionIndex: 0, filePath: 'locked.ts', line: 1, gateId: null, note: 'n' }]);
+    let locked = '';
+    const result = await evidenceFixture({
+      criteria: ['a'],
+      setup: (root) => {
+        locked = path.join(root, 'locked.ts');
+        writeFileSync(locked, 'secret\n');
+        chmodSync(locked, 0o000);
+      },
+    })();
+    chmodSync(locked, 0o644);
+    expect(result.score).toBe(0);
+    expect(result.blockingFindings?.join('\n')).toContain('claim file could not be read for validation: locked.ts');
+  });
+
+  it('skips the claim contract when the task has no acceptance criteria', async () => {
+    claimOutput([]);
+    await expect(evidenceFixture({ criteria: [], gates: [] })()).resolves.toMatchObject(verdict);
+    const args = vi.mocked(runProcess).mock.calls[0]![0].args ?? [];
+    const text = args[args.indexOf('--prompt') + 1] ?? '';
+    expect(text).toContain('return an empty evidenceClaims array');
   });
 });

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { writeFileSync } from 'node:fs';
 import { defaultProjectConfig } from '../src/core/config.js';
 import type { QwenApiClient } from '../src/qwen/qwen-api.js';
 import { QwenRubricEvaluator } from '../src/rewards/evaluators.js';
@@ -7,10 +8,12 @@ import { runProcess } from '../src/runtime/safe-process.js';
 import { makeTmp } from './helpers.js';
 
 vi.mock('../src/runtime/safe-process.js', () => ({ runProcess: vi.fn() }));
-const verdict = { score: 1, confidence: 1, reason: 'src/payment.ts and tests/payment.test.ts verify metadata', blockingFindings: [] };
+const claim = { criterionIndex: 0, filePath: 'payment.ts', line: 2, gateId: null, note: 'payment.ts:2 rejects live keys' };
+const verdict = { score: 1, confidence: 1, reason: 'src/payment.ts and tests/payment.test.ts verify metadata', blockingFindings: [], evidenceClaims: [claim] };
 
 function fixture() {
   const worktree = makeTmp('repository-rubric');
+  writeFileSync(`${worktree}/payment.ts`, 'line one\nrejects live keys\n');
   const config = defaultProjectConfig(worktree, 'fixture', 'owner/repo');
   const context = {
     config, worktree, commitSha: 'exact-candidate-sha', changedFiles: [], diff: '', gateResults: [],
@@ -95,5 +98,57 @@ describe('repository-aware empty-diff rubric', () => {
     await evaluator.evaluate(criterion, { ...context, ...change });
     expect(completeJson).toHaveBeenCalledOnce();
     expect(runProcess).not.toHaveBeenCalled();
+  });
+
+  it('sends the evidence contract and schema to the API judge for indexed criteria', async () => {
+    const { context, criterion, evaluator, completeJson } = fixture();
+    const result = await evaluator.evaluate(criterion, { ...context, changedFiles: ['payment.ts'], diff: '+ change' });
+    expect(result).toMatchObject(verdict);
+    const call = completeJson.mock.calls[0]![0];
+    expect(call.user).toContain('criterionIndex 0: Reject live keys');
+    expect(call.user).toContain('nonblank note explaining how the cited file line or gate demonstrates the criterion');
+    expect(call.jsonSchema).toMatchObject({ name: 'reviewVerdict' });
+    expect(JSON.stringify(call.jsonSchema.schema)).toContain('evidenceClaims');
+  });
+
+  it('fails the API judge evaluation normally when a claim is missing', async () => {
+    const { context, criterion, evaluator, completeJson } = fixture();
+    completeJson.mockResolvedValue({ value: { ...verdict, evidenceClaims: [] }, raw: '', usage: {} });
+    const result = await evaluator.evaluate(criterion, { ...context, changedFiles: ['payment.ts'], diff: '+ change' });
+    expect(result.score).toBe(0);
+    expect(result.blockingFindings).toContain('evidence claim rejected: missing claim for criterionIndex 0');
+  });
+
+  it('accepts a passing-gate claim from the API judge', async () => {
+    const { context, criterion, evaluator, completeJson } = fixture();
+    context.gateResults = [{
+      id: 'gate-unit', kind: 'unit', required: true, applicable: true, ok: true, exitCode: 0,
+      stdout: 'ok', stderr: '', durationMs: 1, command: [], evidenceHash: 'hash',
+    }];
+    completeJson.mockResolvedValue({
+      value: { ...verdict, evidenceClaims: [{ criterionIndex: 0, filePath: null, line: null, gateId: 'gate-unit', note: 'gate-unit proves the criterion' }] },
+      raw: '', usage: {},
+    });
+    expect(await evaluator.evaluate(criterion, { ...context, changedFiles: ['payment.ts'], diff: '+ change' })).toMatchObject({ score: 1 });
+  });
+
+  it('keeps a negative API verdict while appending missing-claim findings', async () => {
+    const { context, criterion, evaluator, completeJson } = fixture();
+    completeJson.mockResolvedValue({
+      value: { score: 0, confidence: 0.7, reason: 'No provider verification evidence', blockingFindings: ['No provider verification evidence'], evidenceClaims: [] },
+      raw: '', usage: {},
+    });
+    const result = await evaluator.evaluate(criterion, { ...context, changedFiles: ['payment.ts'], diff: '+ change' });
+    expect(result).toMatchObject({ score: 0, confidence: 0.7, reason: 'No provider verification evidence' });
+    expect(result.blockingFindings).toEqual(['No provider verification evidence', 'evidence claim rejected: missing claim for criterionIndex 0']);
+  });
+
+  it('keeps API rubric compatibility for tasks without acceptance criteria', async () => {
+    const { context, criterion, evaluator, completeJson } = fixture();
+    context.task.spec = { ...context.task.spec!, acceptanceCriteria: [] };
+    completeJson.mockResolvedValue({ value: { score: 1, confidence: 1, reason: 'ok', blockingFindings: [] }, raw: '', usage: {} });
+    expect(await evaluator.evaluate(criterion, { ...context, changedFiles: ['payment.ts'], diff: '+ change' })).toMatchObject({ score: 1 });
+    const call = completeJson.mock.calls[0]![0];
+    expect(call.user).toContain('no indexed acceptance criteria');
   });
 });

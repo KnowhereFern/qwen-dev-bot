@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.107] - 2026-11-05
+
+- Require the independent reviewer to cite a repository line or passing gate for every task acceptance criterion, and keep those claims in the review evidence.
+
 ## [1.0.0-rc.106] - 2026-11-04
 
 - Preserve previously accepted requirement coverage when its exact task and merge proof still holds and a routine reassessment offers only generic uncertainty.
