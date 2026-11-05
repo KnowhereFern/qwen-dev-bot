@@ -473,6 +473,7 @@ export class PersistentTaskStore {
       ).map(rowToTask);
       const row = rows.find((candidate) => {
         const task = rowToTask(candidate);
+        if (!this.portfolioStoryLeaseAuthorized(task)) return false;
         const budget = this.failureBudget(task, dependencyTasks);
         if (budget.failures >= budget.limit) {
           this.transition(task.id, 'quarantined', {}, now);
@@ -572,6 +573,40 @@ export class PersistentTaskStore {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  /**
+   * Claim-time authorization for portfolio-story tasks. A ready task that
+   * corresponds to a saved portfolio story may be leased only when some saved
+   * plan maps it to an unsuperseded story of an approved active/blocked
+   * program revision whose wave has been reached (story.wave <=
+   * plan.currentWave). Future-wave, pending-material-revision, and superseded
+   * portfolio tasks are held without consuming attempts or altering state;
+   * tasks with no portfolio story (legacy issue-driven work) pass unchanged.
+   */
+  private portfolioStoryLeaseAuthorized(task: TaskRecord): boolean {
+    const matches = this.listPortfolioPlans().flatMap((plan) =>
+      plan.stories
+        .filter(
+          (story) =>
+            story.normalizedIssueNumber === task.issueNumber ||
+            story.sourceIssueNumber === task.issueNumber,
+        )
+        .map((story) => ({ plan, story })),
+    );
+    if (matches.length === 0) return true;
+    return matches.some(({ plan, story }) => {
+      if (!plan.approvedAt || !['active', 'blocked'].includes(plan.status)) return false;
+      if (story.supersededAt) return false;
+      if (story.wave !== undefined && plan.currentWave !== undefined && story.wave > plan.currentWave) {
+        return false;
+      }
+      if (story.revision !== undefined && plan.revisions?.length) {
+        const revision = plan.revisions.find((entry) => entry.number === story.revision);
+        if (!revision || revision.rejectedAt !== undefined || revision.approvedAt === null) return false;
+      }
+      return true;
+    });
   }
 
   private dependenciesSatisfied(task: TaskRecord, candidates: TaskRecord[]): boolean {

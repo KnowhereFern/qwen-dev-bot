@@ -426,6 +426,13 @@ describe('PortfolioCoordinator', () => {
     const normalized = parseNormalizedSpec((github.issues.get(newRoot?.normalizedIssueNumber as number) as RemoteIssue).body);
     expect(normalized?.dependencies).toEqual([]);
     expect((github.issues.get(newRoot?.normalizedIssueNumber as number) as RemoteIssue).body).toContain(`Origin task: #${failedIssue}`);
+    // The repair is ingested and completed before the wave-complete revision.
+    store.upsert({
+      issueNumber: newRoot?.normalizedIssueNumber as number,
+      title: 'recovered foundation',
+      state: 'done',
+      spec: parseNormalizedSpec((github.issues.get(newRoot?.normalizedIssueNumber as number) as RemoteIssue).body),
+    });
 
     const waveRevision = await coordinator.revise({
       planId: created.plan.id,
@@ -632,6 +639,351 @@ describe('PortfolioCoordinator', () => {
       // The saved status stays untouched until an approved reconciliation path runs.
       expect((await coordinator.refresh(created.plan.id))[0]?.status).toBe('assessing');
       expect(store.getPortfolioPlan(created.plan.id)?.status).toBe('assessing');
+    } finally { store.close(); }
+  });
+
+  it('keeps the current wave when a manual reassessment leaves a ready current-wave task unstarted', async () => {
+    const config = defaultProjectConfig(makeTmp('wave-manual-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('wave-manual', makeTmp('wave-manual-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const programDraft = draft();
+      programDraft.stories[0]!.coverageIds = ['REQ1'];
+      programDraft.stories[1]!.coverageIds = ['REQ2'];
+      const assessment: RepositoryAssessment = {
+        id: 'manual_1', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [],
+        coverage: ['Foundation', 'Feature'].map((requirement, index) => ({
+          id: `REQ${index + 1}`, requirement, status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [],
+        })),
+        createdAt: 1,
+      };
+      store.saveRepositoryAssessment(assessment);
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'program objective', draft: programDraft, assessment });
+      const approved = await coordinator.approve(created.plan.id);
+      const foundationIssue = approved.stories[0]!.normalizedIssueNumber!;
+      store.upsert({ issueNumber: foundationIssue, title: 'Foundation', state: 'ready' });
+
+      const next = { ...assessment, id: 'manual_2', commitSha: 'b'.repeat(40), createdAt: 2 };
+      store.saveRepositoryAssessment(next);
+      const revised = await coordinator.revise({
+        planId: created.plan.id, draft: programDraft, assessment: next,
+        reason: 'manual', material: false, summary: 'Reassess without skipping the active wave',
+      });
+
+      expect(revised.currentWave).toBe(1);
+      const prior = revised.stories.find((story) => story.key === approved.stories[0]!.key)!;
+      expect(prior.normalizedIssueNumber).toBe(foundationIssue);
+      expect(prior.supersededAt).toBeNull();
+      expect(store.findByIssue(foundationIssue)?.state).toBe('ready');
+      // New proposals stay unnormalized until their wave becomes current.
+      const added = revised.stories.filter((story) => story.revision === 2);
+      expect(added.length).toBeGreaterThan(0);
+      expect(added.every((story) => story.normalizedIssueNumber === null)).toBe(true);
+      expect(added.every((story) => (story.wave ?? 1) > 1)).toBe(true);
+    } finally { store.close(); }
+  });
+
+  it('keeps the current wave when a published normalized issue has not been ingested into a task yet', async () => {
+    const config = defaultProjectConfig(makeTmp('wave-unpublished-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('wave-unpublished', makeTmp('wave-unpublished-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const programDraft = draft();
+      programDraft.stories[0]!.coverageIds = ['REQ1'];
+      programDraft.stories[1]!.coverageIds = ['REQ2'];
+      const assessment: RepositoryAssessment = {
+        id: 'unpublished_1', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [],
+        coverage: ['Foundation', 'Feature'].map((requirement, index) => ({
+          id: `REQ${index + 1}`, requirement, status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [],
+        })),
+        createdAt: 1,
+      };
+      store.saveRepositoryAssessment(assessment);
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'program objective', draft: programDraft, assessment });
+      const approved = await coordinator.approve(created.plan.id);
+      const foundationIssue = approved.stories[0]!.normalizedIssueNumber!;
+      // Publication precedes intake: no task exists for the normalized issue yet.
+      expect(store.findByIssue(foundationIssue)).toBeNull();
+
+      const next = { ...assessment, id: 'unpublished_2', commitSha: 'b'.repeat(40), createdAt: 2 };
+      store.saveRepositoryAssessment(next);
+      const revised = await coordinator.revise({
+        planId: created.plan.id, draft: programDraft, assessment: next,
+        reason: 'manual', material: false, summary: 'Restart must not skip the published wave',
+      });
+
+      expect(revised.currentWave).toBe(1);
+      const prior = revised.stories.find((story) => story.key === approved.stories[0]!.key)!;
+      expect(prior.normalizedIssueNumber).toBe(foundationIssue);
+      expect(prior.supersededAt).toBeNull();
+      // New proposals stay unnormalized until their wave becomes current.
+      const added = revised.stories.filter((story) => story.revision === 2);
+      expect(added.length).toBeGreaterThan(0);
+      expect(added.every((story) => story.normalizedIssueNumber === null)).toBe(true);
+      expect(added.every((story) => (story.wave ?? 1) > 1)).toBe(true);
+
+      // The issue remains eligible for later ingestion as a normal task.
+      store.upsert({ issueNumber: foundationIssue, title: 'Foundation', state: 'ready' });
+      expect(store.findByIssue(foundationIssue)?.state).toBe('ready');
+      expect(github.issues.get(foundationIssue)).toBeDefined();
+    } finally { store.close(); }
+  });
+
+  it('restores currentWave to the earliest unfinished wave after a controller advanced past it', async () => {
+    const config = defaultProjectConfig(makeTmp('wave-restore-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('wave-restore', makeTmp('wave-restore-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const programDraft = draft();
+      programDraft.stories[0]!.coverageIds = ['REQ1'];
+      programDraft.stories[1]!.coverageIds = ['REQ2'];
+      const assessment: RepositoryAssessment = {
+        id: 'restore_1', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [],
+        coverage: ['Foundation', 'Feature'].map((requirement, index) => ({
+          id: `REQ${index + 1}`, requirement, status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [],
+        })),
+        createdAt: 1,
+      };
+      store.saveRepositoryAssessment(assessment);
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'program objective', draft: programDraft, assessment });
+      const approved = await coordinator.approve(created.plan.id);
+      const foundationIssue = approved.stories[0]!.normalizedIssueNumber!;
+      store.upsert({ issueNumber: foundationIssue, title: 'Foundation', state: 'ready' });
+
+      // An older controller already activated wave 2 and normalized its story
+      // while the wave-1 task was still outstanding.
+      const feature = approved.stories[1]!;
+      const earlyFeatureIssue = 999;
+      store.savePortfolioPlan({
+        ...approved,
+        currentWave: 2,
+        stories: approved.stories.map((story) => story.key === feature.key
+          ? { ...story, normalizedIssueNumber: earlyFeatureIssue, normalizedIssueUrl: `https://github.test/owner/project/issues/${earlyFeatureIssue}` }
+          : story),
+      });
+      store.upsert({ issueNumber: earlyFeatureIssue, title: 'Feature', state: 'active' });
+
+      const next = { ...assessment, id: 'restore_2', commitSha: 'b'.repeat(40), createdAt: 2 };
+      store.saveRepositoryAssessment(next);
+      const revise = () => coordinator.revise({
+        planId: created.plan.id, draft: programDraft, assessment: next,
+        reason: 'manual', material: false, summary: 'Point the wave back at the outstanding verification',
+      });
+
+      const revised = await revise();
+      expect(revised.currentWave).toBe(1);
+      // Prior story contracts, issues, and tasks survive untouched.
+      const restoredFoundation = revised.stories.find((story) => story.key === approved.stories[0]!.key)!;
+      const restoredFeature = revised.stories.find((story) => story.key === feature.key)!;
+      expect(restoredFoundation.normalizedIssueNumber).toBe(foundationIssue);
+      expect(restoredFeature.normalizedIssueNumber).toBe(earlyFeatureIssue);
+      expect(restoredFeature.supersededAt).toBeNull();
+      expect(store.findByIssue(foundationIssue)?.state).toBe('ready');
+      expect(store.findByIssue(earlyFeatureIssue)?.state).toBe('active');
+      expect(github.issues.get(earlyFeatureIssue)).toBeUndefined(); // no issue deletion or rewrite
+      const added = revised.stories.filter((story) => story.revision === 2);
+      expect(added.every((story) => story.normalizedIssueNumber === null)).toBe(true);
+
+      // Idempotent restart: revising again keeps pointing at the same wave.
+      const again = await revise();
+      expect(again.currentWave).toBe(1);
+      expect(again.stories.find((story) => story.key === approved.stories[0]!.key)!.normalizedIssueNumber).toBe(foundationIssue);
+    } finally { store.close(); }
+  });
+
+  it('still advances currentWave on a genuinely completed wave and preserves quarantine recovery', async () => {
+    const config = defaultProjectConfig(makeTmp('wave-complete-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('wave-complete', makeTmp('wave-complete-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const programDraft = draft();
+      programDraft.stories[0]!.coverageIds = ['REQ1'];
+      programDraft.stories[1]!.coverageIds = ['REQ2'];
+      const assessment: RepositoryAssessment = {
+        id: 'complete_1', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [],
+        coverage: ['Foundation', 'Feature'].map((requirement, index) => ({
+          id: `REQ${index + 1}`, requirement, status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [],
+        })),
+        createdAt: 1,
+      };
+      store.saveRepositoryAssessment(assessment);
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'program objective', draft: programDraft, assessment });
+      const approved = await coordinator.approve(created.plan.id);
+      const foundationIssue = approved.stories[0]!.normalizedIssueNumber!;
+      store.upsert({ issueNumber: foundationIssue, title: 'Foundation', state: 'done' });
+
+      const next = { ...assessment, id: 'complete_2', commitSha: 'b'.repeat(40), createdAt: 2 };
+      store.saveRepositoryAssessment(next);
+      const revised = await coordinator.revise({
+        planId: created.plan.id, draft: programDraft, assessment: next,
+        reason: 'manual', material: false, summary: 'Wave genuinely complete; advance normally',
+      });
+      expect(revised.currentWave).toBe(2);
+      const waveTwo = revised.stories.filter((story) => story.revision === 2 && (story.wave ?? 1) === 2);
+      expect(waveTwo.length).toBeGreaterThan(0);
+      expect(waveTwo.every((story) => story.normalizedIssueNumber !== null)).toBe(true);
+    } finally { store.close(); }
+  });
+
+  it('pins the wave for an approved material revision while an earlier wave is unfinished', async () => {
+    const config = defaultProjectConfig(makeTmp('wave-material-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('wave-material', makeTmp('wave-material-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const programDraft = draft();
+      programDraft.stories[0]!.coverageIds = ['REQ1'];
+      programDraft.stories[1]!.coverageIds = ['REQ2'];
+      const assessment: RepositoryAssessment = {
+        id: 'material_1', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [],
+        coverage: ['Foundation', 'Feature'].map((requirement, index) => ({
+          id: `REQ${index + 1}`, requirement, status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [],
+        })),
+        createdAt: 1,
+      };
+      store.saveRepositoryAssessment(assessment);
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'program objective', draft: programDraft, assessment });
+      const approved = await coordinator.approve(created.plan.id);
+      const foundationIssue = approved.stories[0]!.normalizedIssueNumber!;
+      store.upsert({ issueNumber: foundationIssue, title: 'Foundation', state: 'ready' });
+
+      const next = { ...assessment, id: 'material_2', commitSha: 'b'.repeat(40), createdAt: 2 };
+      store.saveRepositoryAssessment(next);
+      const revised = await coordinator.revise({
+        planId: created.plan.id, draft: programDraft, assessment: next,
+        reason: 'manual', material: true, approvedMaterial: true, summary: 'Approved material change must not skip the active wave',
+      });
+
+      // Approval boundary is preserved and the unfinished wave stays current.
+      expect(revised.status).toBe('active');
+      expect(revised.currentWave).toBe(1);
+      const prior = revised.stories.find((story) => story.key === approved.stories[0]!.key)!;
+      expect(prior.normalizedIssueNumber).toBe(foundationIssue);
+      expect(prior.supersededAt).toBeNull();
+      expect(store.findByIssue(foundationIssue)?.state).toBe('ready');
+      const added = revised.stories.filter((story) => story.revision === 2);
+      expect(added.length).toBeGreaterThan(0);
+      expect(added.every((story) => story.normalizedIssueNumber === null)).toBe(true);
+      expect(added.every((story) => (story.wave ?? 1) > 1)).toBe(true);
+    } finally { store.close(); }
+  });
+
+  it('keeps a quarantined wave current while a ready sibling task remains in it', async () => {
+    const config = defaultProjectConfig(makeTmp('wave-quarantine-sibling-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('wave-quarantine-sibling', makeTmp('wave-quarantine-sibling-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const programDraft = draft();
+      programDraft.stories[0]!.coverageIds = ['REQ1'];
+      programDraft.stories[1]!.coverageIds = ['REQ2'];
+      programDraft.stories[1]!.dependsOn = []; // independent sibling in wave 1
+      const assessment: RepositoryAssessment = {
+        id: 'qsibling_1', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [],
+        coverage: ['Foundation', 'Feature'].map((requirement, index) => ({
+          id: `REQ${index + 1}`, requirement, status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [],
+        })),
+        createdAt: 1,
+      };
+      store.saveRepositoryAssessment(assessment);
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'program objective', draft: programDraft, assessment });
+      const approved = await coordinator.approve(created.plan.id);
+      const failedIssue = approved.stories[0]!.normalizedIssueNumber!;
+      const siblingIssue = approved.stories[1]!.normalizedIssueNumber!;
+      expect(approved.stories[1]!.wave).toBe(1);
+      store.upsert({
+        issueNumber: failedIssue, title: 'quarantined foundation', state: 'quarantined',
+        spec: parseNormalizedSpec((github.issues.get(failedIssue) as RemoteIssue).body),
+        identicalFailures: 3, lastFailureFingerprint: 'same-failure', lineageFailures: 3,
+      });
+      store.upsert({ issueNumber: siblingIssue, title: 'Feature', state: 'ready' });
+
+      const next = { ...assessment, id: 'qsibling_2', commitSha: 'b'.repeat(40), createdAt: 2 };
+      store.saveRepositoryAssessment(next);
+      const revised = await coordinator.revise({
+        planId: created.plan.id, draft: programDraft, assessment: next,
+        reason: 'quarantine', material: false, summary: 'Quarantine repair must wait for the ready sibling',
+      });
+
+      // The wave with the ready sibling stays current; no future work activates early.
+      expect(revised.currentWave).toBe(1);
+      expect(revised.stories.find((story) => story.key === approved.stories[1]!.key)!.normalizedIssueNumber).toBe(siblingIssue);
+      expect(store.findByIssue(siblingIssue)?.state).toBe('ready');
+      const added = revised.stories.filter((story) => story.revision === 2);
+      expect(added.length).toBeGreaterThan(0);
+      expect(added.every((story) => story.normalizedIssueNumber === null)).toBe(true);
+      expect(added.every((story) => (story.wave ?? 1) > 1)).toBe(true);
+    } finally { store.close(); }
+  });
+
+  it('advances quarantine recovery when only terminal failed work remains in the wave', async () => {
+    const config = defaultProjectConfig(makeTmp('wave-quarantine-terminal-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('wave-quarantine-terminal', makeTmp('wave-quarantine-terminal-state'));
+    const github = new PortfolioGitHub();
+    const coordinator = new PortfolioCoordinator(config, store, github);
+    try {
+      const programDraft = draft();
+      programDraft.stories[0]!.coverageIds = ['REQ1'];
+      programDraft.stories[1]!.coverageIds = ['REQ2'];
+      const assessment: RepositoryAssessment = {
+        id: 'qterminal_1', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [],
+        coverage: ['Foundation', 'Feature'].map((requirement, index) => ({
+          id: `REQ${index + 1}`, requirement, status: 'missing' as const, requiredAction: 'implement' as const, rationale: 'Missing', evidence: [],
+        })),
+        createdAt: 1,
+      };
+      store.saveRepositoryAssessment(assessment);
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'program objective', draft: programDraft, assessment });
+      const approved = await coordinator.approve(created.plan.id);
+      const failedIssue = approved.stories[0]!.normalizedIssueNumber!;
+      store.upsert({
+        issueNumber: failedIssue, title: 'failed foundation', state: 'failed',
+        spec: parseNormalizedSpec((github.issues.get(failedIssue) as RemoteIssue).body),
+        identicalFailures: 3, lastFailureFingerprint: 'same-failure', lineageFailures: 3,
+      });
+
+      const next = { ...assessment, id: 'qterminal_2', commitSha: 'b'.repeat(40), createdAt: 2 };
+      store.saveRepositoryAssessment(next);
+      const revised = await coordinator.revise({
+        planId: created.plan.id, draft: programDraft, assessment: next,
+        reason: 'quarantine', material: false, summary: 'Only terminal work remains; recover into the next wave',
+      });
+
+      expect(revised.currentWave).toBe(2);
+      const replacement = revised.stories.find((story) => story.revision === 2 && story.dependsOn.length === 0)!;
+      expect(replacement.normalizedIssueNumber).not.toBeNull();
     } finally { store.close(); }
   });
 

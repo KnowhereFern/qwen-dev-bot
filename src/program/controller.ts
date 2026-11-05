@@ -4,10 +4,12 @@ import type { PersistentTaskStore } from '../core/persistent-store.js';
 import type {
   ObjectiveCoverage,
   PortfolioPlan,
+  PortfolioStory,
   ProgramRevision,
   ProgramWorkType,
   ProjectConfig,
   RepositoryAssessment,
+  TaskRecord,
 } from '../core/types.js';
 import { StagingDeploymentController } from '../deployment/controller.js';
 import { EvolutionSignalCollector } from '../evolution/signals.js';
@@ -191,6 +193,28 @@ export class ProgramController {
     const operationalEvidence = [...checkEvidence, ...deploymentEvidence];
     const assessment = await this.assessor.assess(document, signal, operationalEvidence, targetCommitSha, undefined, plan.coverage ?? []);
     signal?.throwIfAborted();
+    // Guard: an approved, unsuperseded verify story with an issued task that
+    // has not finished is the standing acceptance contract for its coverage.
+    // Model/global check evidence must not classify that coverage
+    // implemented while the contracted verification task is still pending.
+    // Failed and quarantined tasks keep this acceptance contract: they must
+    // still block a false implemented/accepted classification.
+    const pendingVerify = this.verifyAcceptanceContracts(plan);
+    for (const entry of assessment.coverage) {
+      const contract = pendingVerify.get(entry.id);
+      if (!contract || entry.status !== 'implemented') continue;
+      entry.status = 'unverified';
+      entry.requiredAction = 'verify';
+      entry.rationale = `Implemented claim from repository checks is held unverified pending accepted verification task #${contract.story.normalizedIssueNumber} (story ${contract.story.key}); no accepted verification or merge has completed that contract`;
+    }
+    // Deterministic requirement-proof binding: an implemented coverage entry is
+    // only accepted when a harness-tracked story/task chain explicitly covers
+    // that requirement — an approved unsuperseded implement/verify story, an
+    // ingested done task, a merge commit that is an ancestor of the assessed
+    // commit, and a persisted passing post-merge verification for that exact
+    // merge. Global gates, model-cited source/test files, signals, and global
+    // staging deployments are not requirement-specific and never bind proof.
+    await this.bindImplementationProofs(plan, assessment, signal);
     this.store.saveRepositoryAssessment(assessment);
     await this.recordExternalCommits(plan, assessment.commitSha, signal);
     signal?.throwIfAborted();
@@ -225,10 +249,24 @@ export class ProgramController {
       return { action: 'reassessed', planId: plan.id, detail: 'Objective is externally blocked' };
     }
     signal?.throwIfAborted();
-    const planningAssessment = await this.planningOnlyAssessment(plan, assessment, checks, signal);
+    // Planning suppression is narrower than acceptance: only actively
+    // pending tasks (ready/active/waiting and other in-flight states)
+    // suppress duplicate verification stories. Failed/quarantined tasks do
+    // not — the planner may propose an approved-scope replacement repair
+    // story with preserved lineage for their coverage.
+    const planningVerify = this.pendingVerifyContracts(plan);
+    const planningAssessment = await this.planningOnlyAssessment(plan, assessment, checks, signal, planningVerify);
     signal?.throwIfAborted();
     if (!planningAssessment.coverage.some((entry) => entry.requiredAction !== 'none')) {
-      await this.coordinator.updateProgramState(plan.id, 'blocked', {
+      // Guard: when the only actionable work is already assigned to pending
+      // approved verification tasks, do not create a revision (the planner
+      // would only invent a duplicate verify story or a falsely delivered
+      // result). Retain the active/blocked program state with the updated
+      // coverage and leave the pending task contracts intact.
+      const heldByPendingTasks = [...planningVerify.keys()].some((id) =>
+        planningAssessment.coverage.some((entry) => entry.id === id && entry.status === 'unverified'));
+      const retainedStatus = heldByPendingTasks && ['active', 'blocked'].includes(plan.status) ? plan.status : 'blocked';
+      await this.coordinator.updateProgramState(plan.id, retainedStatus, {
         assessmentId: assessment.id,
         repositorySha: assessment.commitSha,
         coverage: assessment.coverage,
@@ -236,7 +274,9 @@ export class ProgramController {
       return {
         action: 'reassessed',
         planId: plan.id,
-        detail: 'Objective has no plannable work after completed verification and blocker documentation',
+        detail: heldByPendingTasks
+          ? 'Remaining verification work is already assigned to pending accepted tasks; no duplicate verification story planned'
+          : 'Objective has no plannable work after completed verification and blocker documentation',
       };
     }
     const draft = await this.planner.plan(document, undefined, planningAssessment, undefined, {
@@ -328,6 +368,7 @@ export class ProgramController {
     assessment: RepositoryAssessment,
     checks: CheckSummary,
     signal?: AbortSignal,
+    pendingVerify: Map<string, { story: PortfolioStory; task: TaskRecord | null }> = new Map(),
   ): Promise<RepositoryAssessment> {
     const coverage: ObjectiveCoverage[] = structuredClone(assessment.coverage);
     const verifiedChecks = checks.complete && checks.successful && checks.failed.length === 0;
@@ -378,7 +419,127 @@ export class ProgramController {
       const changed = diff.stdout.split('\n').map((value) => value.trim()).filter(Boolean);
       if (changed.every((file) => file.startsWith('docs/'))) entry.requiredAction = 'none';
     }
+    // Guard: verification already assigned to an approved pending task must
+    // not be planned again; the planner would duplicate the story.
+    for (const entry of coverage) {
+      if (entry.requiredAction === 'verify' && pendingVerify.has(entry.id)) entry.requiredAction = 'none';
+    }
     return { ...assessment, coverage };
+  }
+
+  /**
+   * Coverage IDs mapped to approved, unsuperseded verify stories whose issued
+   * task has not finished. These are standing acceptance contracts:
+   * their coverage may not be classified implemented from model/global checks.
+   * Publication can precede intake, so stories whose normalized issue has not
+   * been ingested as a local task still hold the contract. Failed,
+   * quarantined, and cancelled tasks are included so they still prevent a
+   * false implemented/accepted classification until the story is superseded
+   * or a completed verification is accepted.
+   */
+  private verifyAcceptanceContracts(plan: PortfolioPlan): Map<string, { story: PortfolioStory; task: TaskRecord | null }> {
+    return this.verifyContracts(plan, { includeFailed: true });
+  }
+
+  /**
+   * Coverage IDs mapped to approved, unsuperseded verify stories whose issued
+   * task is actively pending (not finished, failed, quarantined, or
+   * cancelled), including stories whose normalized issue is published but not
+   * yet ingested as a local task — duplicate verify planning stays suppressed
+   * while the issue awaits ingestion. Failed/quarantined/cancelled tasks are
+   * excluded: their coverage is plannable so an approved-scope replacement
+   * repair story with preserved lineage can be proposed.
+   */
+  private pendingVerifyContracts(plan: PortfolioPlan): Map<string, { story: PortfolioStory; task: TaskRecord | null }> {
+    return this.verifyContracts(plan, { includeFailed: false });
+  }
+
+  private verifyContracts(plan: PortfolioPlan, options: { includeFailed: boolean }): Map<string, { story: PortfolioStory; task: TaskRecord | null }> {
+    const pending = new Map<string, { story: PortfolioStory; task: TaskRecord | null }>();
+    if (plan.approvedAt === null) return pending;
+    for (const story of plan.stories) {
+      if (story.supersededAt || story.workType !== 'verify' || story.normalizedIssueNumber === null) continue;
+      const task = this.store.findByIssue(story.normalizedIssueNumber) ?? null;
+      if (task?.state === 'done') continue;
+      if (task && !options.includeFailed && ['failed', 'quarantined', 'cancelled'].includes(task.state)) continue;
+      for (const id of story.coverageIds ?? []) {
+        if (!pending.has(id)) pending.set(id, { story, task });
+      }
+    }
+    return pending;
+  }
+
+  /**
+   * Holds every implemented coverage entry without a deterministic
+   * requirement-specific proof at unverified/verify, and appends the
+   * controller's own story/task evidence reference to proven coverage.
+   * Model-selected evidence locators are never trusted as the binding.
+   */
+  private async bindImplementationProofs(plan: PortfolioPlan, assessment: RepositoryAssessment, signal?: AbortSignal): Promise<void> {
+    for (const entry of assessment.coverage) {
+      if (entry.status !== 'implemented') continue;
+      const proof = await this.requirementProof(plan, entry.id, assessment.commitSha, signal);
+      signal?.throwIfAborted();
+      if (proof) {
+        const locator = `story:${proof.story.key}:task:${proof.task.issueNumber}:${proof.mergeSha}`;
+        if (!entry.evidence.some((item) => item.kind === 'git' && item.locator === locator)) {
+          entry.evidence.push({
+            kind: 'git',
+            locator,
+            summary: proof.via === 'read-only'
+              ? `Story ${proof.story.key} (issue #${proof.task.issueNumber}) verified read-only at ${proof.mergeSha} with passing exact-commit checks and independent scorecard`
+              : `Story ${proof.story.key} (issue #${proof.task.issueNumber}) merged at ${proof.mergeSha} with passing exact-merge post-merge verification`,
+            commitSha: assessment.commitSha,
+          });
+        }
+        continue;
+      }
+      entry.status = 'unverified';
+      entry.requiredAction = 'verify';
+      entry.rationale = `Implemented claim is held unverified: no approved unsuperseded implement/verify story with a done task, a verified commit ancestor of ${assessment.commitSha}, and a passing exact-merge post-merge verification (or trusted read-only verification for verify stories) explicitly covers ${entry.id}; global checks, model-cited files, signals, and deployments are not requirement-specific proof`;
+    }
+  }
+
+  /** First deterministic story/task/merge proof chain that explicitly covers
+   * the coverage ID, or null when none holds. Implementation stories (and
+   * verify stories that merged) prove out via a passing exact-merge
+   * post-merge verification event. A read-only verify story never merges:
+   * its supervisor completion (exact-commit GitHub checks, independent
+   * scorecard, remote-head/worktree verification, then a
+   * task.read_only_verified event and a done task whose mergeSha is the
+   * verified commit) is the trusted equivalent — accepted only when the
+   * event's taskId and commitSha match the done task, its scorecardId
+   * resolves to the persisted passing scorecard for that exact task and
+   * commit, and the verified commit is an ancestor of the assessed commit. */
+  private async requirementProof(plan: PortfolioPlan, entryId: string, commitSha: string, signal?: AbortSignal): Promise<{ story: PortfolioStory; task: TaskRecord; mergeSha: string; via: 'postmerge' | 'read-only' } | null> {
+    if (plan.approvedAt === null) return null;
+    const postmergeEvents = this.store.listEvents('postmerge.verification');
+    const readOnlyEvents = this.store.listEvents('task.read_only_verified');
+    for (const story of plan.stories) {
+      if (story.supersededAt || !(story.workType === 'implement' || story.workType === 'verify')) continue;
+      if (!story.coverageIds?.includes(entryId) || story.normalizedIssueNumber === null) continue;
+      const task = this.store.findByIssue(story.normalizedIssueNumber);
+      if (!task || task.state !== 'done' || !isCommitSha(task.mergeSha)) continue;
+      const mergeSha = task.mergeSha;
+      // An unknown git result conservatively keeps the requirement unverified.
+      if (!await safeMergeAncestor(this.config.project.root, mergeSha, commitSha, signal)) continue;
+      if (postmergeEvents.some((event) => event.taskId === task.id && event.payload.mergeSha === mergeSha && event.payload.passed === true)) {
+        return { story, task, mergeSha, via: 'postmerge' };
+      }
+      if (story.workType === 'verify' && readOnlyEvents.some((event) =>
+        event.taskId === task.id &&
+        event.payload.commitSha === mergeSha &&
+        typeof event.payload.scorecardId === 'string' &&
+        isCommitSha(event.payload.commitSha) &&
+        (() => {
+          const scorecard = this.store.getScorecard(event.payload.scorecardId);
+          return scorecard !== null && scorecard.taskId === task.id &&
+            scorecard.commitSha === mergeSha && scorecard.passed === true;
+        })())) {
+        return { story, task, mergeSha, via: 'read-only' };
+      }
+    }
+    return null;
   }
 
   private async finishWave(plan: PortfolioPlan, signal?: AbortSignal): Promise<ProgramTickResult> {
@@ -532,6 +693,20 @@ export class ProgramController {
 
 function isCommitSha(sha: string | null): sha is string {
   return typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha);
+}
+
+async function safeMergeAncestor(root: string, mergeSha: string, commitSha: string, signal?: AbortSignal): Promise<boolean> {
+  if (!isCommitSha(commitSha)) return false;
+  const result = await runProcess({
+    command: 'git',
+    args: ['merge-base', '--is-ancestor', mergeSha, commitSha],
+    cwd: root,
+    timeoutMs: 30_000,
+    signal,
+  });
+  // Any nonzero result (unrelated history or unknown git error) conservatively
+  // rejects the merge as proof.
+  return result.exitCode === 0;
 }
 
 async function safeCommitFileExists(root: string, commitSha: string, relative: string, signal?: AbortSignal): Promise<boolean> {

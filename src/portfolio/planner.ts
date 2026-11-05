@@ -132,7 +132,7 @@ export class PortfolioPlanner {
         'When repository coverage is supplied, create work only for non-implemented requirements and map every story to at least one coverage id.',
         'Every coverage item requiring implement must have an implementation story that delivers the missing behavior; verification-only work is insufficient.',
         'Before returning, audit the mandatory coverage/action matrix item by item. Every non-none action must have a story whose workType exactly matches it (external maps to document), and implementation acceptance criteria must change product behavior rather than merely test or describe it.',
-        'Coverage whose requiredAction is none is already satisfied (implemented, previously verified, or blocker-documented). Never propose a new story mapped exclusively to none-action coverage; repeating that completed work is a planning defect.',
+        'Coverage whose requiredAction is none is already satisfied (implemented, previously verified, or pending approved work). Never map a new story to any none-action coverage id, alone or mixed with actionable ids; repeating or duplicating that work is a planning defect.',
         'Do not add periodic polling, background workers, keepalive traffic, or scheduled provider health checks unless the objective and repository evidence explicitly require them. Preserve documented sleep, wake, cost, and worker-idleness behavior; prefer request-time or on-demand recovery where compatible.',
         'Do not create file-oriented cleanup, speculative infrastructure, or stories for capabilities proven implemented.',
         'A story may reference only decision ids that it actually needs.',
@@ -445,8 +445,9 @@ function assertCoverageActions(stories: PortfolioStoryDraft[], coverage: Objecti
   const noneAction = new Set(coverage.filter((entry) => entry.requiredAction === 'none').map((entry) => entry.id));
   for (const story of stories) {
     const mapped = story.coverageIds ?? [];
-    if (mapped.length > 0 && mapped.every((id) => noneAction.has(id))) {
-      throw new Error(`Story ${story.key} maps exclusively to satisfied (none-action) coverage: ${mapped.join(', ')}`);
+    const satisfied = mapped.filter((id) => noneAction.has(id));
+    if (mapped.length > 0 && satisfied.length > 0) {
+      throw new Error(`Story ${story.key} maps to satisfied (none-action) coverage ${satisfied.join(', ')}; that scope is already covered by pending or completed work`);
     }
   }
   for (const entry of coverage) {
