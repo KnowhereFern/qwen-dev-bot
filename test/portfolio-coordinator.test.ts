@@ -85,6 +85,61 @@ function draft(): PortfolioDraft {
 }
 
 describe('PortfolioCoordinator', () => {
+  it('supersedes issued but unstarted repeat work after verified or external coverage', async () => {
+    const config = defaultProjectConfig(makeTmp('retire-issued-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('retire-issued', makeTmp('retire-issued-state'));
+    const coordinator = new PortfolioCoordinator(config, store, new PortfolioGitHub());
+    const item = (id: string, status: 'partial' | 'implemented' | 'externally_blocked') => ({
+      id, requirement: id, status, requiredAction: (status === 'implemented' ? 'none' : status === 'externally_blocked' ? 'external' : 'implement') as 'none' | 'external' | 'implement',
+      rationale: status, evidence: [],
+    });
+    try {
+      const initial: RepositoryAssessment = { id: 'before-retire', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [], coverage: [item('A', 'partial'), item('B', 'partial')], createdAt: 1 };
+      store.saveRepositoryAssessment(initial);
+      const proposed = draft();
+      proposed.stories = proposed.stories.map((story, index) => ({ ...story, coverageIds: [index === 0 ? 'A' : 'B'], dependsOn: [] }));
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: proposed, assessment: initial });
+      const approved = await coordinator.approve(created.plan.id);
+      const issued = approved.stories.map((story) => story.normalizedIssueNumber);
+      expect(issued.every((number) => number !== null)).toBe(true);
+      const next: RepositoryAssessment = { ...initial, id: 'after-retire', coverage: [item('A', 'implemented'), item('B', 'externally_blocked')] };
+      store.saveRepositoryAssessment(next);
+      const revised = await coordinator.revise({ planId: approved.id, draft: { ...proposed, stories: [] }, assessment: next,
+        reason: 'manual', material: false, summary: 'Evidence resolved issued repeats' });
+      expect(revised.stories.filter((story) => issued.includes(story.normalizedIssueNumber)).every((story) => story.supersededAt !== null)).toBe(true);
+      expect(revised.stories.filter((story) => !story.supersededAt)).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
+  it('preserves issued work while a material revision awaits approval', async () => {
+    const config = defaultProjectConfig(makeTmp('material-retire-root'), 'project', 'owner/project');
+    config.program.enabled = true;
+    config.intake.trustedAuthors.push('owner');
+    config.gates = [{ id: 'test', kind: 'unit', command: 'npm', args: ['test'], required: true, timeoutMs: 1_000 }];
+    const store = new PersistentTaskStore('material-retire', makeTmp('material-retire-state'));
+    const coordinator = new PortfolioCoordinator(config, store, new PortfolioGitHub());
+    try {
+      const before: RepositoryAssessment = { id: 'before-material', projectId: store.projectId, commitSha: 'a'.repeat(40), dirty: false,
+        detectedStacks: ['node'], files: [], analyses: [], coverage: [{ id: 'A', requirement: 'A', status: 'partial', requiredAction: 'implement', rationale: 'Open', evidence: [] }], createdAt: 1 };
+      store.saveRepositoryAssessment(before);
+      const proposed = draft();
+      proposed.stories = [{ ...proposed.stories[0], coverageIds: ['A'] }];
+      const created = await coordinator.createDraft({ sourcePath: 'PROJECT.md', content: 'objective', draft: proposed, assessment: before });
+      const approved = await coordinator.approve(created.plan.id);
+      const after: RepositoryAssessment = { ...before, id: 'after-material', coverage: [{ ...before.coverage[0], status: 'implemented', requiredAction: 'none' }] };
+      store.saveRepositoryAssessment(after);
+      const changed = { ...proposed, technologyDecisions: [{ ...proposed.technologyDecisions[0], technology: 'Different host' }] };
+      const pending = await coordinator.revise({ planId: approved.id, draft: changed, assessment: after,
+        reason: 'manual', material: true, summary: 'Pending approval' });
+      expect(pending.status).toBe('awaiting_material_approval');
+      expect(pending.stories[0].supersededAt).toBeNull();
+    } finally { store.close(); }
+  });
+
   it.each(['snapshot', 'legacy', 'missing-proof', 'normalized', 'stale', 'concurrent'] as const)('rejects material revisions without losing approved history: %s', async (scenario) => {
     const config = defaultProjectConfig(makeTmp('reject-root'), 'project', 'owner/project');
     config.program.enabled = true; config.intake.trustedAuthors.push('owner');

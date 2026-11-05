@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.0.0-rc.106] - 2026-11-04
+
+- Preserve previously accepted requirement coverage when its exact task and merge proof still holds and a routine reassessment offers only generic uncertainty.
+- Keep external provider blockers in coverage without creating duplicate documentation or product stories.
+
 ## [1.0.0-rc.105] - 2026-11-04
 
 - Record evidence-backed coverage challenges and keep contradicted requirements open until a later verified implementation resolves them.

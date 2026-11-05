@@ -1229,6 +1229,168 @@ describe('ProgramController', () => {
       try { first.store.close(); } catch { /* already closed after restart handoff */ }
     }
   });
+  it('retains a proven implemented requirement on routine wave-complete reassessment despite generic model uncertainty', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Accepted', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'IMP1', workType: 'implement', coverageIds: ['REQ1'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha, postmergePass: true }],
+    });
+    // The model downgrades the previously accepted requirement to partial
+    // with only generic uncertainty.
+    const downgraded: ObjectiveCoverage[] = [
+      { id: 'REQ1', requirement: 'Ship', status: 'partial', requiredAction: 'implement', rationale: 'Supplied detail does not fully prove the behavior', evidence: [] },
+    ];
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, downgraded, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan');
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      // The deterministic proof still holds: implemented is retained, the
+      // objective audit completes, and no duplicate story is planned.
+      expect(['delivered', 'maintaining']).toContain(result.action);
+      expect(planning).not.toHaveBeenCalled();
+      const retained = fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0];
+      expect(retained).toMatchObject({ id: 'REQ1', status: 'implemented', requiredAction: 'none' });
+      expect(retained?.rationale).toMatch(/Retained implemented/);
+      // Current proof evidence is attached via the existing binding.
+      expect(retained?.evidence).toEqual([
+        expect.objectContaining({ kind: 'git', locator: `story:IMP1:task:10:${repo.baseSha}` }),
+      ]);
+      const updated = fixture.store.getPortfolioPlan('repeat_plan');
+      expect(updated?.stories).toHaveLength(1);
+      expect(updated?.coverage?.[0]).toMatchObject({ status: 'implemented' });
+      expect(fixture.store.listEvents('program.coverage_retained')).toHaveLength(1);
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('keeps a challenged previously implemented requirement partial on wave-complete reassessment', async () => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Accepted', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'IMP1', workType: 'implement', coverageIds: ['REQ1'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha, postmergePass: true }],
+    });
+    recordChallenge(fixture.store, 'repeat_plan', repo.docsSha);
+    const downgraded: ObjectiveCoverage[] = [
+      { id: 'REQ1', requirement: 'Ship', status: 'partial', requiredAction: 'implement', rationale: 'Supplied detail does not fully prove the behavior', evidence: [] },
+    ];
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, downgraded, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockResolvedValue(req1Draft());
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(result.action).toBe('reassessed');
+      // Retention never applies to unresolved challenged coverage even on the
+      // routine wave-complete path with a still-valid pre-challenge proof.
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'partial', requiredAction: 'implement' });
+      expect(fixture.store.listEvents('program.coverage_retained')).toHaveLength(0);
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
+      // A replacement implement story is planned for the challenged coverage.
+      expect(planning).toHaveBeenCalledOnce();
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it.each([
+    { label: 'no current deterministic proof', reason: 'wave-complete' as const, withProof: false },
+    { label: 'quarantine reassessment', reason: 'quarantine' as const, withProof: true },
+  ])('does not retain a downgraded requirement when the retention gate fails: $label', async ({ reason, withProof }) => {
+    const repo = await committedRepeatRepo();
+    const coverage: ObjectiveCoverage[] = [
+      { id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Accepted', evidence: [] },
+    ];
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage,
+      stories: [priorStory({ key: 'IMP1', workType: 'implement', coverageIds: ['REQ1'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha, postmergePass: withProof }],
+    });
+    const downgraded: ObjectiveCoverage[] = [
+      { id: 'REQ1', requirement: 'Ship', status: 'partial', requiredAction: 'implement', rationale: 'Supplied detail does not fully prove the behavior', evidence: [] },
+    ];
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, downgraded, []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockResolvedValue(req1Draft());
+    try {
+      const result = await fixture.controller.reassess(fixture.plan, reason, undefined, false, repo.docsSha);
+      expect(result.action).toBe('reassessed');
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'partial', requiredAction: 'implement' });
+      expect(fixture.store.listEvents('program.coverage_retained')).toHaveLength(0);
+      expect(fixture.store.listEvents('program.objective_accepted')).toHaveLength(0);
+      expect(planning).toHaveBeenCalledOnce();
+    } finally {
+      assess.mockRestore(); planning.mockRestore(); fixture.store.close();
+    }
+  });
+
+  it('recovers prior approved exact proof from history when the current plan was downgraded', async () => {
+    const repo = await committedRepeatRepo();
+    const implemented: ObjectiveCoverage = { id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Accepted', evidence: [] };
+    const fixture = buildRepeatProgram({
+      repo: repo.repo, commitSha: repo.docsSha, coverage: [implemented],
+      stories: [priorStory({ key: 'IMP1', workType: 'implement', coverageIds: ['REQ1'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha, postmergePass: true }],
+    });
+    const downgraded: ObjectiveCoverage = { ...implemented, status: 'partial', requiredAction: 'implement', rationale: 'Supplied detail does not fully prove the behavior' };
+    const current = { ...fixture.plan, coverage: [downgraded], revision: 2,
+      revisions: [...(fixture.plan.revisions ?? []), { number: 2, assessmentId: 'downgraded-prior', repositorySha: repo.docsSha, reason: 'wave-complete' as const, material: false, summary: 'Downgraded', createdAt: 2, approvedAt: 2 }] };
+    fixture.store.savePortfolioPlan(current);
+    fixture.store.saveRepositoryAssessment({ ...repeatAssessment(fixture.store.projectId, repo.docsSha, [downgraded], []), id: 'downgraded-prior' });
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, [downgraded], []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan');
+    try {
+      const result = await fixture.controller.reassess(current, 'manual', undefined, false, repo.docsSha);
+      expect(['delivered', 'maintaining']).toContain(result.action);
+      expect(planning).not.toHaveBeenCalled();
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]).toMatchObject({ status: 'implemented', requiredAction: 'none' });
+    } finally { assess.mockRestore(); planning.mockRestore(); fixture.store.close(); }
+  });
+
+  it('does not retain coverage when the approved requirement text has changed', async () => {
+    const repo = await committedRepeatRepo();
+    const prior: ObjectiveCoverage = { id: 'REQ1', requirement: 'Old behavior', status: 'implemented', requiredAction: 'none', rationale: 'Accepted', evidence: [] };
+    const fixture = buildRepeatProgram({ repo: repo.repo, commitSha: repo.docsSha, coverage: [prior],
+      stories: [priorStory({ key: 'IMP1', workType: 'implement', coverageIds: ['REQ1'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha, postmergePass: true }] });
+    const changed: ObjectiveCoverage = { ...prior, requirement: 'New behavior', status: 'partial', requiredAction: 'implement', rationale: 'Supplied detail does not fully prove the behavior' };
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, [changed], []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockResolvedValue(req1Draft());
+    try {
+      await expect(fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha)).rejects.toThrow(/changes an existing requirement identity/);
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]?.status).toBe('partial');
+      expect(planning).toHaveBeenCalledOnce();
+    } finally { assess.mockRestore(); planning.mockRestore(); fixture.store.close(); }
+  });
+
+  it('does not retain old proof over a concrete gap in the new rationale', async () => {
+    const repo = await committedRepeatRepo();
+    const prior: ObjectiveCoverage = { id: 'REQ1', requirement: 'Ship', status: 'implemented', requiredAction: 'none', rationale: 'Accepted', evidence: [] };
+    const fixture = buildRepeatProgram({ repo: repo.repo, commitSha: repo.docsSha, coverage: [prior],
+      stories: [priorStory({ key: 'IMP1', workType: 'implement', coverageIds: ['REQ1'] })],
+      doneTasks: [{ issueNumber: 10, mergeSha: repo.baseSha, postmergePass: true }] });
+    const gap: ObjectiveCoverage = { ...prior, status: 'partial', requiredAction: 'implement',
+      rationale: 'Supplied detail does not fully prove the behavior: a required handler is missing.' };
+    const assessment = repeatAssessment(fixture.store.projectId, repo.docsSha, [gap], []);
+    const assess = vi.spyOn(RepositoryAssessor.prototype, 'assess').mockResolvedValue(assessment);
+    const planning = vi.spyOn(PortfolioPlanner.prototype, 'plan').mockResolvedValue(req1Draft());
+    try {
+      await fixture.controller.reassess(fixture.plan, 'wave-complete', undefined, false, repo.docsSha);
+      expect(fixture.store.getRepositoryAssessment(assessment.id)?.coverage[0]?.status).toBe('partial');
+      expect(planning).toHaveBeenCalledOnce();
+    } finally { assess.mockRestore(); planning.mockRestore(); fixture.store.close(); }
+  });
+
   it.each([
     { label: 'merge sha is not an ancestor of the assessed commit', mergeSha: 'src', eventSha: 'src', passed: true },
     { label: 'passing event cites a different merge sha', mergeSha: 'base', eventSha: 'docs', passed: true },
@@ -1368,6 +1530,7 @@ function buildRepeatProgram(input: {
     revisions: [{ number: 1, assessmentId: 'prior', repositorySha: input.commitSha, reason: 'initial', material: false, summary: 'Initial', createdAt: 1, approvedAt: 1 }],
     latestDeploymentId: null, deliveredAt: null, maintenanceStartedAt: null,
   };
+  store.saveRepositoryAssessment({ ...repeatAssessment(store.projectId, input.commitSha, input.coverage, input.files ?? []), id: 'prior' });
   if (!store.getPortfolioPlan(plan.id)) store.savePortfolioPlan(plan);
   for (const done of input.doneTasks) {
     const task = store.upsert({ issueNumber: done.issueNumber, title: 'Prior', state: done.state ?? 'done' });
